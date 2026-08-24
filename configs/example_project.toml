@@ -1,0 +1,42 @@
+# LamellarSAXS2D 示例项目配置
+# 路径相对本文件所在目录解析；绝对强度校正和 PONI 几何由上游准备。
+
+[project]
+q_unit = "1/nm"
+full2d = false
+
+[inputs]
+# 替换为 CBF、EDF、TIF/TIFF、NPY、NPZ 或 HDF5 序列。
+files = ["data/frame_0001.npy", "data/frame_0002.npy"]
+# poni = "geometry/detector.poni"
+
+[output]
+directory = "results"
+
+[analysis]
+# 没有专用 qmap 模块时，q_scale 用作像素到 q 的示例比例。
+q_scale = 1.0
+q_window = [0.0, 90.0]
+ridge_method = "radial_peak" # or "surface_curvature"
+n_angles = 72
+n_angular_bins = 360
+n_radial_bins = 256
+# mask = "geometry/bad_pixels.npy"       # True means invalid detector pixel
+# valid_mask = "geometry/valid_pixels.npy" # True means valid detector pixel
+# frame = 0                                # required for a multi-frame source
+# dataset = "/entry/data/data"             # required for an ambiguous HDF5/NPZ source
+curvature = { sigma = 2.0, percentile = 25.0, normal_step = 1.0 }
+# batch_mode = "warm_start"
+# manifest = "data/manifest.csv"
+# checkpoint = "results/checkpoint.json"
+# resume = false
+# 默认仅对软件自动生成的 full2d 初值估计幅度/背景尺度；输入强度不归一化。
+# auto_scale_initial = true # 仅在确实需要强制重估显式/warm-start 初值时启用
+
+[export]
+json = true
+npz = true
+
+[metadata]
+name = "example_butterfly"
+description = "Oriented lamellar butterfly-pattern quantitative analysis"

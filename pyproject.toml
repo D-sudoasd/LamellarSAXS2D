@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "butterfly-saxs"
+version = "0.1.0"
+description = "Quantitative refinement and in-situ analysis of anisotropic lamellar 2D SAXS patterns"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+  "SAXS",
+  "small-angle X-ray scattering",
+  "lamellar structures",
+  "two-dimensional refinement",
+  "in-situ analysis",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "numpy>=2.0",
+  "scipy>=1.13",
+  "matplotlib>=3.8",
+  "fabio>=2024.4",
+  "pyFAI>=2024.5",
+  "tifffile>=2024.5",
+]
+
+[project.optional-dependencies]
+ui = ["PySide6>=6.8", "pyqtgraph>=0.13.7"]
+hdf5 = ["h5py>=3.10"]
+dev = [
+  "pytest>=8",
+  "pytest-qt>=4.4",
+  "ruff>=0.15,<0.16",
+  "build>=1.4,<2",
+]
+all = [
+  "PySide6>=6.8",
+  "pyqtgraph>=0.13.7",
+  "h5py>=3.10",
+  "pytest>=8",
+  "pytest-qt>=4.4",
+  "ruff>=0.15,<0.16",
+  "build>=1.4,<2",
+]
+
+[project.urls]
+Homepage = "https://github.com/D-sudoasd/LamellarSAXS2D"
+Repository = "https://github.com/D-sudoasd/LamellarSAXS2D"
+Issues = "https://github.com/D-sudoasd/LamellarSAXS2D/issues"
+Documentation = "https://github.com/D-sudoasd/LamellarSAXS2D/tree/main/docs"
+
+[project.scripts]
+bsaxs = "butterfly_saxs.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

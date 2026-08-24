@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.13"
+
+    env:
+      QT_QPA_PLATFORM: offscreen
+      MPLBACKEND: Agg
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[all]"
+
+      - name: Check dependencies
+        run: python -m pip check
+
+      - name: Lint
+        run: python -m ruff check src tests
+
+      - name: Compile
+        run: python -m compileall -q src tests
+
+      - name: Test
+        run: python -m pytest -q --basetemp "${{ runner.temp }}/pytest" -p no:cacheprovider
+
+      - name: CLI smoke
+        run: |
+          python -m butterfly_saxs --help
+          bsaxs synthetic --shape 16x16
+
+  wheel-smoke:
+    name: wheel smoke
+    needs: tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Build distributions
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+
+      - name: Install wheel in a fresh environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pip check
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m butterfly_saxs --help
+          "$RUNNER_TEMP/wheel-venv/bin/bsaxs" synthetic --shape 16x16
