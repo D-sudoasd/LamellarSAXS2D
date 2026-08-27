@@ -30,6 +30,7 @@ from .intensity import (
 from .io import LoadedImage, load_image as read_image
 from .observables import measure_observables
 from .parameters import ParameterSet, ParameterSpec
+from .validation import AnalysisDomain, build_analysis_domain, normalise_q_arrays
 
 
 SERVICE_FLAGS = (
@@ -55,6 +56,11 @@ DEFAULT_ANALYSIS_SETTINGS: dict[str, Any] = {
     "curvature_percentile": 25.0,
     "normal_step": 1.0,
     "max_pixels": 0,
+    "scales": (0.25, 0.5, 1.0),
+    "seed": 0,
+    "robust_loss": "soft_l1",
+    "f_scale": 1.0,
+    "max_nfev": 800,
 }
 # Public alias retained for callers that describe these as measurement
 # settings rather than analysis settings.
@@ -150,6 +156,44 @@ def _display_q_unit(qmap: Any) -> str:
     return "unknown"
 
 
+def _normalise_service_qmap(qmap: Any, shape: tuple[int, int]) -> Any:
+    """Canonicalize explicit service q arrays without changing mask metadata."""
+
+    if not isinstance(qmap, Mapping):
+        return qmap
+    qx = _read(qmap, ("qx", "qx_nm_inv"), None)
+    qy = _read(qmap, ("qy", "qy_nm_inv"), None)
+    if qx is None or qy is None:
+        return qmap
+    qx_array = np.asarray(qx, dtype=float)
+    qy_array = np.asarray(qy, dtype=float)
+    if qx_array.shape != shape or qy_array.shape != shape:
+        raise ValueError(f"qmap shape must match image shape {shape!r}")
+    q = _read(qmap, ("q", "q_nm_inv"), None)
+    q_array = np.hypot(qx_array, qy_array) if q is None else np.asarray(q, dtype=float)
+    if q_array.shape != shape:
+        raise ValueError(f"qmap q shape must match image shape {shape!r}")
+    qx_array, qy_array, q_array, unit_info = normalise_q_arrays(
+        qx_array,
+        qy_array,
+        q_array,
+        _q_unit(qmap),
+    )
+    if qmap.get("q_unit") == "nm^-1" and "q_conversion_factor_to_nm_inv" in qmap:
+        unit_info["source_q_unit"] = qmap.get("source_q_unit")
+        unit_info["q_conversion_factor_to_nm_inv"] = qmap.get(
+            "q_conversion_factor_to_nm_inv"
+        )
+    result = dict(qmap)
+    result.update({"qx": qx_array, "qy": qy_array, "q": q_array, **unit_info})
+    metadata = result.get("metadata")
+    result["metadata"] = {
+        **(dict(metadata) if isinstance(metadata, Mapping) else {}),
+        **unit_info,
+    }
+    return result
+
+
 def _is_q_parameter(name: Any) -> bool:
     key = str(name).strip().lower()
     return key in _Q_PARAMETER_NAMES or key.startswith("q_") or key.endswith("_q")
@@ -202,7 +246,8 @@ def _analysis_payload(payload: Any) -> dict[str, Any]:
     """
 
     if not isinstance(payload, Mapping):
-        return {}
+        analysis = getattr(payload, "analysis", None)
+        return dict(analysis) if isinstance(analysis, Mapping) else {}
     result: dict[str, Any] = {}
     for source_name in ("measurement", "analysis_settings", "analysis"):
         source = payload.get(source_name)
@@ -216,6 +261,11 @@ def _analysis_payload(payload: Any) -> dict[str, Any]:
     for name in DEFAULT_ANALYSIS_SETTINGS:
         if name in payload:
             result[name] = payload[name]
+    for name in ("q_window", "q_range", "q_min", "q_max"):
+        if name in payload:
+            result[name] = payload[name]
+    if "loss" in payload and "robust_loss" not in result:
+        result["robust_loss"] = payload["loss"]
     return result
 
 
@@ -241,6 +291,26 @@ def _validated_analysis_settings(
     merged = dict(DEFAULT_ANALYSIS_SETTINGS)
     if isinstance(settings, Mapping):
         merged.update(settings)
+    configured_window = merged.get("q_window", merged.get("q_range"))
+    if configured_window is not None:
+        if isinstance(configured_window, Mapping):
+            window_min = configured_window.get(
+                "min", configured_window.get("q_min", configured_window.get("low"))
+            )
+            window_max = configured_window.get(
+                "max", configured_window.get("q_max", configured_window.get("high"))
+            )
+        else:
+            try:
+                window_min, window_max = configured_window
+            except (TypeError, ValueError) as exc:
+                raise ValueError("q_window must be a (min, max) pair") from exc
+        if window_min is None or window_max is None:
+            raise ValueError("q_window mapping must provide min/max")
+        if merged.get("q_min") is None:
+            merged["q_min"] = window_min
+        if merged.get("q_max") is None:
+            merged["q_max"] = window_max
     merged["q_min"] = _optional_float(merged.get("q_min"), "q_min")
     merged["q_max"] = _optional_float(merged.get("q_max"), "q_max")
     try:
@@ -298,6 +368,41 @@ def _validated_analysis_settings(
     if max_pixels < 0:
         raise ValueError("max_pixels must be a non-negative integer; 0 means all")
     merged["max_pixels"] = max_pixels
+    try:
+        seed = int(merged.get("seed", 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("seed must be an integer") from exc
+    merged["seed"] = seed
+    try:
+        max_nfev = int(merged.get("max_nfev", 800))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_nfev must be a positive integer") from exc
+    if max_nfev <= 0:
+        raise ValueError("max_nfev must be a positive integer")
+    merged["max_nfev"] = max_nfev
+    try:
+        f_scale = float(merged.get("f_scale", 1.0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("f_scale must be finite and > 0") from exc
+    if not np.isfinite(f_scale) or f_scale <= 0:
+        raise ValueError("f_scale must be finite and > 0")
+    merged["f_scale"] = f_scale
+    loss = str(merged.get("robust_loss", merged.get("loss", "soft_l1"))).strip()
+    if loss not in {"linear", "soft_l1", "huber", "cauchy", "arctan"}:
+        raise ValueError(
+            "robust_loss must be linear, soft_l1, huber, cauchy, or arctan"
+        )
+    merged["robust_loss"] = loss
+    raw_scales = merged.get("scales", (0.25, 0.5, 1.0))
+    if isinstance(raw_scales, (str, bytes)):
+        raise ValueError("scales must be a sequence of positive finite numbers")
+    try:
+        scales = tuple(float(value) for value in raw_scales)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("scales must be a sequence of positive finite numbers") from exc
+    if not scales or any(not np.isfinite(value) or value <= 0 for value in scales):
+        raise ValueError("scales must be a sequence of positive finite numbers")
+    merged["scales"] = scales
     return merged
 
 
@@ -327,6 +432,67 @@ def _resolved_analysis_settings(
     if not np.isfinite(q_min) or not np.isfinite(q_max) or q_max <= q_min:
         raise ValueError("q window must contain finite max > min")
     return normalized, (q_min, q_max)
+
+
+def _service_analysis_domain(
+    observed: np.ndarray,
+    qmap: Any,
+    *,
+    mask: Any = None,
+    analysis: Mapping[str, Any] | None = None,
+    sigma: Any = None,
+    weights: Any = None,
+    detector_valid: Any = None,
+    roi_exclusion: Any = None,
+) -> tuple[AnalysisDomain, dict[str, Any]]:
+    """Build the shared measurement/refinement domain for one service request."""
+
+    settings, q_window = _resolved_analysis_settings(analysis, qmap, observed.shape)
+    qx = np.asarray(_read(qmap, ("qx", "qx_nm_inv")), dtype=float)
+    qy = np.asarray(_read(qmap, ("qy", "qy_nm_inv")), dtype=float)
+    q = _read(qmap, ("q", "q_nm_inv", "q_map"), None)
+    qmap_valid = _read(qmap, ("valid_mask", "valid"), None)
+    if detector_valid is None:
+        detector_valid = qmap_valid
+    elif qmap_valid is not None:
+        detector_valid = (
+            np.asarray(detector_valid, dtype=bool)
+            & np.asarray(qmap_valid, dtype=bool)
+        )
+    if detector_valid is None:
+        qmap_mask = _read(qmap, ("mask", "invalid_mask", "bad_mask"), None)
+        if qmap_mask is not None:
+            detector_valid = ~np.asarray(qmap_mask, dtype=bool)
+    domain = build_analysis_domain(
+        observed,
+        qx,
+        qy,
+        q=q,
+        detector_valid=detector_valid,
+        external_mask=mask,
+        roi_exclusion=roi_exclusion,
+        q_window=q_window,
+        sigma=sigma,
+        weights=weights,
+    )
+    return domain, settings
+
+
+def _combined_exclusion_mask(
+    detector_valid: Any = None,
+    external_mask: Any = None,
+    roi_exclusion: Any = None,
+) -> np.ndarray | None:
+    """Combine already-validated masks for display/error-result fallbacks."""
+
+    exclusions: list[np.ndarray] = []
+    if detector_valid is not None:
+        exclusions.append(~np.asarray(detector_valid, dtype=bool))
+    if external_mask is not None:
+        exclusions.append(np.asarray(external_mask, dtype=bool))
+    if roi_exclusion is not None:
+        exclusions.append(np.asarray(roi_exclusion, dtype=bool))
+    return np.logical_or.reduce(exclusions) if exclusions else None
 
 
 def _reference_axis_deg(settings: Mapping[str, Any] | None) -> float:
@@ -912,11 +1078,20 @@ class ButterflyAnalysisService:
         dataset: str | None = None,
         valid_mask: Any | None = None,
         external_mask: Any | None = None,
+        mask_frame: int | None = None,
+        mask_dataset: str | None = None,
         poni: str | Path | Any | None = None,
     ) -> dict[str, Any]:
         if poni is not None:
             self.set_poni(poni)
-        loaded = read_image(path, frame=frame, dataset=dataset, valid_mask=valid_mask, external_mask=external_mask)
+        loaded = read_image(
+            path,
+            frame=frame,
+            dataset=dataset,
+            valid_mask=valid_mask,
+            mask_frame=mask_frame,
+            mask_dataset=mask_dataset,
+        )
         if self._poni is not None:
             qmap = build_geometry(loaded.data.shape, self._poni, valid_mask=loaded.valid_mask)
         else:
@@ -925,7 +1100,24 @@ class ButterflyAnalysisService:
         self._qmap = qmap
         # Keep the loaded pair local: another batch worker may replace the
         # document state before it starts optimization.
-        return self._payload_from_loaded(loaded, qmap)
+        payload = self._payload_from_loaded(loaded, qmap)
+        if external_mask is not None:
+            mask_value = (
+                read_image(
+                    external_mask,
+                    frame=mask_frame,
+                    dataset=mask_dataset,
+                ).data
+                if isinstance(external_mask, (str, Path))
+                else external_mask
+            )
+            mask_array = np.asarray(mask_value)
+            if mask_array.shape != loaded.data.shape:
+                raise ValueError(
+                    f"external_mask shape {mask_array.shape} does not match image shape {loaded.data.shape}"
+                )
+            payload["external_mask"] = np.asarray(mask_array != 0, dtype=bool)
+        return payload
 
     read_image = load_image
 
@@ -934,7 +1126,7 @@ class ButterflyAnalysisService:
         supplied_valid = _read(qmap, ("valid_mask", "valid"), None) if qmap is not None else None
         self._loaded = LoadedImage(array, metadata=dict(metadata or {}), valid_mask=supplied_valid)
         if qmap is not None:
-            self._qmap = qmap
+            self._qmap = _normalise_service_qmap(qmap, array.shape)
         elif qx is not None and qy is not None:
             qx_array, qy_array = np.asarray(qx, dtype=float), np.asarray(qy, dtype=float)
             self._qmap = {"qx": qx_array, "qy": qy_array, "q": np.hypot(qx_array, qy_array), "q_unit": "provided"}
@@ -979,19 +1171,37 @@ class ButterflyAnalysisService:
     def current_payload(self) -> dict[str, Any]:
         return self._payload_from_loaded(self._loaded, self._qmap)
 
-    def _state(self, payload: Any = None) -> tuple[np.ndarray | None, Any, list[str], np.ndarray | None]:
+    def _state(
+        self, payload: Any = None
+    ) -> tuple[
+        np.ndarray | None,
+        Any,
+        list[str],
+        np.ndarray | None,
+        np.ndarray | None,
+        np.ndarray | None,
+    ]:
         payload = payload if isinstance(payload, Mapping) else {}
         observed = payload.get("observed", self.observed)
         if observed is None:
-            return None, payload.get("qmap", self._qmap), ["no_observed"], None
+            return (
+                None,
+                payload.get("qmap", self._qmap),
+                ["no_observed"],
+                None,
+                None,
+                None,
+            )
         observed = np.asarray(observed)
         qmap = payload.get("qmap", self._qmap)
         flags: list[str] = []
         if qmap is None:
             qmap = self._fallback_qmap(observed.shape)
+        else:
+            qmap = _normalise_service_qmap(qmap, observed.shape)
         if _display_q_unit(qmap) == "pixel-q":
             flags.append("uncalibrated_pixel_q")
-        exclusion_masks: list[np.ndarray] = []
+        detector_masks: list[np.ndarray] = []
         valid_mask = payload.get("valid_mask")
         if valid_mask is None:
             valid_mask = _read(qmap, ("valid_mask", "valid"), None)
@@ -1010,53 +1220,58 @@ class ButterflyAnalysisService:
         if valid_mask is not None:
             valid_array = np.asarray(valid_mask, dtype=bool)
             if valid_array.shape == observed.shape:
-                exclusion_masks.append(~valid_array)
+                detector_masks.append(valid_array)
             else:
                 raise ValueError(
                     f"valid_mask shape {valid_array.shape} does not match image shape {observed.shape}"
+                )
+        qmap_valid = _read(qmap, ("valid_mask", "valid"), None)
+        if qmap_valid is not None:
+            qmap_valid_array = np.asarray(qmap_valid, dtype=bool)
+            if qmap_valid_array.shape == observed.shape:
+                detector_masks.append(qmap_valid_array)
+            else:
+                raise ValueError(
+                    f"qmap valid_mask shape {qmap_valid_array.shape} does not match image shape {observed.shape}"
                 )
         qmap_mask = _read(qmap, ("mask", "invalid_mask", "bad_mask"), None)
         if qmap_mask is not None:
             qmap_mask_array = np.asarray(qmap_mask, dtype=bool)
             if qmap_mask_array.shape == observed.shape:
-                exclusion_masks.append(qmap_mask_array)
+                detector_masks.append(~qmap_mask_array)
             else:
                 raise ValueError(
                     f"qmap mask shape {qmap_mask_array.shape} does not match image shape {observed.shape}"
                 )
+        detector_valid = (
+            np.logical_and.reduce(detector_masks) if detector_masks else None
+        )
         external_mask = payload.get("external_mask")
         if external_mask is not None:
             external_array = np.asarray(external_mask, dtype=bool)
             if external_array.shape == observed.shape:
-                exclusion_masks.append(external_array)
+                external_mask = external_array
             else:
                 raise ValueError(
                     f"external_mask shape {external_array.shape} does not match image shape {observed.shape}"
                 )
         rois = payload.get("rois", ())
-        if rois or exclusion_masks:
+        roi_exclusion = None
+        if rois:
             try:
                 from .masking import combine_exclusion_masks
 
                 qx = _read(qmap, ("qx", "qx_nm_inv"), None)
                 qy = _read(qmap, ("qy", "qy_nm_inv"), None)
-                external_mask = combine_exclusion_masks(
+                roi_exclusion = combine_exclusion_masks(
                     observed.shape,
-                    masks=exclusion_masks,
                     rois=rois,
                     qx=qx,
                     qy=qy,
                 )
-            except Exception as exc:
-                flags.append(f"roi_mask_failed:{type(exc).__name__}")
-                external_mask = (
-                    np.logical_or.reduce(exclusion_masks)
-                    if exclusion_masks
-                    else None
-                )
-        elif not exclusion_masks:
-            external_mask = None
-        return observed, qmap, flags, external_mask
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(f"invalid ROI exclusion specification: {exc}") from exc
+        return observed, qmap, flags, external_mask, roi_exclusion, detector_valid
 
     def _q_window(self, qmap: Any, shape: tuple[int, int]) -> tuple[float, float]:
         q = _read(qmap, ("q", "q_nm_inv", "q_map"), None)
@@ -1078,20 +1293,26 @@ class ButterflyAnalysisService:
         *,
         mask: Any = None,
         analysis: Mapping[str, Any] | None = None,
+        analysis_domain: AnalysisDomain | None = None,
     ) -> Any:
         try:
             merged = dict(self._analysis_settings)
             if isinstance(analysis, Mapping):
                 merged.update(analysis)
-            settings, q_window = _resolved_analysis_settings(merged, qmap, observed.shape)
+            if analysis_domain is None:
+                analysis_domain, settings = _service_analysis_domain(
+                    observed, qmap, mask=mask, analysis=merged
+                )
+            else:
+                settings = _validated_analysis_settings(merged)
             return measure_observables(
                 observed,
                 qmap,
-                q_window,
+                analysis_domain.q_window,
                 n_angular_bins=settings["n_angular_bins"],
                 n_ridge_angles=settings["n_ridge_angles"],
                 n_radial_bins=settings["n_radial_bins"],
-                mask=mask,
+                mask=~analysis_domain.fit_valid_mask,
                 ridge_method=settings["ridge_method"],
                 draw_axis_deg=settings["draw_axis_deg"],
                 curvature_sigma=settings["curvature_sigma"],
@@ -1103,7 +1324,7 @@ class ButterflyAnalysisService:
             flags.append(f"analysis_validation_failed:{exc}")
             return None
 
-    def _result_mapping(self, observed: np.ndarray | None, qmap: Any, model: Any = None, residual: Any = None, *, parameters: Mapping[str, Mapping[str, Any]] | None = None, observables: Any = None, flags: Iterable[str] = (), fit: Any = None, mask: Any = None, analysis: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def _result_mapping(self, observed: np.ndarray | None, qmap: Any, model: Any = None, residual: Any = None, *, parameters: Mapping[str, Mapping[str, Any]] | None = None, observables: Any = None, flags: Iterable[str] = (), fit: Any = None, mask: Any = None, analysis: Mapping[str, Any] | None = None, analysis_domain: AnalysisDomain | None = None) -> dict[str, Any]:
         analysis_settings = dict(self._analysis_settings)
         if isinstance(analysis, Mapping):
             analysis_settings.update(analysis)
@@ -1126,6 +1347,7 @@ class ButterflyAnalysisService:
                 "mask": None,
                 "parameters": public_parameters,
                 "analysis": _json_safe(analysis_settings),
+                "analysis_domain": None,
                 "metrics": {
                     "rmse": None,
                     "ndata": 0,
@@ -1161,7 +1383,11 @@ class ButterflyAnalysisService:
                     f"mask shape {mask_array.shape} does not match image shape {observed_array.shape}"
                 )
             display_valid &= ~mask_array
-        valid = display_valid & np.isfinite(observed_array)
+        valid = (
+            np.asarray(analysis_domain.fit_valid_mask, dtype=bool)
+            if analysis_domain is not None
+            else display_valid & np.isfinite(observed_array)
+        )
         # NaN is intentional for display arrays: pyqtgraph/matplotlib treat
         # it as transparent, so masked detector pixels cannot look like a
         # fitted signal.  ``valid_mask`` remains the explicit JSON/UI mask.
@@ -1180,6 +1406,9 @@ class ButterflyAnalysisService:
             "ndata": int(_read(fit, ("ndata",), int(valid.sum()))) if fit is not None else int(valid.sum()),
             "valid_fraction": float(valid.mean()) if valid.size else None,
             "flags": sorted(set(str(item) for item in all_flags)),
+            "domain_counts": (
+                None if analysis_domain is None else analysis_domain.counts
+            ),
         }
         if fit is not None:
             metrics.update(
@@ -1205,6 +1434,15 @@ class ButterflyAnalysisService:
             "observables": observables,
             "parameters": public_parameters,
             "analysis": _json_safe(analysis_settings),
+            "analysis_domain": (
+                None if analysis_domain is None else analysis_domain.to_summary()
+            ),
+            "fit_valid_mask": valid,
+            "sampled_valid_mask": (
+                valid
+                if analysis_domain is None
+                else analysis_domain.sampled_valid_mask
+            ),
             "metrics": metrics,
             "flags": metrics["flags"],
         }
@@ -1220,7 +1458,14 @@ class ButterflyAnalysisService:
         **extra: Any,
     ) -> dict[str, Any]:
         payload_mapping = payload if isinstance(payload, Mapping) else {}
-        observed, qmap, flags, external_mask = self._state(payload_mapping)
+        (
+            observed,
+            qmap,
+            flags,
+            external_mask,
+            roi_exclusion,
+            detector_valid,
+        ) = self._state(payload_mapping)
         analysis = dict(self._analysis_settings)
         analysis.update(_analysis_payload(payload_mapping))
         if isinstance(analysis_settings, Mapping):
@@ -1236,6 +1481,9 @@ class ButterflyAnalysisService:
         values = _core_parameter_set(specs, scalar)
         if observed is None:
             return self._result_mapping(None, qmap, parameters=specs, flags=flags, analysis=analysis)
+        display_mask = _combined_exclusion_mask(
+            detector_valid, external_mask, roi_exclusion
+        )
         qx = np.asarray(_read(qmap, ("qx", "qx_nm_inv")), dtype=float)
         qy = np.asarray(_read(qmap, ("qy", "qy_nm_inv")), dtype=float)
         model = double_ellipse_intensity(
@@ -1244,8 +1492,30 @@ class ButterflyAnalysisService:
             values,
             reference_axis_deg=_reference_axis_deg(analysis),
         )
-        observables = self._measure(observed, qmap, flags, mask=external_mask, analysis=analysis)
-        return self._result_mapping(observed, qmap, model, parameters=specs, observables=observables, flags=flags, mask=external_mask, analysis=analysis)
+        observables = None
+        try:
+            domain, _ = _service_analysis_domain(
+                observed,
+                qmap,
+                mask=external_mask,
+                analysis=analysis,
+                detector_valid=detector_valid,
+                roi_exclusion=roi_exclusion,
+            )
+        except ValueError as exc:
+            flags.append("observables_failed:ValueError")
+            flags.append(f"analysis_validation_failed:{exc}")
+            domain = None
+        if domain is not None:
+            observables = self._measure(
+                observed,
+                qmap,
+                flags,
+                mask=display_mask,
+                analysis=analysis,
+                analysis_domain=domain,
+            )
+        return self._result_mapping(observed, qmap, model, parameters=specs, observables=observables, flags=flags, mask=display_mask, analysis=analysis, analysis_domain=domain)
 
     def optimize(
         self,
@@ -1261,7 +1531,14 @@ class ButterflyAnalysisService:
         **extra: Any,
     ) -> dict[str, Any]:
         payload_mapping = payload if isinstance(payload, Mapping) else {}
-        observed, qmap, flags, external_mask = self._state(payload_mapping)
+        (
+            observed,
+            qmap,
+            flags,
+            external_mask,
+            roi_exclusion,
+            detector_valid,
+        ) = self._state(payload_mapping)
         analysis = dict(self._analysis_settings)
         analysis.update(_analysis_payload(payload_mapping))
         if isinstance(analysis_settings, Mapping):
@@ -1277,9 +1554,12 @@ class ButterflyAnalysisService:
         values = _core_parameter_set(specs, scalar)
         if observed is None:
             return self._result_mapping(None, qmap, parameters=specs, flags=flags, analysis=analysis)
+        display_mask = _combined_exclusion_mask(
+            detector_valid, external_mask, roi_exclusion
+        )
         frame = LoadedImage(observed)
         try:
-            normalized_analysis, resolved_q_window = _resolved_analysis_settings(
+            normalized_analysis, _ = _resolved_analysis_settings(
                 analysis,
                 qmap,
                 observed.shape,
@@ -1293,7 +1573,7 @@ class ButterflyAnalysisService:
                 parameters=specs,
                 flags=flags,
                 analysis=analysis,
-                mask=external_mask,
+                mask=display_mask,
             )
         if max_pixels is None:
             max_pixels = _payload_option(
@@ -1305,12 +1585,12 @@ class ButterflyAnalysisService:
             max_pixels = int(max_pixels) if max_pixels is not None else None
         except (TypeError, ValueError) as exc:
             flags.append(f"intensity_fit_failed:{type(exc).__name__}")
-            return self._result_mapping(observed, qmap, parameters=specs, flags=flags, analysis=analysis, mask=external_mask)
+            return self._result_mapping(observed, qmap, parameters=specs, flags=flags, analysis=analysis, mask=display_mask)
         if max_pixels == 0:
             max_pixels = None
         if max_pixels is not None and max_pixels < 0:
             flags.append("intensity_fit_failed:ValueError")
-            return self._result_mapping(observed, qmap, parameters=specs, flags=flags, analysis=analysis, mask=external_mask)
+            return self._result_mapping(observed, qmap, parameters=specs, flags=flags, analysis=analysis, mask=display_mask)
         try:
             sigma_source = sigma if sigma is not None else _payload_option(payload_mapping, ("sigma",))
             weights_source = weights if weights is not None else _payload_option(payload_mapping, ("weights", "weight"))
@@ -1321,10 +1601,11 @@ class ButterflyAnalysisService:
                 # Full-pixel refinement is the service default.  Sampling is
                 # opt-in through the explicit max_pixels/speed_cap payload.
                 "max_pixels": max_pixels,
-                "scales": (0.25, 0.5, 1.0),
-                "seed": 0,
-                "mask": external_mask,
-                "q_window": resolved_q_window,
+                "scales": normalized_analysis["scales"],
+                "seed": normalized_analysis["seed"],
+                "robust_loss": normalized_analysis["robust_loss"],
+                "f_scale": normalized_analysis["f_scale"],
+                "max_nfev": normalized_analysis["max_nfev"],
                 "reference_axis_deg": _reference_axis_deg(analysis),
                 "auto_scale_initial": bool(
                     analysis.get(
@@ -1338,26 +1619,54 @@ class ButterflyAnalysisService:
                 fit_kwargs["sigma"] = sigma_array
             if weights_array is not None:
                 fit_kwargs["weights"] = weights_array
+            domain, _ = _service_analysis_domain(
+                observed,
+                qmap,
+                mask=external_mask,
+                analysis=normalized_analysis,
+                sigma=sigma_array,
+                weights=weights_array,
+                detector_valid=detector_valid,
+                roi_exclusion=roi_exclusion,
+            )
+            fit_mask = ~domain.fit_valid_mask
+            fit_kwargs["mask"] = fit_mask if np.any(fit_mask) else None
+            fit_kwargs["q_window"] = domain.q_window
             fit = fit_intensity_model(frame, qmap, **fit_kwargs)
         except Exception as exc:
             flags.append(f"intensity_fit_failed:{type(exc).__name__}")
-            return self._result_mapping(observed, qmap, parameters=specs, flags=flags, analysis=analysis, mask=external_mask)
+            return self._result_mapping(observed, qmap, parameters=specs, flags=flags, analysis=analysis, mask=display_mask)
         fitted_values = parameter_values(_read(fit, ("parameters",), values))
         result_specs = _updated_specs(specs, fitted_values, stderr=_read(fit, ("stderr",), {}))
         if bool(_payload_option(payload_mapping, ("commit_parameters", "commit"), True)):
             self._parameter_specs = deepcopy(result_specs)
-        observables = self._measure(observed, qmap, flags, mask=external_mask, analysis=analysis)
-        return self._result_mapping(observed, qmap, fit.model_image, observed - fit.model_image, parameters=result_specs, observables=observables, flags=flags, fit=fit, mask=external_mask, analysis=analysis)
+        sampled_indices = _read(fit, ("sampled_indices",), None)
+        if sampled_indices is not None:
+            domain = domain.with_sampled_indices(sampled_indices)
+        observables = self._measure(
+            observed,
+            qmap,
+            flags,
+            mask=display_mask,
+            analysis=analysis,
+            analysis_domain=domain,
+        )
+        return self._result_mapping(observed, qmap, fit.model_image, observed - fit.model_image, parameters=result_specs, observables=observables, flags=flags, fit=fit, mask=display_mask, analysis=analysis, analysis_domain=domain)
 
     def analyze_frame(self, frame: Any, initial: Any = None, *, warm_start: bool = False, config: Any = None) -> dict[str, Any]:
-        del config
         path = _read(frame, ("path", "input_path"), frame)
         frame_selector, dataset = _frame_selectors(frame)
         payload = self.load_image(path, frame=frame_selector, dataset=dataset)
         params = initial if warm_start and initial is not None else self.parameters
         if isinstance(initial, Mapping):
             params = initial.get("parameters", initial)
-        result = self.optimize(parameters=params, parameter_specs=params if _is_spec_mapping(params) else self.parameters, payload=payload)
+        config_analysis = _analysis_payload(config)
+        result = self.optimize(
+            parameters=params,
+            parameter_specs=params if _is_spec_mapping(params) else self.parameters,
+            payload=payload,
+            analysis_settings=config_analysis,
+        )
         result["frame"] = str(path)
         result["frame_selector"] = frame_selector
         result["dataset"] = dataset
@@ -1445,6 +1754,7 @@ class ButterflyAnalysisService:
                     run,
                     output_dir,
                     provenance={"source": "ButterflySAXS UI"},
+                    force=bool(payload_mapping.get("force", False)),
                 ).items()
             }
         return {
@@ -1455,6 +1765,15 @@ class ButterflyAnalysisService:
             "checkpoint": str(run.checkpoint) if run.checkpoint is not None else None,
             "flags": list(SERVICE_FLAGS),
         }
+
+    def preflight(self, package: str | Path, **kwargs: Any) -> dict[str, Any]:
+        """Run the same read-only preflight contract used by the CLI."""
+
+        from .preflight import run_preflight
+
+        if kwargs.get("poni") is None and self.poni_path not in {None, "in-memory"}:
+            kwargs["poni"] = self.poni_path
+        return run_preflight(package, **kwargs)
 
 
 AnalysisService = ButterflyAnalysisService

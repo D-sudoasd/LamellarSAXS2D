@@ -19,6 +19,40 @@ OKABE_ITO = {
 }
 
 
+def _diagnostic_q_unit(q_unit: str | None) -> str:
+    """Return the small set of q-unit labels that can be shown honestly."""
+
+    normalized = str(q_unit or "unknown").strip().lower().replace(" ", "")
+    if normalized in {"1/nm", "nm^-1", "nm^−1", "nm−1", "nm-1", "nm⁻¹"}:
+        return "nm^-1"
+    if normalized in {
+        "1/a",
+        "a^-1",
+        "a−1",
+        "a-1",
+        "angstrom^-1",
+        "å^-1",
+        "å^−1",
+        "å−1",
+        "å⁻¹",
+    }:
+        return "Å^-1"
+    if normalized in {"pixel-q", "pixel_q", "pixelq", "pixel"}:
+        return "pixel-q"
+    return "unknown"
+
+
+def _diagnostic_q_axis_labels(q_unit: str | None) -> tuple[str, str]:
+    unit = _diagnostic_q_unit(q_unit)
+    if unit == "nm^-1":
+        suffix = r"nm$^{-1}$"
+    elif unit == "Å^-1":
+        suffix = r"Å$^{-1}$"
+    else:
+        suffix = unit
+    return rf"$q_x$ ({suffix})", rf"$q_y$ ({suffix})"
+
+
 def _finite_limits(values: np.ndarray, lower: float = 1.0, upper: float = 99.5) -> tuple[float, float]:
     finite = np.asarray(values, dtype=float)
     finite = finite[np.isfinite(finite)]
@@ -52,6 +86,7 @@ def plot_fit_diagnostics(
     qy: np.ndarray,
     *,
     valid_mask: np.ndarray | None = None,
+    q_unit: str = "unknown",
     ridge_xy: np.ndarray | Sequence[Sequence[float]] | None = None,
     ellipse_curves: Iterable[np.ndarray | Sequence[Sequence[float]]] = (),
     output: str | Path | None = None,
@@ -88,6 +123,7 @@ def plot_fit_diagnostics(
     if not np.isfinite(resid_lim) or resid_lim <= 0:
         resid_lim = 1.0
     ext = _extent(np.asarray(qx), np.asarray(qy))
+    qx_label, qy_label = _diagnostic_q_axis_labels(q_unit)
 
     fig, axes = plt.subplots(2, 2, figsize=(7.2, 6.4), constrained_layout=True)
     panels = (
@@ -108,8 +144,8 @@ def plot_fit_diagnostics(
             aspect="equal",
         )
         ax.set_title(panel_title, fontsize=9)
-        ax.set_xlabel(r"$q_x$ (nm$^{-1}$)")
-        ax.set_ylabel(r"$q_y$ (nm$^{-1}$)")
+        ax.set_xlabel(qx_label)
+        ax.set_ylabel(qy_label)
         ax.text(-0.13, 1.04, label, transform=ax.transAxes, fontweight="bold", fontsize=10)
         fig.colorbar(image, ax=ax, shrink=0.82, label="Intensity (input units)" if panel_title != "Residual" else "Data - model")
 

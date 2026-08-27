@@ -1,0 +1,119 @@
+{
+  "schema_version": "lamellarsaxs2d.acceptance_thresholds.v1",
+  "thresholds_version": "draft-v1-provisional",
+  "status": "draft_provisional",
+  "frozen": false,
+  "usable_for_final_pass_fail": false,
+  "policy": {
+    "algorithm_performance_may_change_thresholds": false,
+    "requires_human_repeatability": true,
+    "requires_instrument_resolution": true,
+    "requires_pilot_evidence": true
+  },
+  "evidence_sources": {
+    "human_annotation_repeatability": null,
+    "instrument_resolution": null,
+    "pilot_report": null,
+    "frozen_by": null,
+    "frozen_at": null
+  },
+  "evidence_record_contract": {
+    "human_annotation_repeatability": [
+      "status=complete",
+      "source JSON schema=lamellarsaxs2d.human_repeatability.v1",
+      "sha256",
+      "metric.value finite and non-negative",
+      "metric.unit=px",
+      "metric.aggregation is reproducible from eight per_frame_error_px values",
+      "source annotation_status_sha256 matches the completed annotation status",
+      "source reviewed_by/reviewed_at"
+    ],
+    "instrument_resolution": [
+      "status=complete",
+      "source JSON schema=lamellarsaxs2d.instrument_resolution.v1",
+      "sha256",
+      "metric.value finite and positive",
+      "metric.unit=nm^-1",
+      "metric.aggregation is reproducible from measurements_nm_inv",
+      "source calibration_record exists and its sha256 matches",
+      "source method/reviewed_by/reviewed_at"
+    ],
+    "pilot_report": [
+      "status=complete",
+      "source JSON schema=lamellarsaxs2d.pilot_evidence.v1",
+      "sha256",
+      "frame_count=8",
+      "source has exactly blind_001 through blind_008",
+      "source annotation_status_sha256 and consensus_sha256 match current evidence",
+      "source frame_results exactly match eight consensus statuses",
+      "source reviewed_by/reviewed_at"
+    ],
+    "freeze_audit": [
+      "frozen_by",
+      "frozen_at"
+    ]
+  },
+  "fixed_contracts": {
+    "input_sha256_before_after_equal": true,
+    "mask_shape_exact": true,
+    "mask_logic_exact": true,
+    "masked_pixel_false_positive_count": 0,
+    "ambiguous_selector_fails_closed": true,
+    "unscaled_condition_cannot_drive_quality": true
+  },
+  "t1_high_snr": {
+    "ridge_detector_median_error_px_max": 0.5,
+    "ridge_detector_p95_error_px_max": 1.0,
+    "ridge_f1_min": 0.9,
+    "lobe_periodic_angle_error_deg_max": 1.0,
+    "ellipse_a_relative_error_max": 0.03,
+    "ellipse_b_relative_error_max": 0.03,
+    "ellipse_theta_periodic_error_deg_max": 1.0,
+    "ellipse_center_equivalent_pixel_error_max": 0.5,
+    "same_seed_deterministic": true
+  },
+  "t2_independent": {
+    "ridge_error_local_fwhm_fraction_max": 0.25,
+    "pattern_class_accuracy_min": 0.9,
+    "projection_a_relative_error_max": 0.05,
+    "projection_b_relative_error_max": 0.05,
+    "projection_tilt_error_deg_max": 1.0,
+    "structure_truth_is_not_empirical_inverse_truth": true
+  },
+  "full2d_quality": {
+    "scaled_condition_pass_lt": 100000000.0,
+    "scaled_condition_warn_lt_or_equal": 1000000000000.0,
+    "scaled_condition_fail_gt": 1000000000000.0,
+    "nonfinite_condition_fails": true,
+    "critical_bound_hit_fails": true,
+    "withheld_failure_fails": true,
+    "structured_residual_fails": true
+  },
+  "uncertainty": {
+    "repeats_per_representative_condition_min": 100,
+    "repeats_per_representative_condition_max": 200,
+    "interval_level": 0.95,
+    "empirical_coverage_min": 0.9,
+    "empirical_coverage_max": 0.98,
+    "false_pass_rate_max": 0.05,
+    "statistical_and_selection_uncertainty_separate": true
+  },
+  "real_data": {
+    "ridge_f1_min": 0.9,
+    "lobe_periodic_angle_error_deg_max": 1.0,
+    "repeat_frame_apparent_parameter_cv_max": 0.05,
+    "pilot_frame_count": 8,
+    "pilot_difficult_or_negative_count_min": 4,
+    "holding_sequence_denominator": 120,
+    "usable_fraction_min": 0.9,
+    "independent_warm_start_difference_within_combined_uncertainty": true,
+    "forward_reverse_systematic_bias_allowed": false,
+    "resume_matches_continuous": true
+  },
+  "notes": [
+    "All numerical scientific thresholds are copied from the v2.0 implementation plan and remain provisional.",
+    "Create acceptance_thresholds_v1.json only after human repeatability, instrument resolution, and pilot evidence are recorded.",
+    "Non-empty placeholder strings do not satisfy the evidence record contract.",
+    "Do not relax thresholds after observing algorithm performance."
+  ]
+}

@@ -738,23 +738,53 @@ def export_batch(
     *,
     provenance: Mapping[str, Any] | None = None,
     prefix: str = "",
+    force: bool = False,
 ) -> dict[str, Path]:
     """Write CSV, JSON/JSONL, NPZ and evolution-plot exports.
 
     The returned mapping uses stable logical keys (``frame_summary``,
     ``parameters_long``, ``ridge_points``, ``ellipse_fit``, ``npz``, and
     ``evolution_png``) and points to the actual files.
+
+    Existing targets are rejected before any export is written unless
+    ``force=True`` is explicitly supplied.
     """
 
     # Also tolerate export_batch(output_dir, batch), a common notebook form.
     if isinstance(batch, (str, os.PathLike, Path)) and not isinstance(output_dir, (str, os.PathLike, Path)):
         batch, output_dir = output_dir, batch
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     results = _frame_results(batch)
     stem = f"{prefix}" if prefix else ""
 
     frame_summary = output / f"{stem}frame_summary.csv"
+    parameters_long = output / f"{stem}parameters_long.csv"
+    ridge_points = output / f"{stem}ridge_points.csv"
+    ellipse_fit = output / f"{stem}ellipse_fit.json"
+    ellipse_jsonl = output / f"{stem}ellipse_fit.jsonl"
+    manifest_path = output / f"{stem}manifest.json"
+    provenance_path = output / f"{stem}provenance.json"
+    npz_path = output / f"{stem}results.npz"
+    evolution_path = output / f"{stem}evolution.png"
+    targets = (
+        frame_summary,
+        parameters_long,
+        ridge_points,
+        ellipse_fit,
+        ellipse_jsonl,
+        manifest_path,
+        provenance_path,
+        npz_path,
+        evolution_path,
+    )
+    existing_targets = [path for path in targets if path.exists()]
+    if existing_targets and not force:
+        paths = ", ".join(str(path) for path in existing_targets)
+        raise FileExistsError(
+            f"Export target(s) already exist; pass force=True to overwrite: {paths}"
+        )
+    output.mkdir(parents=True, exist_ok=True)
+
     _write_csv(
         frame_summary,
         _frame_summary_rows(results),
@@ -785,7 +815,6 @@ def export_batch(
                 "scientific_flags": _json_text(result_flags),
             }
             parameter_rows.append(row)
-    parameters_long = output / f"{stem}parameters_long.csv"
     _write_csv(
         parameters_long,
         parameter_rows,
@@ -815,7 +844,6 @@ def export_batch(
                 "point_index": point_index,
                 **point,
             })
-    ridge_points = output / f"{stem}ridge_points.csv"
     _write_csv(ridge_points, ridge_rows)
 
     ellipse_rows = []
@@ -824,12 +852,10 @@ def export_batch(
             **_frame_base(item, index),
             "ellipse_fit": _json_safe(_ellipse_fit(item.result)),
         })
-    ellipse_fit = output / f"{stem}ellipse_fit.json"
     ellipse_fit.write_text(
         json.dumps({"frames": ellipse_rows}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    ellipse_jsonl = output / f"{stem}ellipse_fit.jsonl"
     with ellipse_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
         for row in ellipse_rows:
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
@@ -862,15 +888,11 @@ def export_batch(
         "user_manifest": _json_safe(batch_manifest),
         "provenance": provenance_value,
     }
-    manifest_path = output / f"{stem}manifest.json"
     manifest_path.write_text(json.dumps(manifest_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
-    provenance_path = output / f"{stem}provenance.json"
     provenance_path.write_text(json.dumps(provenance_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
-    npz_path = output / f"{stem}results.npz"
     _write_npz(npz_path, results)
-    evolution_path = output / f"{stem}evolution.png"
     _write_evolution(evolution_path, results)
     return {
         "frame_summary": frame_summary,

@@ -56,6 +56,47 @@ def test_service_marks_unusable_pixels_and_reports_q_units() -> None:
         assert result["ellipse_fit"]["Lz_from_draw_axis_nm"] is None
 
 
+def test_service_converts_explicit_angstrom_inverse_qmap_to_nm_inverse() -> None:
+    image = np.ones((3, 4), dtype=float)
+    qx = np.full(image.shape, 0.1)
+    qy = np.zeros(image.shape)
+    service = ButterflyAnalysisService()
+
+    payload = service.set_observed(
+        image,
+        qmap={"qx": qx, "qy": qy, "q": np.hypot(qx, qy), "q_unit": "Å^-1"},
+    )
+
+    assert payload["qmap"]["q_unit"] == "nm^-1"
+    assert payload["qmap"]["source_q_unit"] == "Å^-1"
+    assert payload["qmap"]["q_conversion_factor_to_nm_inv"] == 10.0
+    assert np.allclose(payload["qmap"]["q"], 1.0)
+
+
+def test_service_converts_direct_payload_angstrom_qmap_to_nm_inverse() -> None:
+    image = np.ones((3, 4), dtype=float)
+    qx = np.full(image.shape, 0.1)
+    qy = np.zeros(image.shape)
+    service = ButterflyAnalysisService()
+
+    _, qmap, _, _, _, _ = service._state(
+        {
+            "observed": image,
+            "qmap": {
+                "qx": qx,
+                "qy": qy,
+                "q": np.hypot(qx, qy),
+                "q_unit": "Å^-1",
+            },
+        }
+    )
+
+    assert qmap["q_unit"] == "nm^-1"
+    assert qmap["source_q_unit"] == "Å^-1"
+    assert qmap["q_conversion_factor_to_nm_inv"] == 10.0
+    assert np.allclose(qmap["q"], 1.0)
+
+
 def test_service_forwards_weight_arrays_and_paths_without_default_sampling(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -105,7 +146,8 @@ def test_service_measurement_payload_controls_the_observable_chain(monkeypatch) 
         captured.update(kwargs)
         captured["q_window"] = q_window
         assert frame.shape == image.shape
-        assert supplied_qmap is qmap
+        assert supplied_qmap["q_unit"] == "nm^-1"
+        np.testing.assert_allclose(supplied_qmap["qx"], qmap["qx"])
         return SimpleNamespace(flags=(), ridge=None, ellipse=None)
 
     monkeypatch.setattr(service_module, "measure_observables", fake_measure)
@@ -163,6 +205,42 @@ def test_draw_axis_controls_preview_and_fit_reference_axis(monkeypatch) -> None:
     service.optimize(parameters=service.parameters, payload={**state, "analysis": settings})
     assert captured["preview_reference_axis_deg"] == 33.0
     assert captured["fit_reference_axis_deg"] == 33.0
+
+
+def test_service_forwards_all_fit_controls_and_reports_shared_domain(monkeypatch) -> None:
+    image = np.ones((5, 6), dtype=float)
+    service = ButterflyAnalysisService()
+    state = service.set_observed(image)
+    captured: dict[str, object] = {}
+
+    def fake_fit(frame, qmap, **kwargs):
+        del frame, qmap
+        captured.update(kwargs)
+        return _FakeFit(image.shape)
+
+    monkeypatch.setattr(service_module, "fit_intensity_model", fake_fit)
+    result = service.optimize(
+        parameters=service.parameters,
+        payload={
+            **state,
+            "analysis": {
+                "robust_loss": "huber",
+                "f_scale": 2.5,
+                "max_nfev": 123,
+                "scales": [0.5, 1.0],
+                "seed": 17,
+            },
+        },
+    )
+
+    assert captured["robust_loss"] == "huber"
+    assert captured["f_scale"] == 2.5
+    assert captured["max_nfev"] == 123
+    assert captured["scales"] == (0.5, 1.0)
+    assert captured["seed"] == 17
+    assert result["analysis_domain"]["fit_pixel_count"] == image.size
+    assert result["metrics"]["domain_counts"]["fit_pixel_count"] == image.size
+    np.testing.assert_array_equal(result["fit_valid_mask"], result["valid_mask"])
 
 
 def test_service_analysis_auto_window_and_zero_max_pixels_are_explicit(monkeypatch) -> None:
@@ -240,6 +318,56 @@ def test_service_rejects_wrong_shape_masks_instead_of_fitting(monkeypatch) -> No
         )
 
 
+def test_service_rejects_invalid_roi_instead_of_ignoring_it(monkeypatch) -> None:
+    image = np.ones((5, 6), dtype=float)
+    service = ButterflyAnalysisService()
+    state = service.set_observed(image)
+
+    def should_not_fit(*args, **kwargs):
+        raise AssertionError("invalid ROI reached the optimizer")
+
+    monkeypatch.setattr(service_module, "fit_intensity_model", should_not_fit)
+    with pytest.raises(ValueError, match="invalid ROI exclusion specification"):
+        service.optimize(
+            parameters=service.parameters,
+            payload={**state, "rois": [{"type": "rectangle", "x0": 0}]},
+        )
+
+
+def test_service_reports_detector_external_and_roi_counts_separately() -> None:
+    image = np.ones((4, 4), dtype=float)
+    service = ButterflyAnalysisService()
+    state = service.set_observed(image)
+    detector_valid = np.ones(image.shape, dtype=bool)
+    detector_valid[0, 0] = False
+    external_mask = np.zeros(image.shape, dtype=bool)
+    external_mask[0, 1] = True
+
+    result = service.preview(
+        parameters=service.parameters,
+        payload={
+            **state,
+            "valid_mask": detector_valid,
+            "external_mask": external_mask,
+            "rois": [
+                {
+                    "type": "rectangle",
+                    "x0": 2,
+                    "x1": 2,
+                    "y0": 0,
+                    "y1": 0,
+                }
+            ],
+        },
+    )
+
+    counts = result["analysis_domain"]
+    assert counts["detector_valid_count"] == 15
+    assert counts["external_mask_excluded_count"] == 1
+    assert counts["roi_excluded_count"] == 1
+    assert counts["fit_pixel_count"] == 13
+
+
 def test_service_optimize_can_defer_parameter_commit(monkeypatch) -> None:
     image = np.ones((5, 6), dtype=float)
     service = ButterflyAnalysisService()
@@ -298,6 +426,67 @@ def test_service_analyze_frame_forwards_per_frame_selectors(monkeypatch, tmp_pat
     ]
     assert result["frame_selector"] == 2
     assert result["dataset"] == "entry/data"
+
+
+def test_service_analyze_frame_forwards_config_window_and_fit_controls(
+    monkeypatch, tmp_path: Path
+) -> None:
+    image = np.ones((5, 6), dtype=float)
+    yy, xx = np.indices(image.shape, dtype=float)
+    qmap = {"qx": xx / 4.0, "qy": yy / 4.0, "q_unit": "1/nm"}
+    service = ButterflyAnalysisService()
+    state = service.set_observed(image, qmap=qmap)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(service, "load_image", lambda *args, **kwargs: state)
+
+    def fake_fit(frame, supplied_qmap, **kwargs):
+        del frame, supplied_qmap
+        captured.update(kwargs)
+        return _FakeFit(image.shape)
+
+    monkeypatch.setattr(service_module, "fit_intensity_model", fake_fit)
+    result = service.analyze_frame(
+        tmp_path / "frame.npy",
+        config={
+            "analysis": {
+                "q_window": {"q_min": 0.5, "q_max": 1.0},
+                "robust_loss": "huber",
+                "f_scale": 2.5,
+                "max_nfev": 17,
+            }
+        },
+    )
+
+    assert captured["q_window"] == (0.5, 1.0)
+    assert captured["robust_loss"] == "huber"
+    assert captured["f_scale"] == 2.5
+    assert captured["max_nfev"] == 17
+    assert result["analysis_domain"]["q_window"] == [0.5, 1.0]
+    assert result["analysis_domain"]["q_window_pixel_count"] < image.size
+
+
+def test_service_analyze_frame_accepts_q_range_and_existing_q_min_q_max(
+    monkeypatch, tmp_path: Path
+) -> None:
+    image = np.ones((4, 5), dtype=float)
+    yy, xx = np.indices(image.shape, dtype=float)
+    qmap = {"qx": xx / 4.0, "qy": yy / 4.0, "q_unit": "1/nm"}
+    service = ButterflyAnalysisService()
+    state = service.set_observed(image, qmap=qmap)
+    monkeypatch.setattr(service, "load_image", lambda *args, **kwargs: state)
+    monkeypatch.setattr(
+        service_module,
+        "fit_intensity_model",
+        lambda frame, supplied_qmap, **kwargs: _FakeFit(image.shape),
+    )
+
+    result = service.analyze_frame(
+        tmp_path / "frame.npy",
+        config={"q_range": [0.25, 0.75], "q_min": 0.5},
+    )
+
+    assert result["analysis_domain"]["q_window"] == [0.5, 0.75]
 
 
 def test_stale_service_batch_does_not_overwrite_newer_parameter_state(

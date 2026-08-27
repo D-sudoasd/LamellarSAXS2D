@@ -1,0 +1,18 @@
+{
+  "schema_version": "lamellarsaxs2d.instrument_resolution.v1",
+  "status": "awaiting_instrument_review",
+  "measurements_nm_inv": [],
+  "metric": {
+    "value": null,
+    "unit": "nm^-1",
+    "aggregation": "median"
+  },
+  "method": null,
+  "calibration_record": {
+    "source": null,
+    "sha256": null
+  },
+  "reviewed_by": null,
+  "reviewed_at": null,
+  "notes": "Record positive measured values and hash the underlying calibration record; detector sampling alone is not full instrument resolution."
+}

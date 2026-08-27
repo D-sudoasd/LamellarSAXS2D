@@ -24,6 +24,7 @@ import re
 import numpy as np
 
 from .project import ProjectConfig, load_project
+from .validation import AnalysisDomain, build_analysis_domain, normalise_q_arrays
 
 
 class PipelineError(RuntimeError):
@@ -261,6 +262,45 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
             )
         return array
 
+    def normalise_mapping(result: dict[str, Any]) -> dict[str, Any]:
+        qx = result.get("qx", result.get("qx_nm_inv"))
+        qy = result.get("qy", result.get("qy_nm_inv"))
+        if qx is None or qy is None:
+            return result
+        q = result.get("q", result.get("q_nm_inv", result.get("radius")))
+        if q is None:
+            q = np.hypot(np.asarray(qx, dtype=float), np.asarray(qy, dtype=float))
+        metadata = result.get("metadata")
+        metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
+        source_unit = result.get("q_unit", result.get("unit"))
+        if source_unit is None:
+            source_unit = metadata.get("q_unit", metadata.get("unit"))
+        if source_unit is None and any(
+            key in result for key in ("qx_nm_inv", "qy_nm_inv", "q_nm_inv")
+        ):
+            source_unit = "nm^-1"
+        qx_array, qy_array, q_array, unit_info = normalise_q_arrays(
+            qx,
+            qy,
+            q,
+            source_unit,
+        )
+        if (
+            result.get("q_unit") == "nm^-1"
+            and "q_conversion_factor_to_nm_inv" in result
+        ):
+            unit_info["source_q_unit"] = result.get("source_q_unit")
+            unit_info["q_conversion_factor_to_nm_inv"] = result.get(
+                "q_conversion_factor_to_nm_inv"
+            )
+        result["qx"] = qx_array
+        result["qy"] = qy_array
+        result["q"] = q_array
+        result.update(unit_info)
+        metadata.update(unit_info)
+        result["metadata"] = metadata
+        return result
+
     if isinstance(value, Mapping):
         result = dict(value)
         for key in (
@@ -276,7 +316,7 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
                 result.pop(key, None)
             else:
                 result[key] = array
-        return result
+        return normalise_mapping(result)
     if isinstance(value, (tuple, list)) and len(value) >= 2:
         result = {}
         qx = coerce_field("qx", value[0])
@@ -289,7 +329,7 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
             q = coerce_field("q", value[2])
             if q is not None:
                 result["q"] = q
-        return result
+        return normalise_mapping(result)
     attrs: dict[str, Any] = {}
     aliases = {
         "qx": ("qx", "qx_nm_inv"),
@@ -325,10 +365,10 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
                 attrs["q_unit"] = unit
                 break
     if attrs:
-        return {"object": value, **attrs}
+        return normalise_mapping({"object": value, **attrs})
     array = np.asarray(value)
     if array.shape == shape + (2,):
-        return {"qx": array[..., 0], "qy": array[..., 1]}
+        return normalise_mapping({"qx": array[..., 0], "qy": array[..., 1]})
     raise PipelineError("qmap 必须包含 qx/qy 数组，或形状为 (高, 宽, 2) 的数组")
 
 
@@ -372,6 +412,7 @@ class _FrameBundle:
     metadata: dict[str, Any]
     qmap: Any | None
     valid_mask: np.ndarray | None = None
+    external_mask: np.ndarray | None = None
 
 
 def _combine_valid_masks(
@@ -379,6 +420,8 @@ def _combine_valid_masks(
     *,
     valid_masks: Iterable[Any] = (),
     masks: Iterable[Any] = (),
+    frame: int | None = None,
+    dataset: str | None = None,
 ) -> np.ndarray | None:
     """Combine positive and negative mask conventions without overwriting.
 
@@ -388,14 +431,19 @@ def _combine_valid_masks(
     all supplied values.
     """
 
-    from .io import combine_masks
+    from .io import combine_masks, load_image
 
     combined: np.ndarray | None = None
     try:
         for value in valid_masks:
             if value is None:
                 continue
-            current = combine_masks(shape, valid_mask=value)
+            raw = (
+                load_image(value, frame=frame, dataset=dataset).data
+                if isinstance(value, (str, os.PathLike, Path))
+                else value
+            )
+            current = combine_masks(shape, valid_mask=raw)
             if current is not None:
                 combined = current if combined is None else (combined & current)
         for value in masks:
@@ -406,6 +454,36 @@ def _combine_valid_masks(
                 combined = current if combined is None else (combined & current)
     except Exception as exc:  # noqa: BLE001 - normalize source/config errors
         raise PipelineError(f"掩膜无法与图像形状 {shape} 合并：{exc}") from exc
+    return combined
+
+
+def _combine_external_masks(
+    shape: tuple[int, int],
+    masks: Iterable[Any] = (),
+    *,
+    frame: int | None = None,
+    dataset: str | None = None,
+) -> np.ndarray | None:
+    """Load and OR negative-polarity masks without mixing detector validity."""
+
+    from .io import combine_masks, load_image
+
+    combined: np.ndarray | None = None
+    try:
+        for value in masks:
+            if value is None:
+                continue
+            raw = (
+                load_image(value, frame=frame, dataset=dataset).data
+                if isinstance(value, (str, os.PathLike, Path))
+                else value
+            )
+            valid = combine_masks(shape, external_mask=raw)
+            if valid is not None:
+                current = ~valid
+                combined = current if combined is None else (combined | current)
+    except Exception as exc:  # noqa: BLE001 - normalize mask boundary errors
+        raise PipelineError(f"外部掩膜无法与图像形状 {shape} 合并：{exc}") from exc
     return combined
 
 
@@ -473,6 +551,8 @@ def _read_frame_bundle(
     dataset: str | None = None,
     valid_mask: Any = None,
     external_mask: Any = None,
+    mask_frame: int | None = None,
+    mask_dataset: str | None = None,
 ) -> _FrameBundle:
     """Read one frame while retaining ``LoadedImage.valid_mask`` and qmap mask."""
 
@@ -480,6 +560,14 @@ def _read_frame_bundle(
     configured_dataset = dataset if dataset is not None else _config_value(config, "dataset", None)
     configured_valid_mask = valid_mask if valid_mask is not None else _config_value(config, "valid_mask", None)
     configured_mask = external_mask if external_mask is not None else _config_value(config, "mask", None)
+    configured_mask_frame = (
+        mask_frame if mask_frame is not None else _config_value(config, "mask_frame", None)
+    )
+    configured_mask_dataset = (
+        mask_dataset
+        if mask_dataset is not None
+        else _config_value(config, "mask_dataset", None)
+    )
     if isinstance(source, Mapping):
         data = source.get("data", source.get("image", source.get("intensity")))
         if data is None:
@@ -495,7 +583,14 @@ def _read_frame_bundle(
         valid = _combine_valid_masks(
             image.shape,
             valid_masks=(*source_valid, configured_valid_mask),
-            masks=(*source_masks, configured_mask),
+            frame=configured_mask_frame,
+            dataset=configured_mask_dataset,
+        )
+        exclusion = _combine_external_masks(
+            image.shape,
+            (*source_masks, configured_mask),
+            frame=configured_mask_frame,
+            dataset=configured_mask_dataset,
         )
         frame = _loaded_frame(data, metadata=metadata, valid_mask=valid)
         return _FrameBundle(
@@ -504,6 +599,7 @@ def _read_frame_bundle(
             metadata=metadata,
             qmap=source.get("qmap"),
             valid_mask=getattr(frame, "valid_mask", None),
+            external_mask=exclusion,
         )
 
     if isinstance(source, np.ndarray) or (
@@ -525,7 +621,14 @@ def _read_frame_bundle(
         valid = _combine_valid_masks(
             image.shape,
             valid_masks=(*source_valid, configured_valid_mask),
-            masks=(*source_masks, configured_mask),
+            frame=configured_mask_frame,
+            dataset=configured_mask_dataset,
+        )
+        exclusion = _combine_external_masks(
+            image.shape,
+            (*source_masks, configured_mask),
+            frame=configured_mask_frame,
+            dataset=configured_mask_dataset,
         )
         frame = _loaded_frame(data, metadata=metadata, valid_mask=valid)
         return _FrameBundle(
@@ -534,6 +637,7 @@ def _read_frame_bundle(
             metadata=metadata,
             qmap=getattr(source, "qmap", None),
             valid_mask=getattr(frame, "valid_mask", valid),
+            external_mask=exclusion,
         )
 
     path = Path(source)
@@ -564,7 +668,8 @@ def _read_frame_bundle(
             "frame": configured_frame,
             "dataset": loader_dataset,
             "valid_mask": configured_valid_mask,
-            "external_mask": configured_mask,
+            "mask_frame": configured_mask_frame,
+            "mask_dataset": configured_mask_dataset,
         }
         reader_kwargs = {key: value for key, value in reader_kwargs.items() if value is not None}
         loaded = load_image(path, **reader_kwargs) if reader_kwargs else load_image(path)
@@ -575,6 +680,12 @@ def _read_frame_bundle(
     metadata = dict(getattr(loaded, "metadata", {}) or {})
     metadata.setdefault("path", os.fspath(path))
     valid = getattr(loaded, "valid_mask", None)
+    exclusion = _combine_external_masks(
+        data.shape,
+        (configured_mask,),
+        frame=configured_mask_frame,
+        dataset=configured_mask_dataset,
+    )
     embedded_qmap = getattr(loaded, "qmap", None)
     if embedded_qmap is None and suffix == ".npz":
         # The selected image itself is always read by io.load_image.  Reading
@@ -606,6 +717,7 @@ def _read_frame_bundle(
         metadata=metadata,
         qmap=embedded_qmap,
         valid_mask=valid,
+        external_mask=exclusion,
     )
 
 
@@ -642,14 +754,12 @@ def build_qmap(
     )
     if adapter is not None:
         try:
-            configured_mask = _config_value(config, "mask", None)
             result = _call_adapter(
                 adapter,
                 image=image,
                 config=config,
                 poni=poni,
                 valid_mask=valid_mask,
-                mask=configured_mask,
             )
             coerced = _coerce_qmap(result, image.shape)
             if isinstance(coerced, Mapping):
@@ -703,7 +813,7 @@ def build_qmap(
     if valid_mask is not None:
         result["valid_mask"] = np.asarray(valid_mask, dtype=bool)
         result["mask"] = ~result["valid_mask"]
-    return result
+    return _coerce_qmap(result, image.shape)
 
 
 def _q_window(image: np.ndarray, qmap: Any, config: Any = None) -> tuple[float, float] | Any:
@@ -760,25 +870,40 @@ def _analysis_options(image: np.ndarray, qmap: Any, config: Any = None) -> dict[
     }
 
 
-def _observable_mask(value: Any, shape: tuple[int, int], *, qmap: Any = None, config: Any = None) -> Any:
-    """Resolve detector masks and serializable q/pixel ROIs to True=invalid."""
+def _configured_external_mask(
+    value: Any,
+    shape: tuple[int, int],
+    *,
+    config: Any = None,
+) -> np.ndarray | None:
+    """Resolve one configured negative-polarity mask."""
 
-    masks: list[np.ndarray] = []
     if value is not None:
         if isinstance(value, (str, os.PathLike)):
             try:
-                from .io import combine_masks
+                from .io import combine_masks, load_image
 
-                valid = combine_masks(shape, external_mask=value)
-                if valid is not None:
-                    masks.append(~valid)
+                loaded_mask = load_image(
+                    value,
+                    frame=_config_value(config, "mask_frame", None),
+                    dataset=_config_value(config, "mask_dataset", None),
+                ).data
+                valid = combine_masks(shape, external_mask=loaded_mask)
+                return None if valid is None else ~valid
             except Exception as exc:  # noqa: BLE001 - report a useful config error
                 raise PipelineError(f"无法读取 analysis.mask：{value}（{exc}）") from exc
-        else:
-            array = np.asarray(value, dtype=bool)
-            if array.shape != shape:
-                raise PipelineError(f"analysis.mask 形状 {array.shape} 与图像 {shape} 不一致")
-            masks.append(array)
+        array = np.asarray(value, dtype=bool)
+        if array.shape != shape:
+            raise PipelineError(f"analysis.mask 形状 {array.shape} 与图像 {shape} 不一致")
+        return array
+    return None
+
+
+def _roi_exclusion_mask(
+    shape: tuple[int, int], *, qmap: Any = None, config: Any = None
+) -> np.ndarray | None:
+    """Resolve configured ROIs separately so their count remains auditable."""
+
     rois = _config_value(config, "rois", ())
     if rois:
         try:
@@ -787,12 +912,91 @@ def _observable_mask(value: Any, shape: tuple[int, int], *, qmap: Any = None, co
             qx = qy = None
             if qmap is not None:
                 qx, qy, _ = _qmap_arrays(qmap, shape)
-            masks.append(combine_exclusion_masks(shape, rois=rois, qx=qx, qy=qy))
+            return combine_exclusion_masks(shape, rois=rois, qx=qx, qy=qy)
         except Exception as exc:  # noqa: BLE001 - fail closed for ROI config
             raise PipelineError(f"无法解析 analysis.rois：{exc}") from exc
-    if not masks:
-        return None
-    return np.logical_or.reduce(masks)
+    return None
+
+
+def _observable_mask(value: Any, shape: tuple[int, int], *, qmap: Any = None, config: Any = None) -> Any:
+    """Resolve configured external mask and ROIs to one legacy exclusion mask."""
+
+    masks = [
+        item
+        for item in (
+            _configured_external_mask(value, shape, config=config),
+            _roi_exclusion_mask(shape, qmap=qmap, config=config),
+        )
+        if item is not None
+    ]
+    return None if not masks else np.logical_or.reduce(masks)
+
+
+def _analysis_domain(
+    image: np.ndarray,
+    qmap: Any,
+    *,
+    config: Any = None,
+    sigma: Any = None,
+    weights: Any = None,
+    detector_valid: Any = None,
+    external_mask: Any = None,
+    include_config_mask: bool = True,
+) -> AnalysisDomain:
+    """Resolve the single auditable pixel population for all analysis stages."""
+
+    qx, qy, q = _qmap_arrays(qmap, image.shape)
+    options = _analysis_options(image, qmap, config)
+    qmap_detector_valid = None
+    if isinstance(qmap, Mapping):
+        qmap_detector_valid = qmap.get("valid_mask", qmap.get("valid"))
+    if detector_valid is None:
+        detector_valid = qmap_detector_valid
+    elif qmap_detector_valid is not None:
+        detector_valid = (
+            np.asarray(detector_valid, dtype=bool)
+            & np.asarray(qmap_detector_valid, dtype=bool)
+        )
+    exclusions: list[np.ndarray] = []
+    if external_mask is not None:
+        explicit = np.asarray(external_mask, dtype=bool)
+        if explicit.shape != image.shape:
+            raise PipelineError(
+                f"external_mask 形状 {explicit.shape} 与图像 {image.shape} 不一致"
+            )
+        exclusions.append(explicit)
+    if include_config_mask:
+        configured = _configured_external_mask(
+            options["mask"], image.shape, config=config
+        )
+        if configured is not None:
+            exclusions.append(configured)
+    exclusion = None if not exclusions else np.logical_or.reduce(exclusions)
+    roi_exclusion = _roi_exclusion_mask(image.shape, qmap=qmap, config=config)
+    if sigma is None:
+        sigma = _config_value(config, "sigma", None)
+    if weights is None:
+        weights = _config_value(config, "weights", None)
+    if sigma is not None and not isinstance(sigma, np.ndarray):
+        sigma = _resolve_full2d_array(
+            sigma, name="sigma", shape=image.shape, config=config
+        )
+    if weights is not None and not isinstance(weights, np.ndarray):
+        weights = _resolve_full2d_array(
+            weights, name="weights", shape=image.shape, config=config
+        )
+    return build_analysis_domain(
+        image,
+        qx,
+        qy,
+        q=q,
+        detector_valid=detector_valid,
+        external_mask=exclusion,
+        roi_exclusion=roi_exclusion,
+        q_window=options["q_window"],
+        sigma=sigma,
+        weights=weights,
+    )
 
 
 def measure_observables(
@@ -802,23 +1006,24 @@ def measure_observables(
     config: Any = None,
     frame: Any = None,
     fit_ellipse: bool = True,
+    analysis_domain: AnalysisDomain | None = None,
 ) -> dict[str, Any]:
     """Measure angular/lobe/ridge observables with the declared config."""
 
     from . import observables as observable_module
 
     options = _analysis_options(image, qmap, config)
-    options["mask"] = _observable_mask(options["mask"], image.shape, qmap=qmap, config=config)
+    domain = analysis_domain or _analysis_domain(image, qmap, config=config)
     observed_frame = frame if frame is not None else _loaded_frame(image)
     result = observable_module.measure_observables(
         observed_frame,
         qmap,
-        options["q_window"],
+        domain.q_window,
         n_angular_bins=options["n_angular_bins"],
         n_ridge_angles=options["n_angles"],
         n_radial_bins=options["n_radial_bins"],
         fit_ellipse=bool(fit_ellipse),
-        mask=options["mask"],
+        mask=~domain.fit_valid_mask,
         ridge_method=options["ridge_method"],
         draw_axis_deg=options["draw_axis_deg"],
         curvature_sigma=options["curvature_sigma"],
@@ -830,21 +1035,27 @@ def measure_observables(
     return _public_angles(_as_mapping(result))
 
 
-def extract_ridges(image: np.ndarray, qmap: Any, *, config: Any = None) -> list[dict[str, float]]:
+def extract_ridges(
+    image: np.ndarray,
+    qmap: Any,
+    *,
+    config: Any = None,
+    analysis_domain: AnalysisDomain | None = None,
+) -> list[dict[str, float]]:
     """Extract the observed radial ridge with all configured safeguards."""
 
     from . import observables as observable_module
 
     options = _analysis_options(image, qmap, config)
-    options["mask"] = _observable_mask(options["mask"], image.shape, qmap=qmap, config=config)
+    domain = analysis_domain or _analysis_domain(image, qmap, config=config)
     frame = _loaded_frame(image)
     track = observable_module.measure_radial_ridges(
         frame,
         qmap,
-        options["q_window"],
+        domain.q_window,
         n_angles=options["n_angles"],
         n_bins=options["n_radial_bins"],
-        mask=options["mask"],
+        mask=~domain.fit_valid_mask,
         ridge_method=options["ridge_method"],
         curvature_sigma=options["curvature_sigma"],
         curvature_percentile=options["curvature_percentile"],
@@ -1218,6 +1429,7 @@ def fit_full2d(
     config: Any = None,
     frame: Any = None,
     initial_parameters: Any = None,
+    analysis_domain: AnalysisDomain | None = None,
 ) -> Any:
     """Run the empirical pixel-wise intensity refinement when requested."""
 
@@ -1225,7 +1437,6 @@ def fit_full2d(
     from .parameters import ParameterSet
 
     options = _analysis_options(image, qmap, config)
-    mask = _observable_mask(options["mask"], image.shape, qmap=qmap, config=config)
     observed_frame = frame if frame is not None else _loaded_frame(image)
     auto_initial = initial_parameters is None
     initial = initial_parameters
@@ -1289,7 +1500,6 @@ def fit_full2d(
         )
     kwargs: dict[str, Any] = {
         "q_window": options["q_window"],
-        "mask": mask,
         "fixed": analysis.get("fixed"),
         "bounds": analysis.get("bounds"),
         # Precision-first default: every valid detector pixel participates.
@@ -1317,6 +1527,15 @@ def fit_full2d(
                 shape=image.shape,
                 config=config,
             )
+    domain = analysis_domain or _analysis_domain(
+        image,
+        qmap,
+        config=config,
+        sigma=kwargs.get("sigma"),
+        weights=kwargs.get("weights"),
+    )
+    kwargs["q_window"] = domain.q_window
+    kwargs["mask"] = ~domain.fit_valid_mask
     kwargs = {key: value for key, value in kwargs.items() if value is not None}
     try:
         fit = fit_intensity_model(observed_frame, qmap, initial, **kwargs)
@@ -1372,6 +1591,7 @@ class PipelineResult:
     flags: dict[str, Any] = field(default_factory=dict)
     output_paths: list[str] = field(default_factory=list)
     valid_mask: np.ndarray | None = None
+    analysis_domain: AnalysisDomain | None = None
 
     @property
     def data(self) -> np.ndarray:
@@ -1412,6 +1632,9 @@ class PipelineResult:
             "image": self.image,
             "qmap": self.qmap,
             "valid_mask": self.valid_mask,
+            "analysis_domain": (
+                None if self.analysis_domain is None else self.analysis_domain.to_summary()
+            ),
         }
         return _jsonable(result, array_summary=not include_arrays)
 
@@ -1426,6 +1649,8 @@ def inspect_frame(
     dataset: str | None = None,
     valid_mask: Any = None,
     mask: Any = None,
+    mask_frame: int | None = None,
+    mask_dataset: str | None = None,
     fit_ellipse: bool = False,
 ) -> dict[str, Any]:
     """Return frame/q-space diagnostics, with ellipse fitting explicit.
@@ -1442,6 +1667,8 @@ def inspect_frame(
         dataset=dataset,
         valid_mask=valid_mask,
         external_mask=mask,
+        mask_frame=mask_frame,
+        mask_dataset=mask_dataset,
     )
     image, metadata, embedded_qmap = bundle.image, bundle.metadata, bundle.qmap
     selected_qmap = qmap if qmap is not None else embedded_qmap
@@ -1452,10 +1679,15 @@ def inspect_frame(
         config=config,
         valid_mask=bundle.valid_mask,
     )
-    report_valid_mask = bundle.valid_mask
-    if isinstance(qmap_obj, Mapping) and qmap_obj.get("valid_mask") is not None:
-        report_valid_mask = np.asarray(qmap_obj["valid_mask"], dtype=bool)
     qx, qy, q = _qmap_arrays(qmap_obj, image.shape)
+    domain = _analysis_domain(
+        image,
+        qmap_obj,
+        config=config,
+        detector_valid=bundle.valid_mask,
+        external_mask=bundle.external_mask,
+        include_config_mask=False,
+    )
     finite = np.isfinite(image)
     requested_fit_ellipse = bool(_config_value(config, "fit_ellipse", fit_ellipse))
     measured = measure_observables(
@@ -1464,6 +1696,7 @@ def inspect_frame(
         config=config,
         frame=bundle.frame,
         fit_ellipse=requested_fit_ellipse,
+        analysis_domain=domain,
     )
     return {
         "metadata": metadata,
@@ -1482,7 +1715,8 @@ def inspect_frame(
         "observables": _jsonable(measured),
         "ellipse_measured": requested_fit_ellipse,
         "ellipse_fit": _jsonable(measured.get("ellipse")),
-        "valid_mask": _jsonable(report_valid_mask),
+        "valid_mask": _jsonable(domain.fit_valid_mask),
+        "analysis_domain": domain.to_summary(),
         "flags": {
             "empirical_model_only": True,
             "mechanism_under_determined": True,
@@ -1507,6 +1741,8 @@ def analyze_frame(
     dataset: str | None = None,
     valid_mask: Any = None,
     mask: Any = None,
+    mask_frame: int | None = None,
+    mask_dataset: str | None = None,
     output: str | os.PathLike[str] | None = None,
     force: bool = False,
 ) -> PipelineResult:
@@ -1519,6 +1755,8 @@ def analyze_frame(
         dataset=dataset,
         valid_mask=valid_mask,
         external_mask=mask,
+        mask_frame=mask_frame,
+        mask_dataset=mask_dataset,
     )
     image, metadata, embedded_qmap = bundle.image, bundle.metadata, bundle.qmap
     if isinstance(source, (str, os.PathLike)):
@@ -1530,9 +1768,14 @@ def analyze_frame(
         config=config,
         valid_mask=bundle.valid_mask,
     )
-    result_valid_mask = bundle.valid_mask
-    if isinstance(qmap_obj, Mapping) and qmap_obj.get("valid_mask") is not None:
-        result_valid_mask = np.asarray(qmap_obj["valid_mask"], dtype=bool)
+    domain = _analysis_domain(
+        image,
+        qmap_obj,
+        config=config,
+        detector_valid=bundle.valid_mask,
+        external_mask=bundle.external_mask,
+        include_config_mask=False,
+    )
     # ``measure_observables`` owns the ridge and ellipse calculation.  Keep
     # ellipse fitting enabled here and adapt its result below; calling the
     # standalone ridge/ellipse solver afterwards would fit the same pixels a
@@ -1543,6 +1786,7 @@ def analyze_frame(
         config=config,
         frame=bundle.frame,
         fit_ellipse=True,
+        analysis_domain=domain,
     )
     observable_ellipse = observables.get("ellipse") if isinstance(observables, Mapping) else None
     if isinstance(observable_ellipse, Mapping):
@@ -1560,7 +1804,9 @@ def analyze_frame(
         # that does not expose its measured ridge track.  It does not trigger
         # an additional ellipse solver; the measured ellipse remains the
         # authoritative result for this frame.
-        ridges = extract_ridges(image, qmap_obj, config=config)
+        ridges = extract_ridges(
+            image, qmap_obj, config=config, analysis_domain=domain
+        )
     ellipse_fit = _public_ellipse_fit(
         observable_ellipse,
         n_points=len(ridges),
@@ -1592,10 +1838,13 @@ def analyze_frame(
             config=config,
             frame=bundle.frame,
             initial_parameters=initial_parameters,
+            analysis_domain=domain,
         )
         if run_full2d
         else None
     )
+    if isinstance(full2d_result, Mapping) and full2d_result.get("sampled_indices") is not None:
+        domain = domain.with_sampled_indices(full2d_result["sampled_indices"])
     result = PipelineResult(
         image=image,
         qmap=qmap_obj,
@@ -1610,7 +1859,8 @@ def analyze_frame(
             "forward_simulation_only": False,
             "nonunique_inverse_problem": True,
         },
-        valid_mask=result_valid_mask,
+        valid_mask=domain.fit_valid_mask,
+        analysis_domain=domain,
     )
     if output is not None:
         result.output_paths = [os.fspath(path) for path in export_result(result, output, force=force)]
@@ -1630,6 +1880,21 @@ def _result_arrays(result: PipelineResult) -> dict[str, np.ndarray]:
     arrays: dict[str, np.ndarray] = {"image": np.asarray(result.image)}
     if result.valid_mask is not None:
         arrays["valid_mask"] = np.asarray(result.valid_mask, dtype=bool)
+    if result.analysis_domain is not None:
+        for name in (
+            "finite_mask",
+            "detector_valid_mask",
+            "external_valid_mask",
+            "q_window_mask",
+            "roi_exclusion_mask",
+            "weight_valid_mask",
+            "fit_valid_mask",
+            "sampled_valid_mask",
+        ):
+            arrays[name] = np.asarray(
+                getattr(result.analysis_domain, name),
+                dtype=bool,
+            )
     if isinstance(result.qmap, Mapping):
         for key in ("qx", "qy", "q", "theta"):
             if key in result.qmap:

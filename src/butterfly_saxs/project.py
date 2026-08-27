@@ -221,9 +221,19 @@ class ProjectConfig:
         # Beamline files often put frame selectors and detector masks beside
         # the input path.  Promote them into the same analysis namespace used
         # by CLI/pipeline while retaining the original values on round-trip.
-        for key in ("frame", "dataset", "mask", "valid_mask"):
-            if key not in analysis and key in input_group:
-                analysis[key] = copy.deepcopy(input_group[key])
+        for key in (
+            "frame",
+            "dataset",
+            "mask",
+            "valid_mask",
+            "mask_frame",
+            "mask_dataset",
+        ):
+            if key in analysis:
+                continue
+            source_group = input_group if key in input_group else inputs_group
+            if key in source_group:
+                analysis[key] = copy.deepcopy(source_group[key])
         # Flat project knobs not consumed above are retained in analysis when
         # explicitly supplied by the [project] group.
         for key in (

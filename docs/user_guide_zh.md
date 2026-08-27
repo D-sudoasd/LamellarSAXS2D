@@ -7,32 +7,47 @@
 在项目根目录执行：
 
 ```powershell
-py -3 -m pip install -e .
-# 图形界面还需要 Qt/pyqtgraph 可选依赖
-py -3 -m pip install -e ".[ui]"
+python -m venv .venv-project
+.\.venv-project\Scripts\python.exe -m pip install -c constraints\validation-py311-313.txt -e ".[all]"
 ```
 
-安装后的 `bsaxs` 与 `py -3 -m butterfly_saxs` 是同一 CLI。若 Windows 的 `python` 指向 Store 占位程序，优先使用项目环境中的 `py -3` 或明确的虚拟环境解释器。
+安装后的 `bsaxs` 与 `python -m butterfly_saxs` 是同一 CLI。Windows 下建议直接使用 `.\.venv-project\Scripts\bsaxs.exe`；双击 `启动_LamellarSAXS2D.cmd` 也只使用这个已验证环境。旧 `.venv` 不会被删除或自动修复。
 
 ### 常用单帧命令
 
 PONI 是物理 q 坐标的校准输入，CBF、EDF、TIF/TIFF 的最小示例：
 
 ```powershell
-py -3 -m butterfly_saxs inspect data\frame_0001.cbf --poni geometry\detector.poni
-py -3 -m butterfly_saxs analyze data\frame_0001.cbf --poni geometry\detector.poni -o results\frame_0001
+.\.venv-project\Scripts\python.exe -m butterfly_saxs inspect data\frame_0001.cbf --poni geometry\detector.poni
+.\.venv-project\Scripts\python.exe -m butterfly_saxs analyze data\frame_0001.cbf --poni geometry\detector.poni -o results\frame_0001
 
-py -3 -m butterfly_saxs analyze data\frame_0001.edf --poni geometry\detector.poni -o results\edf_0001
-py -3 -m butterfly_saxs analyze data\frame_0001.tif --poni geometry\detector.poni -o results\tif_0001
+.\.venv-project\Scripts\python.exe -m butterfly_saxs analyze data\frame_0001.edf --poni geometry\detector.poni -o results\edf_0001
+.\.venv-project\Scripts\python.exe -m butterfly_saxs analyze data\frame_0001.tif --poni geometry\detector.poni -o results\tif_0001
 ```
 
 `inspect` 只检查输入、q 范围和基础观测量；`analyze` 执行观测量、脊线和镜像双椭圆拟合。需要像素级经验模型时加 `--full2d`：
 
 ```powershell
-py -3 -m butterfly_saxs analyze data\frame_0001.cbf --poni geometry\detector.poni --full2d -o results\frame_0001
+.\.venv-project\Scripts\python.exe -m butterfly_saxs analyze data\frame_0001.cbf --poni geometry\detector.poni --full2d -o results\frame_0001
 ```
 
 不想写文件时可以省略 `-o`，结果 JSON 摘要打印到终端。`-o` 指向目录时写 `<输入stem>.json` 和 `<输入stem>.npz`；也可直接指定 `.json`、`.npz` 或 `.csv`。已有输出不会自动覆盖，确认覆盖时显式加 `--force`。
+
+### 真实数据包预检
+
+在任何 ridge、ellipse 或 `full2d` 拟合前，先只读运行：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe preflight data_local\real_validation\sample_package `
+  --manifest manifest.csv `
+  --poni geometry\detector.poni `
+  --mask masks\detector_mask.npy `
+  -o results\validation\preflight
+```
+
+输入是数据包、可选 context、manifest、PONI 和 mask；输出目录包含 `preflight.json`、`arrays.npz` 和 `run_report.md`。其中 `arrays.npz` 保存单位限定的 q-map，以及 finite、detector、external mask、q-window、ROI、weight、fit 和 sampled 共 8 类 analysis-domain 掩膜。成功标准是没有未解释的 `red` 检查项；`yellow` 表示只读预检完成，但必须阅读原因，例如 provisional 时间、`partial` 不确定度或未烧入强度的 solid-angle/polarization。该命令不运行拟合，也不改写图像或 mask。已有输出默认拒绝覆盖，只有确认后才用 `--force`。
+
+退出码约定：`0` 为全部检查绿色通过；`1` 为预检完成但存在 `yellow/WARN`、质量失败或部分失败且证据已保留；`2` 为输入、配置、selector、单位、mask、PONI 或覆盖错误。
 
 ### 无 PONI 的边界
 
@@ -56,11 +71,13 @@ py -3 -m butterfly_saxs analyze data\frame_0001.cbf --poni geometry\detector.pon
 命令行选择器：
 
 ```powershell
-py -3 -m butterfly_saxs analyze data\scan.h5 --dataset "/entry/data" --frame 3 --poni geometry\detector.poni -o results\scan3
-py -3 -m butterfly_saxs inspect data\stack.tif --frame 0 --poni geometry\detector.poni
+.\.venv-project\Scripts\python.exe -m butterfly_saxs analyze data\scan.h5 --dataset "/entry/data" --frame 3 --poni geometry\detector.poni -o results\scan3
+.\.venv-project\Scripts\python.exe -m butterfly_saxs inspect data\stack.tif --frame 0 --poni geometry\detector.poni
 ```
 
 掩膜参数的极性不同：`--valid-mask` 中 `True` 是有效像素；`--mask` 中 `True` 是无效像素。两者都是布尔数组或路径，必须与所选二维图像同形状。
+
+图像的 `--frame/--dataset` 与掩膜的 `--mask-frame/--mask-dataset` 完全独立。NPY mask 不会继承 HDF5 图像的 dataset；多帧或多 dataset mask 必须显式给出自身 selector，否则快速失败。
 
 ## 3. 项目 TOML
 
@@ -124,9 +141,9 @@ chi_max_deg = -170
 以 TOML 运行单帧/项目：
 
 ```powershell
-py -3 -m butterfly_saxs inspect -c project.toml
-py -3 -m butterfly_saxs project project.toml
-py -3 -m butterfly_saxs project project.toml --force
+.\.venv-project\Scripts\python.exe -m butterfly_saxs inspect -c project.toml
+.\.venv-project\Scripts\python.exe -m butterfly_saxs project project.toml
+.\.venv-project\Scripts\python.exe -m butterfly_saxs project project.toml --force
 ```
 
 `project` 会按 `inputs.files` 顺序/自然排序逐帧分析，并将单帧 JSON/NPZ 写入 `output.directory`。`--force` 只应在确认目标输出可覆盖时使用。若要获取批处理的统一 CSV/JSONL/NPZ 汇总，使用下一节的 `batch` 命令。
@@ -148,8 +165,8 @@ py -3 -m butterfly_saxs project project.toml --force
 启动：
 
 ```powershell
-py -3 -m butterfly_saxs gui
-py -3 -m butterfly_saxs gui data\frame_0001.cbf --poni geometry\detector.poni
+.\.venv-project\Scripts\python.exe -m butterfly_saxs gui
+.\.venv-project\Scripts\python.exe -m butterfly_saxs gui data\frame_0001.cbf --poni geometry\detector.poni
 ```
 
 UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY/NPZ/HDF5/CSV/TXT，后者可通过 CLI/API 或注入服务使用。典型顺序：
@@ -170,9 +187,9 @@ UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY
 PowerShell 中若使用通配符，建议加引号让 CLI 自己展开；CLI 也接受目录：
 
 ```powershell
-py -3 -m butterfly_saxs batch "data\frame_*.cbf" --poni geometry\detector.poni -o results\batch --mode independent
-py -3 -m butterfly_saxs batch "data\frame_*.cbf" --poni geometry\detector.poni -o results\batch --mode warm_start --manifest sequence.csv --checkpoint results\checkpoint.json
-py -3 -m butterfly_saxs batch "data\frame_*.cbf" -c project.toml --resume --force
+.\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\frame_*.cbf" --poni geometry\detector.poni -o results\batch --mode independent
+.\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\frame_*.cbf" --poni geometry\detector.poni -o results\batch --mode warm_start --manifest sequence.csv --checkpoint results\checkpoint.json
+.\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\frame_*.cbf" -c project.toml --resume --force
 ```
 
 `manifest` 可用 CSV/JSON 提供 `path`、`frame_id`、`time`、`order`、`dataset`、零基 `frame`（或 `frame_index`）等元数据。manifest 文件中的相对 `path` 按 manifest 所在目录解析。它可以让同一个 HDF5/NPZ/TIFF 容器中的不同 dataset/frame 成为独立批处理记录；这些选择器会传给实际读取器并进入 checkpoint 身份。没有 manifest 时使用自然文件名排序。`checkpoint` 记录输入内容 hash、配置 hash、模式和每帧控制状态；`--resume` 只有 hash/mode 相符时才恢复。
@@ -194,8 +211,8 @@ UI 的 `Batch` 页提供 `Add frames…`、`Run batch`、`Independent/Warm start
 
 `analyze -o <目录>` 创建：
 
-- `<stem>.json`：严格 JSON 摘要，包含 `metadata`、`flags`、`observables`、`ridges`、`ellipse_fit`、顶层 `parameters`、可选 `full2d`、`qmap`、`valid_mask` 和 `output_paths`；大数组在 JSON 中以摘要形式保存，非有限值转为 `null`。
-- `<stem>.npz`：压缩数组 sidecar，保存图像、有效 mask、q/qx/qy、脊点数组，以及存在时的 `full2d_model`/`full2d_residual`；还保存 `observables_json`。
+- `<stem>.json`：严格 JSON 摘要，包含 `metadata`、`flags`、`observables`、`ridges`、`ellipse_fit`、顶层 `parameters`、可选 `full2d`、`qmap`、`analysis_domain`、`valid_mask` 和 `output_paths`；大数组在 JSON 中以摘要形式保存，非有限值转为 `null`。
+- `<stem>.npz`：压缩数组 sidecar，保存图像、`fit_valid_mask`、`sampled_valid_mask`、q/qx/qy、脊点数组，以及存在时的 `full2d_model`/`full2d_residual`；还保存 `observables_json`。
 
 `-o` 指向 `.json`、`.npz` 或 `.csv` 时只写相应格式。JSON 是机器可读摘要，不应当作完整像素证据；需要复核像素、qmap、model/residual 时读取 NPZ。
 
@@ -217,9 +234,84 @@ UI 的 `Batch` 页提供 `Add frames…`、`Run batch`、`Independent/Warm start
 
 遇到结果异常时按以下顺序留证：
 
-1. 先用 `inspect` 确认图像 shape、finite fraction、q 范围和 `q_unit`；
+1. 先用 `preflight` 确认 manifest、hash、图像 shape、PONI、mask 极性、校正/不确定度状态和 `q_unit`；
 2. 确认 PONI 与图像 shape 相符，mask 极性和 shape 正确；
 3. 先不用 `full2d` 检查 ridge/ellipse 的 `coverage`、`condition`、中心与 flags；
 4. 对 beamstop/streak/overlap 增加排除区，比较 mask 前后的 ridge 支持，不用对称复制填洞；
 5. 最后再运行 `full2d`，检查 `weighting`、`ndata`、`sampled_n`、`covariance_local_linear_approximation` 和整幅 residual；
 6. 保存命令、TOML/JSON 项目、PONI、mask、输入 hash 和输出 provenance，确保后续结果可复核。
+
+## 9. P3 基准、盲标包与证据门
+
+P3 的用途是把“同模型实现正确”“对独立 FFT 图样有泛化能力”和“真实图像人工重复性”分开，不用软件自己的经验模型证明全部科学有效性。以下命令只生成测试证据或读取现有文件，不运行 R0 真实数据拟合。
+
+生成 T1 同模型矩阵和 T2 独立实空间层片 + FFT 基准：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe benchmark --suite t1 --seed 20260828 -o results\validation\synthetic_same_model\p3_run
+.\.venv-project\Scripts\bsaxs.exe benchmark --suite t2 --shape 256x256 --seed 20260828 -o results\validation\synthetic_independent\p3_run
+```
+
+- T1 包含 15 个 case，覆盖噪声、参数变化、中心/q 范围/shape、探测器缺陷、低 SNR、重叠和非椭圆负例。它复用经验强度模型，只能验证实现、真值恢复和拒绝逻辑。
+- T2 从实空间有限层片堆叠做二维 FFT，不导入 `intensity.py` 或旧 synthetic 模块。`projection_truth` 是只由层间距和取向分布计算的解析 Bragg 轨迹，不读取或吸附到生成的 FFT 像素；`structure_truth` 只描述生成器结构，不是经验参数的反演真值。`non_elliptical` 的轨迹仅用于负类识别，不作为定量反演真值。T2 仍是简化外部测试源，不是完整 3D 物理正演。
+- 目标目录默认不得已有同名证据；`--force` 只覆盖本命令列出的目标文件，不删除无关文件。
+
+从 R0 清单创建固定 8 帧盲标包：
+
+```powershell
+$projectRoot = (Get-Location).Path
+.\.venv-project\Scripts\bsaxs.exe annotation-pack data_local\real_validation\2#_no50s_375_2_iso `
+  --rt-manifest project_rt_reference_manifest.csv `
+  --hold-manifest project_hold_375C_manifest.csv `
+  --preflight "$projectRoot\results\validation\preflight\r0_hold\preflight.json" `
+  --poni config\geometry\BL19B2_SAXS_Califile.poni `
+  --mask masks\bl19b2_mask.npy `
+  -o results\validation\annotations\r0_pilot
+```
+
+输出中的 `blind_payload/` 只包含 8 张不带拟合覆盖层的 `blind_*.png`、标注协议和两份待填写标注表，是唯一应分发给标注者的目录。上级目录另存选择审计表、待填写 consensus 表和 `annotation_status.json`，其中含帧角色/选择理由，只供协调者保管，consensus 前不得分发。有 preflight 时先用其中的原始强度摘要排序，只读取最终 8 帧图像；输入文件读取前后 SHA-256 必须一致。软件不会代替人填写标注。
+
+评估 P3 门禁：
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe p3-status `
+  --t1-manifest results\validation\synthetic_same_model\p3_run\truth_manifest.json `
+  --t2-manifest results\validation\synthetic_independent\p3_run\truth_manifest.json `
+  --annotation-status results\validation\annotations\r0_pilot\annotation_status.json `
+  --thresholds configs\acceptance_thresholds_draft_v1.json `
+  -o results\validation\p3_gate\p3_gate_report.json
+```
+
+返回码 `0` 表示四项证据检查均通过；团队可据报告决定是否进入 P4，工具本身不运行拟合，也不强制阻止后续阶段。返回码 `1` 表示科学证据 No-Go，`2` 表示路径、JSON 或参数错误。门禁会实际打开 NPZ 核对数组、mask、shape、q 恒等式、T2 FFT 重建和生成器 hash，并核对两份标注 CSV、consensus CSV、审计 manifest 都有 8 个相同盲号。只有完成 8 帧人工 consensus，并用人工重复性、仪器分辨率和 pilot 证据冻结 `acceptance_thresholds_v1.json` 后才可能返回 Go；draft 阈值不能用于最终 PASS/FAIL。正式阈值中的人工/仪器证据记录必须带 `status=complete`、存在的来源文件及其 SHA-256、有限数值和单位，pilot 记录必须明确 8 帧，且要记录 `frozen_by/frozen_at`；仅填写任意非空字符串不会通过门禁。
+
+### 9.1 盲标模板的实际完成条件
+
+生成器预填的 `blind_id`、`coordinate_system` 和 `image_version` 是固定身份字段，不要改写。完成盲标时，`annotator_a.csv`、`annotator_b.csv` 和 `consensus_review.csv` 必须各有且仅有 `blind_001`–`blind_008` 八行；前两份的 `valid_area`、`beamstop`、`streak`、`overlap`、`lobe_center_x`、`lobe_center_y`、`ridge_points`、`software`、`software_version`、`coordinate_system`、`image_version`、`annotation_time`、`annotator` 必须逐行非空，consensus 表的 `consensus_status`、上述标注字段、`reviewer` 和 `review_time` 也必须逐行非空。`valid_area` 必须由至少 3 个不同的有限 `[x,y]` 点构成，鞋带公式面积必须大于 0，不能写 `[]`、`unknown` 或共线/重复点；明确不存在的 beamstop/streak/overlap/ridge 可写 `[]`，其他确实无法判断的字段可写 `unknown`，但整行占位内容不会通过。`notes` 可留空。时间必须是可解析的带时区时间戳，坐标系必须保持 `image_pixel_x_right_y_up_origin_lower_left`，`image_version` 必须等于对应 PNG 的 SHA-256。
+
+同时，`annotation_status.json` 必须从生成时的 `status=awaiting_human_annotations`、`human_consensus=false` 更新为门禁允许的完整状态：`schema_version=lamellarsaxs2d.annotation_pack.v2`、`human_consensus=true`、`candidate_count=8`、`consensus_records_count=8`，并在 `human_evidence` 中记录盲化方式。可接受的方式是两名不同标注者（`mode=two_independent_annotators`、`annotator_count>=2`），或同一专家间隔至少 7 天复标（`mode=one_expert_repeat`、`session_count>=2`、`interval_days>=7`、`lower_evidence=true`）。`files` 指向的 CSV、八个 PNG 和不可变输出哈希都必须能读回并与实际文件一致；每条 `input_hashes` 都必须有 64 位小写 SHA-256，且 `sha256_before == sha256_after`、`unchanged=true`。
+
+### 9.2 `evidence_templates` 三种 JSON 契约
+
+以下模板当前只是待补证据的骨架，不能把 `awaiting_*` 或 `null` 当作完成：
+
+| 文件 | 完成时必须满足的字段 |
+|---|---|
+| `configs/evidence_templates/human_repeatability_template.json` | `schema_version=lamellarsaxs2d.human_repeatability.v1`；`status=complete`、`blinded=true`、`mode` 为 `two_independent_annotators` 或 `one_expert_repeat`、`frame_count=8`；`annotation_status_sha256` 等于完成后的状态文件哈希；`per_frame_error_px` 恰好记录 8 个盲号的有限非负误差；`metric.value` 必须等于声明的 `mean/median/p95/max/min` 聚合，单位为 `px`；`reviewed_by` 非空、`reviewed_at` 可解析。 |
+| `configs/evidence_templates/instrument_resolution_template.json` | `schema_version=lamellarsaxs2d.instrument_resolution.v1`；`status=complete`；`measurements_nm_inv` 为非空有限正数序列；`metric.value` 等于声明的聚合、单位为 `nm^-1`；`calibration_record.source` 存在且 SHA-256 匹配；`method`、`reviewed_by` 非空且 `reviewed_at` 可解析。记录的是实测或 beamline 批准的 q 分辨率，不把 detector sampling 单独当成完整仪器分辨率。 |
+| `configs/evidence_templates/pilot_evidence_template.json` | `schema_version=lamellarsaxs2d.pilot_evidence.v1`；`status=complete`、`frame_count=8`；`blind_ids` 恰好为 `blind_001`–`blind_008`；`annotation_status_sha256` 和 `consensus_sha256` 匹配当前文件；`frame_results` 的 8 个状态逐帧等于 consensus CSV；`reviewed_by` 非空、`reviewed_at` 可解析。 |
+
+在冻结阈值 JSON 的 `evidence_sources` 中，每条记录都必须包含 `status=complete`、`source` 和 `sha256`，且记录的哈希与文件当前内容一致；人工重复性和仪器分辨率 wrapper 还必须有与 source 的数值、单位和聚合方式逐项匹配的 `metric`，pilot wrapper 必须有 `frame_count=8`。source 内容必须满足上表的逐帧、原始校准记录或 consensus 绑定合同。最终阈值本身需为 `schema_version=lamellarsaxs2d.acceptance_thresholds.v1`、`thresholds_version=v1`、`status=frozen`、`frozen=true`、`usable_for_final_pass_fail=true`，且保存 `frozen_by` 与可解析的 `frozen_at`。因此仓库现有 `acceptance_thresholds_draft_v1.json` 和三个 `awaiting_*` 模板只能用于占位/检查路径，不能产生最终 Go。
+
+### 9.3 `p3-status` 的输入哈希与 provenance
+
+`p3-status` 是只读证据汇总。报告的 `inputs` 对 `t1_manifest`、`t2_manifest`、`annotation_status` 和 `thresholds` 逐项保存绝对路径及当前 SHA-256；`provenance.gate_code_sha256` 记录门禁代码，`provenance.evidence_fingerprint_sha256` 是按输入名称排序后对四个输入哈希映射计算的 SHA-256，并同时记录 Python、NumPy 版本及 T1/T2 generator version/hash。请把 `p3_gate_report.json` 与这些输入放在同一证据目录中保存；若重新生成任何输入，应生成新的报告并重新核对哈希。它只读取和报告证据，不修改输入、不冻结阈值、不运行真实数据拟合。
+
+生成只读总览图：
+
+```powershell
+.\.venv-project\Scripts\python.exe scripts\render_p3_overviews.py `
+  --t1-manifest <T1 truth_manifest.json> `
+  --t2-manifest <T2 truth_manifest.json> `
+  --annotation-status <annotation_status.json> `
+  -o <新的总览输出目录>
+```

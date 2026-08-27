@@ -178,6 +178,40 @@ def test_select_mask_without_observed_invalidates_old_worker(qtbot, tmp_path) ->
     window.close()
 
 
+def test_image_and_mask_selectors_are_independent(qtbot, tmp_path) -> None:
+    image_path = tmp_path / "images.npz"
+    mask_path = tmp_path / "masks.npz"
+    image_frames = np.stack(
+        [
+            np.ones((3, 4), dtype=np.float32),
+            np.full((3, 4), 2.0, dtype=np.float32),
+        ]
+    )
+    mask_frames = np.zeros((2, 3, 4), dtype=np.uint8)
+    mask_frames[0, 0, 0] = 1
+    mask_frames[1, 0, 1] = 1
+    np.savez(image_path, image_series=image_frames)
+    np.savez(mask_path, mask_series=mask_frames)
+
+    window = MainWindow(mask_frame=0, mask_dataset="mask_series", auto_preview=False)
+    qtbot.addWidget(window)
+    assert window.open_image(
+        image_path,
+        frame=1,
+        dataset="image_series",
+        external_mask=mask_path,
+    )
+
+    assert window._frame == 1
+    assert window._dataset == "image_series"
+    assert window._mask_frame == 0
+    assert window._mask_dataset == "mask_series"
+    assert np.asarray(window._observed)[0, 0] == pytest.approx(2.0)
+    assert bool(window._external_mask[0, 0])
+    assert not bool(window._external_mask[0, 1])
+    window.close()
+
+
 def test_set_exclusion_roi_without_observed_invalidates_old_worker(qtbot) -> None:
     window = MainWindow(engine=_StateEngine(), auto_preview=False)
     qtbot.addWidget(window)

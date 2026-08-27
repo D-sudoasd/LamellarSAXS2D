@@ -299,6 +299,8 @@ if QT_AVAILABLE:
             parameters: Any = None,
             analysis_service: Any = None,
             analysis_settings: Mapping[str, Any] | None = None,
+            mask_frame: int | None = None,
+            mask_dataset: str | None = None,
             auto_preview: bool = True,
             debounce_ms: int = 250,
         ) -> None:
@@ -332,6 +334,8 @@ if QT_AVAILABLE:
             self._source_path: str | None = None
             self._frame: int | None = None
             self._dataset: str | None = None
+            self._mask_frame: int | None = mask_frame
+            self._mask_dataset: str | None = mask_dataset
             self._mask_path: str | None = None
             self._file_mask: Any = None
             self._external_mask: Any = None
@@ -1047,6 +1051,8 @@ if QT_AVAILABLE:
             dataset: str | None = None,
             poni: str | Path | Any | None = None,
             external_mask: Any | None = None,
+            mask_frame: int | None = None,
+            mask_dataset: str | None = None,
         ) -> bool:
             if isinstance(path, bool) or path is None:
                 chosen, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -1062,13 +1068,28 @@ if QT_AVAILABLE:
             if not callable(loader):
                 self._set_status("Current engine does not support image loading", flags="error")
                 return False
+            selected_mask_frame = self._mask_frame if mask_frame is None else mask_frame
+            selected_mask_dataset = self._mask_dataset if mask_dataset is None else mask_dataset
             try:
-                state = loader(path, frame=frame, dataset=dataset, poni=poni, external_mask=external_mask)
+                load_kwargs = {
+                    "frame": frame,
+                    "dataset": dataset,
+                    "poni": poni,
+                    "external_mask": external_mask,
+                }
+                if external_mask is not None:
+                    load_kwargs.update(
+                        mask_frame=selected_mask_frame,
+                        mask_dataset=selected_mask_dataset,
+                    )
+                state = loader(path, **load_kwargs)
                 if not isinstance(state, Mapping):
                     raise TypeError("image loader must return a mapping state")
                 self._source_path = str(path)
                 self._frame = frame
                 self._dataset = dataset
+                self._mask_frame = selected_mask_frame
+                self._mask_dataset = selected_mask_dataset
                 if external_mask is not None:
                     # A supplied mask replaces the previous detector mask.  Do
                     # this only after loading succeeds so a failed image/mask
@@ -1086,7 +1107,11 @@ if QT_AVAILABLE:
                 )
                 if external_mask is not None:
                     if isinstance(external_mask, (str, Path)):
-                        self._load_external_mask(external_mask)
+                        self._load_external_mask(
+                            external_mask,
+                            frame=selected_mask_frame,
+                            dataset=selected_mask_dataset,
+                        )
                     else:
                         self._file_mask = _np.asarray(external_mask, dtype=bool) if _np is not None else external_mask
                     self._recompute_external_mask(update_widgets=False)
@@ -1099,12 +1124,20 @@ if QT_AVAILABLE:
         load_image = open_image
         load_frame = set_observed_data
 
-        def _load_external_mask(self, path: str | Path) -> Any:
-            """Load a detector mask using the same frame/dataset selectors."""
+        def _load_external_mask(
+            self,
+            path: str | Path,
+            *,
+            frame: int | None = None,
+            dataset: str | None = None,
+        ) -> Any:
+            """Load a detector mask using only the mask's selectors."""
 
             from ..io import load_image
 
-            loaded = load_image(path, frame=self._frame, dataset=self._dataset)
+            selected_frame = self._mask_frame if frame is None else frame
+            selected_dataset = self._mask_dataset if dataset is None else dataset
+            loaded = load_image(path, frame=selected_frame, dataset=selected_dataset)
             array = _np.asarray(loaded.data != 0, dtype=bool) if _np is not None else loaded.data
             if self._observed is not None and _np is not None:
                 expected = tuple(_np.asarray(self._observed).shape)
@@ -1112,6 +1145,8 @@ if QT_AVAILABLE:
                     raise ValueError(f"mask shape {getattr(array, 'shape', None)!r} does not match {expected!r}")
             self._mask_path = str(path)
             self._file_mask = array
+            self._mask_frame = selected_frame
+            self._mask_dataset = selected_dataset
             return array
 
         def _recompute_external_mask(self, *, update_widgets: bool = True) -> bool:
@@ -1150,7 +1185,13 @@ if QT_AVAILABLE:
                 self._set_status(f"Mask/ROI apply failed: {exc}", flags="error")
                 return False
 
-        def select_mask(self, path: str | Path | bool | None = None) -> bool:
+        def select_mask(
+            self,
+            path: str | Path | bool | None = None,
+            *,
+            mask_frame: int | None = None,
+            mask_dataset: str | None = None,
+        ) -> bool:
             """Select an external detector mask; its polarity is True=excluded."""
 
             if isinstance(path, bool) or path is None:
@@ -1164,7 +1205,7 @@ if QT_AVAILABLE:
                     return False
                 path = chosen
             try:
-                self._load_external_mask(path)
+                self._load_external_mask(path, frame=mask_frame, dataset=mask_dataset)
                 if self._observed is not None and _np is not None:
                     self._recompute_external_mask(update_widgets=False)
                 else:
@@ -1387,6 +1428,8 @@ if QT_AVAILABLE:
                 "frame": self._frame,
                 "dataset": self._dataset,
                 "mask_path": self._mask_path,
+                "mask_frame": self._mask_frame,
+                "mask_dataset": self._mask_dataset,
                 "analysis": analysis,
                 # Background workers must remain side-effect free.  Only the
                 # generation-current result is committed on the GUI thread.
@@ -1740,6 +1783,8 @@ if QT_AVAILABLE:
                 "frame": self._frame,
                 "dataset": self._dataset,
                 "mask": self._mask_path,
+                "mask_frame": self._mask_frame,
+                "mask_dataset": self._mask_dataset,
                 "roi_exclusion": _jsonable(self._exclusion_roi),
                 "rois": list(self._roi_specs),
                 "batch": {
@@ -1813,10 +1858,14 @@ if QT_AVAILABLE:
                 frame = data.get("frame")
                 dataset = data.get("dataset")
                 mask = _resolve_project_path(data.get("mask", data.get("mask_path")), project_base)
+                mask_frame = data.get("mask_frame")
+                mask_dataset = data.get("mask_dataset")
                 roi = data.get("roi_exclusion")
                 rois = data.get("rois")
                 self._frame = int(frame) if frame is not None else None
                 self._dataset = str(dataset) if dataset is not None else None
+                self._mask_frame = int(mask_frame) if mask_frame is not None else None
+                self._mask_dataset = str(mask_dataset) if mask_dataset is not None else None
                 batch = data.get("batch")
                 if isinstance(batch, Mapping):
                     mode_index = self.batch_mode_combo.findData(batch.get("mode", "independent"))
@@ -1837,13 +1886,29 @@ if QT_AVAILABLE:
                 if poni:
                     self.set_poni(poni)
                 if source:
-                    if not self.open_image(source, frame=self._frame, dataset=self._dataset, poni=poni, external_mask=mask):
+                    if not self.open_image(
+                        source,
+                        frame=self._frame,
+                        dataset=self._dataset,
+                        poni=poni,
+                        external_mask=mask,
+                        mask_frame=self._mask_frame,
+                        mask_dataset=self._mask_dataset,
+                    ):
                         raise ValueError(f"could not load project input: {source}")
                 elif mask:
-                    if not self.select_mask(mask):
+                    if not self.select_mask(
+                        mask,
+                        mask_frame=self._mask_frame,
+                        mask_dataset=self._mask_dataset,
+                    ):
                         raise ValueError(f"could not load project mask: {mask}")
                 if mask and self._file_mask is None:
-                    self._load_external_mask(mask)
+                    self._load_external_mask(
+                        mask,
+                        frame=self._mask_frame,
+                        dataset=self._mask_dataset,
+                    )
                 if rois and isinstance(rois, Iterable):
                     self._roi_specs = [dict(spec) for spec in rois if isinstance(spec, Mapping)]
                     self._exclusion_roi = self._roi_specs[-1] if self._roi_specs else None
@@ -2072,6 +2137,8 @@ def _gui_options(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("-c", "--config")
     parser.add_argument("--frame", type=int)
     parser.add_argument("--dataset")
+    parser.add_argument("--mask-frame", type=int)
+    parser.add_argument("--mask-dataset")
     parser.add_argument("--no-auto-preview", action="store_true")
     raw = list(sys.argv[1:] if argv is None else argv)
     # QApplication should never be asked to interpret our scientific options;
@@ -2087,6 +2154,8 @@ def create_app(
     poni: str | Path | Any | None = None,
     config: Any = None,
     config_path: str | Path | None = None,
+    mask_frame: int | None = None,
+    mask_dataset: str | None = None,
 ) -> tuple[Any, RefinementMainWindow]:
     """Create a QApplication and a real-service workbench without showing it."""
 
@@ -2112,7 +2181,22 @@ def create_app(
         project_config = ProjectConfig.from_mapping(project_config)
     analysis_options = getattr(project_config, "analysis", {}) if project_config is not None else {}
     configured_parameters = analysis_options.get("parameters") if isinstance(analysis_options, Mapping) else None
+    configured_frame = analysis_options.get("frame") if isinstance(analysis_options, Mapping) else None
+    configured_dataset = analysis_options.get("dataset") if isinstance(analysis_options, Mapping) else None
+    configured_mask = analysis_options.get("mask") if isinstance(analysis_options, Mapping) else None
+    configured_mask_frame = analysis_options.get("mask_frame") if isinstance(analysis_options, Mapping) else None
+    configured_mask_dataset = analysis_options.get("mask_dataset") if isinstance(analysis_options, Mapping) else None
     selected_poni = poni or getattr(options, "poni", None) or getattr(project_config, "poni_path", None)
+    selected_frame = getattr(options, "frame", None)
+    if selected_frame is None:
+        selected_frame = configured_frame
+    selected_dataset = getattr(options, "dataset", None) or configured_dataset
+    selected_mask_frame = mask_frame
+    if selected_mask_frame is None:
+        selected_mask_frame = getattr(options, "mask_frame", None)
+    if selected_mask_frame is None:
+        selected_mask_frame = configured_mask_frame
+    selected_mask_dataset = mask_dataset or getattr(options, "mask_dataset", None) or configured_mask_dataset
     service = analysis_service
     if service is None:
         from ..service import ButterflyAnalysisService
@@ -2126,6 +2210,8 @@ def create_app(
         analysis_service=service,
         parameters=configured_parameters,
         analysis_settings=analysis_options if isinstance(analysis_options, Mapping) else None,
+        mask_frame=selected_mask_frame,
+        mask_dataset=selected_mask_dataset,
         auto_preview=not bool(options.no_auto_preview),
     )
     selected_input = (
@@ -2134,13 +2220,6 @@ def create_app(
         or getattr(options, "input", None)
         or (getattr(project_config, "input_paths", [None]) or [None])[0]
     )
-    configured_frame = analysis_options.get("frame") if isinstance(analysis_options, Mapping) else None
-    configured_dataset = analysis_options.get("dataset") if isinstance(analysis_options, Mapping) else None
-    configured_mask = analysis_options.get("mask") if isinstance(analysis_options, Mapping) else None
-    selected_frame = getattr(options, "frame", None)
-    if selected_frame is None:
-        selected_frame = configured_frame
-    selected_dataset = getattr(options, "dataset", None) or configured_dataset
     if selected_input:
         window.open_image(
             selected_input,
@@ -2148,6 +2227,8 @@ def create_app(
             dataset=selected_dataset,
             poni=selected_poni,
             external_mask=configured_mask,
+            mask_frame=selected_mask_frame,
+            mask_dataset=selected_mask_dataset,
         )
     elif selected_poni:
         window.set_poni(selected_poni)
@@ -2164,6 +2245,8 @@ def launch(
     analysis_service: Any = None,
     config: Any = None,
     config_path: str | Path | None = None,
+    mask_frame: int | None = None,
+    mask_dataset: str | None = None,
 ) -> int:
     """Run the workbench as a small standalone entry point."""
 
@@ -2174,6 +2257,8 @@ def launch(
         poni=poni,
         config=config,
         config_path=config_path,
+        mask_frame=mask_frame,
+        mask_dataset=mask_dataset,
     )
     window.show()
     return int(app.exec())

@@ -133,6 +133,8 @@ Grubb 2021 在不同几何操作/定义下写出 `L_N = L_z cosϕ`（图 2 的�
 
 ## 6. 经验 `full2d` 与 Grubb 2016 完整 3D 模型的边界
 
+进入任何定量步骤前，软件用同一个 `analysis-domain` 冻结像素总体：强度/q 坐标有限、探测器有效、未被外部 mask 或 ROI 排除、落在 q-window 内，并且 sigma/weights 有效。`fit_pixel_count` 是完整拟合总体，`sampled_pixel_count` 只表示显式速度抽样；二者不能混称。无效权重、空 q-window 或形状不一致会快速失败，不能静默改变拟合总体。
+
 当前 `full2d` 是像素级**经验测量模型**，包含：共享 `a,b`、镜像 `+theta/-theta` 的两条原点中心椭圆，四个角向包络，径向 Gaussian/Lorentzian 混合（`eta`），以及非负、平滑的径向背景。椭圆角度相对 `reference_axis_deg` 定义；pipeline 默认采用 `draw_axis_deg - 90°`。它保留整幅 `model`/`residual` 图像用于比较，默认使用全部有效像素进行优化并据此计算 `ndata/rmse/weighted_rmse`。仅当用户显式设置 `max_pixels` 时才进行确定性抽样，并以 `sampled_n/sample_rmse` 单独报告抽样诊断。模型可直接配置 `sigma` 或 `weights`（二者不能同时给出），默认稳健损失为 `soft_l1`。对软件自动生成的初值，会用有效像素的稳健分位数估计幅度与背景的**起始尺度**；这不归一化、不重写输入强度，并以 `initial_intensity_scale_estimated` 标记。用户显式给出的初值和跨帧 warm start 默认不重估，除非配置 `auto_scale_initial=true`。
 
 这不是 Grubb 2016 的完整模型。2016 模型还包括分子/层片取向能量分布、三维取向积分、多个尺寸方向的展宽、pseudo-Voigt、背景与尺度/强度等物理参数，并在完整二维像素上拟合。当前软件没有实现或验证那套 3D 能量-取向正演/唯一逆解，因此不能把 `full2d` 的 `theta`、`a/b`、`phi_app` 直接写成 2016 的结构 `θ/ψ` 或 2021 的 `ϕ/α/ψ`。
@@ -140,6 +142,8 @@ Grubb 2021 在不同几何操作/定义下写出 `L_N = L_z cosϕ`（图 2 的�
 经验模型适合在相同 q 校准、mask、权重和配置下比较图样/时间序列。它不是机制判别器；任何结构解释都需要额外实验、几何假设或论文证据。
 
 ## 7. 精修结果、不确定度与 reduced chi-square
+
+预检中的 `correction_state` 与拟合参数是两套信息。状态使用 `raw_counts`、`external_recipe_declared`、`partially_corrected`、`fully_corrected_external` 或 `unknown`，并分别说明 dark/background/monitor/transmission/thickness/absolute factor/solid-angle/polarization 是否已执行；软件不得重复应用已声明的上游校正。`uncertainty_state` 使用 `none/partial/complete/unknown`，并记录来源数据集、单位和误差分量；探测器测量不确定度、局部拟合协方差和 bootstrap/分析选择敏感性必须分栏解释。
 
 椭圆拟合使用 Sampson 或 geometric q-space residual，默认 `soft_l1` 稳健损失；`rmse` 是所用残差的均方根，`coverage` 与 `condition` 用于判断覆盖和可辨识性。
 

@@ -10,6 +10,7 @@ from butterfly_saxs.cli import build_parser, main
 from butterfly_saxs.intensity import default_intensity_parameters, double_ellipse_intensity
 from butterfly_saxs.pipeline import (
     PipelineError,
+    _configured_external_mask,
     _loaded_frame,
     _coerce_qmap,
     _public_angles,
@@ -68,6 +69,18 @@ def test_single_frame_pipeline_accepts_qmap_fixture(tmp_path: Path) -> None:
         summary = json.load(handle)
     assert summary["flags"]["nonunique_inverse_problem"] is True
     assert "NaN" not in paths[0].read_text(encoding="utf-8")
+    arrays_path = next(path for path in paths if path.suffix == ".npz")
+    with np.load(arrays_path) as arrays:
+        assert {
+            "finite_mask",
+            "detector_valid_mask",
+            "external_valid_mask",
+            "q_window_mask",
+            "roi_exclusion_mask",
+            "weight_valid_mask",
+            "fit_valid_mask",
+            "sampled_valid_mask",
+        } <= set(arrays.files)
 
 
 def test_analyze_reuses_measured_ridge_instead_of_extracting_twice(monkeypatch) -> None:
@@ -180,6 +193,46 @@ def test_project_config_round_trip(tmp_path: Path) -> None:
     assert loaded.metadata["sample"] == "demo"
     with pytest.raises(FileExistsError):
         save_project(source, path)
+
+
+def test_project_promotes_independent_mask_selectors_from_inputs_group() -> None:
+    config = ProjectConfig.from_mapping(
+        {
+            "inputs": {
+                "files": ["data/image.h5"],
+                "frame": 2,
+                "dataset": "images/series",
+                "mask": "geometry/mask.h5",
+                "mask_frame": 1,
+                "mask_dataset": "masks/series",
+            }
+        }
+    )
+
+    assert config.analysis["frame"] == 2
+    assert config.analysis["dataset"] == "images/series"
+    assert config.analysis["mask"] == "geometry/mask.h5"
+    assert config.analysis["mask_frame"] == 1
+    assert config.analysis["mask_dataset"] == "masks/series"
+
+
+def test_low_level_configured_mask_uses_its_own_frame_and_dataset(
+    tmp_path: Path,
+) -> None:
+    masks = np.zeros((2, 3, 4), dtype=np.uint8)
+    masks[1, 1, 2] = 1
+    source = tmp_path / "mask.npz"
+    np.savez(source, mask_series=masks)
+
+    exclusion = _configured_external_mask(
+        source,
+        (3, 4),
+        config={"analysis": {"mask_frame": 1, "mask_dataset": "mask_series"}},
+    )
+
+    expected = np.zeros((3, 4), dtype=bool)
+    expected[1, 2] = True
+    np.testing.assert_array_equal(exclusion, expected)
 
 
 def test_project_resolves_analysis_paths_beside_toml(tmp_path: Path) -> None:
@@ -306,7 +359,8 @@ def test_coerce_qmap_skips_none_attributes_and_requires_exact_2d_arrays() -> Non
 
     coerced = _coerce_qmap(OptionalQMap(), shape)
     assert set(coerced) >= {"qx", "qy", "object"}
-    assert "q" not in coerced
+    np.testing.assert_allclose(coerced["q"], 1.0)
+    assert coerced["q_unit"] == "unknown"
     assert "mask" not in coerced
     assert "valid_mask" not in coerced
 
@@ -338,8 +392,11 @@ def test_pipeline_combines_source_config_and_embedded_qmap_masks() -> None:
         config={"analysis": {"valid_mask": config_valid, "mask": config_mask}},
     )
     expected = source_valid & config_valid & ~source_mask & ~config_mask & ~qmap_mask
+    expected_detector = source_valid & config_valid & ~qmap_mask
     assert np.array_equal(result.valid_mask, expected)
-    assert np.array_equal(result.qmap["valid_mask"], expected)
+    assert np.array_equal(result.qmap["valid_mask"], expected_detector)
+    assert result.analysis_domain is not None
+    assert result.analysis_domain.counts["external_mask_excluded_count"] == 2
     assert bool(result.qmap["mask"][2, 2])
 
 

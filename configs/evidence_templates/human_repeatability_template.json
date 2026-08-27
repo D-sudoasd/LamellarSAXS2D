@@ -1,0 +1,26 @@
+{
+  "schema_version": "lamellarsaxs2d.human_repeatability.v1",
+  "status": "awaiting_human_review",
+  "blinded": true,
+  "mode": null,
+  "frame_count": 8,
+  "annotation_status_sha256": null,
+  "per_frame_error_px": {
+    "blind_001": null,
+    "blind_002": null,
+    "blind_003": null,
+    "blind_004": null,
+    "blind_005": null,
+    "blind_006": null,
+    "blind_007": null,
+    "blind_008": null
+  },
+  "metric": {
+    "value": null,
+    "unit": "px",
+    "aggregation": "max"
+  },
+  "reviewed_by": null,
+  "reviewed_at": null,
+  "notes": "Fill all eight per-frame errors from completed blind annotations; metric.value must equal the declared aggregation."
+}

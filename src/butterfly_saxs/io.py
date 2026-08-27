@@ -156,6 +156,8 @@ def load_image(
     valid_mask: Any | None = None,
     external_mask: Any | None = None,
     mask: Any | None = None,
+    mask_frame: int | None = None,
+    mask_dataset: str | None = None,
 ) -> LoadedImage:
     """Read one two-dimensional detector frame.
 
@@ -175,6 +177,14 @@ def load_image(
     external_mask (or ``mask``):
         Optional boolean-like array/path where ``True`` means masked/invalid.
         The two mask arguments cannot be supplied together.
+    mask_frame:
+        Zero-based frame selector for a path-valued mask.  It is independent
+        from the image ``frame`` selector and is required for a multi-frame
+        mask.
+    mask_dataset:
+        Dataset/key selector for a path-valued mask.  It is independent from
+        the image ``dataset`` selector and is required for an ambiguous mask
+        source.  When omitted, a mask never inherits the image selector.
     """
 
     source = Path(path).expanduser()
@@ -185,8 +195,11 @@ def load_image(
             raise DataIOError("provide only one of mask and external_mask")
         external_mask = mask
     _validate_frame_argument(frame)
+    _validate_frame_argument(mask_frame)
     if dataset is not None and not isinstance(dataset, str):
         raise DatasetSelectionError("dataset must be a string path/key")
+    if mask_dataset is not None and not isinstance(mask_dataset, str):
+        raise DatasetSelectionError("mask_dataset must be a string path/key")
 
     suffix = source.suffix.lower()
     kind = _IMAGE_SUFFIXES.get(suffix)
@@ -263,8 +276,12 @@ def load_image(
 
     combined_mask = combine_masks(
         data.shape,
-        valid_mask=_mask_value(valid_mask, frame=frame, dataset=dataset),
-        external_mask=_mask_value(external_mask, frame=frame, dataset=dataset),
+        valid_mask=_mask_value(
+            valid_mask, mask_frame=mask_frame, mask_dataset=mask_dataset
+        ),
+        external_mask=_mask_value(
+            external_mask, mask_frame=mask_frame, mask_dataset=mask_dataset
+        ),
     )
     if combined_mask is not None:
         metadata["valid_pixel_count"] = int(np.count_nonzero(combined_mask))
@@ -600,12 +617,23 @@ def _attribute_dict(attrs: Any) -> dict[str, Any]:
     return result
 
 
-def _mask_value(value: Any | None, *, frame: int | None, dataset: str | None) -> Any | None:
-    """Load a mask path using the same explicit selectors as the image."""
+def _mask_value(
+    value: Any | None,
+    *,
+    mask_frame: int | None,
+    mask_dataset: str | None,
+) -> Any | None:
+    """Load a path-valued mask using only its own explicit selectors.
+
+    The image's frame/dataset must not leak into an independent mask source.
+    Leaving these selectors unset intentionally delegates ambiguity handling to
+    :func:`load_image`, which fails closed for multi-frame or multi-dataset
+    masks.
+    """
 
     if value is None or not isinstance(value, (str, Path)):
         return value
-    loaded = load_image(value, frame=frame, dataset=dataset)
+    loaded = load_image(value, frame=mask_frame, dataset=mask_dataset)
     return loaded.data
 
 

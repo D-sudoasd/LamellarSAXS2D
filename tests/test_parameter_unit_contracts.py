@@ -69,16 +69,25 @@ def test_fit_full2d_preserves_parameter_set_warm_start_specs(
     assert received["b"].expr == "a*axis_ratio"
 
 
-@pytest.mark.parametrize("q_unit", ["pixel-q", "Å^-1"])
-def test_inspect_report_uses_qmap_unit_over_project_default(q_unit: str) -> None:
+@pytest.mark.parametrize(
+    ("q_unit", "expected_unit", "expected_scale"),
+    [("pixel-q", "pixel-q", 1.0), ("Å^-1", "nm^-1", 10.0)],
+)
+def test_inspect_report_uses_qmap_unit_over_project_default(
+    q_unit: str,
+    expected_unit: str,
+    expected_scale: float,
+) -> None:
     image = np.ones((10, 10), dtype=float)
+    qmap = _qmap(image.shape, q_unit)
     report = inspect_frame(
         image,
-        qmap=_qmap(image.shape, q_unit),
+        qmap=qmap,
         config=ProjectConfig(q_unit="1/nm"),
     )
 
-    assert report["q_unit"] == q_unit
+    assert report["q_unit"] == expected_unit
+    assert report["q_range"][1] == pytest.approx(np.max(qmap["q"]) * expected_scale)
 
 
 def test_parameter_set_rejects_independent_radian_and_degree_fields() -> None:

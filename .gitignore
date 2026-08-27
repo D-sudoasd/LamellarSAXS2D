@@ -7,9 +7,19 @@ __pycache__/
 .coverage
 htmlcov/
 .venv/
+.venv-project/
 .artifact-venv/
 build/
 dist/
 *.egg-info/
 outputs/
 tmp/
+
+# Local-only experimental datasets. Never commit or upload these files.
+data_local/
+
+# Local project history required by AGENTS.md; keep it off GitHub.
+CHANGELOG.md
+
+# Local validation evidence can contain private paths and raw-data hashes.
+results/validation/
