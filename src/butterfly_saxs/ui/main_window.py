@@ -528,6 +528,7 @@ if QT_AVAILABLE:
 
         def _build_actions(self) -> None:
             self.project_menu = self.menuBar().addMenu("&Project")
+            self.project_menu.setToolTipsVisible(True)
             self.open_project_action = QtGui.QAction("Open project…", self)
             self.open_project_action.setObjectName("openProjectAction")
             self.open_project_action.triggered.connect(self.load_project)
@@ -566,6 +567,7 @@ if QT_AVAILABLE:
             self.project_menu.addAction(self.close_action)
 
             self.language_menu = self.menuBar().addMenu("&Language")
+            self.language_menu.setToolTipsVisible(True)
             self.language_action_group = QtGui.QActionGroup(self)
             self.language_action_group.setExclusive(True)
             self.chinese_action = QtGui.QAction("中文", self)
@@ -1092,6 +1094,190 @@ if QT_AVAILABLE:
             if index >= 0:
                 combo.setItemText(index, self._tr(key))
 
+        def _set_form_tooltip(self, form: Any, field: Any, key: str) -> None:
+            """Apply one translated tooltip to a form field and its label."""
+
+            tooltip = self._tr(key)
+            setter = getattr(field, "setToolTip", None)
+            if callable(setter):
+                setter(tooltip)
+            label = form.labelForField(field)
+            if label is not None:
+                label.setToolTip(tooltip)
+
+        def _set_combo_item_tooltip(
+            self,
+            combo: Any,
+            data: Any,
+            key: str,
+            **values: Any,
+        ) -> None:
+            """Set the popup tooltip for one stable-data combo option."""
+
+            index = combo.findData(data)
+            if index >= 0:
+                combo.setItemData(
+                    index,
+                    self._tr(key, **values),
+                    QtCore.Qt.ItemDataRole.ToolTipRole,
+                )
+
+        def _refresh_snapshot_item_tooltips(self) -> None:
+            if not hasattr(self, "snapshot_combo"):
+                return
+            snapshots = self._fit_session.get("snapshots", [])
+            if not isinstance(snapshots, list):
+                return
+            for combo_index in range(self.snapshot_combo.count()):
+                snapshot_index = self.snapshot_combo.itemData(combo_index)
+                if not isinstance(snapshot_index, int) or not 0 <= snapshot_index < len(snapshots):
+                    continue
+                snapshot = snapshots[snapshot_index]
+                if not isinstance(snapshot, Mapping):
+                    continue
+                note = str(snapshot.get("note", "") or "") or self._tr("snapshot.no_note")
+                self.snapshot_combo.setItemData(
+                    combo_index,
+                    self._tr(
+                        "tooltip.combo.snapshot",
+                        index=snapshot_index + 1,
+                        note=note,
+                    ),
+                    QtCore.Qt.ItemDataRole.ToolTipRole,
+                )
+
+        def _refresh_evolution_item_tooltips(self) -> None:
+            if not hasattr(self, "evolution_parameter_combo"):
+                return
+            for index in range(self.evolution_parameter_combo.count()):
+                name = self.evolution_parameter_combo.itemText(index)
+                self.evolution_parameter_combo.setItemData(
+                    index,
+                    self._tr("tooltip.combo.evolution", name=name),
+                    QtCore.Qt.ItemDataRole.ToolTipRole,
+                )
+
+        def _apply_tooltips(self) -> None:
+            """Refresh all application-owned hover help in the active language."""
+
+            for action, key in (
+                (self.project_menu.menuAction(), "tooltip.menu.project"),
+                (self.language_menu.menuAction(), "tooltip.menu.language"),
+                (self.open_project_action, "tooltip.open_project"),
+                (self.save_project_action, "tooltip.save_project"),
+                (self.open_image_action, "tooltip.open_image"),
+                (self.open_poni_action, "tooltip.select_poni"),
+                (self.open_mask_action, "tooltip.select_mask"),
+                (self.clear_mask_action, "tooltip.clear_mask"),
+                (self.export_evidence_action, "tooltip.export_evidence"),
+                (self.close_action, "tooltip.close"),
+                (self.chinese_action, "tooltip.language.zh_CN"),
+                (self.english_action, "tooltip.language.en"),
+            ):
+                action.setToolTip(self._tr(key))
+
+            for page, key in (
+                (self.refinement_page, "tooltip.tab.refinement"),
+                (self.measurements_page, "tooltip.tab.measurements"),
+                (self.batch_page, "tooltip.tab.batch"),
+                (self.evolution_page, "tooltip.tab.evolution"),
+            ):
+                self.pages.setTabToolTip(self.pages.indexOf(page), self._tr(key))
+
+            for widget, key in (
+                (self.parameter_table, "tooltip.parameter_table"),
+                (self.preview_button, "tooltip.preview"),
+                (self.optimize_button, "tooltip.optimize"),
+                (self.cancel_button, "tooltip.cancel"),
+                (self.ignore_late_result_button, "tooltip.ignore_late"),
+                (self.auto_preview_check, "tooltip.auto_preview"),
+                (self.clear_mask_button, "tooltip.clear_mask"),
+                (self.roi_type_combo, "tooltip.roi_type"),
+                (self.apply_roi_button, "tooltip.apply_roi"),
+                (self.clear_roi_button, "tooltip.clear_roi"),
+                (self.reviewer_edit, "tooltip.reviewer"),
+                (self.review_notes_edit, "tooltip.review_notes"),
+                (self.accept_current_button, "tooltip.accept_current"),
+                (self.reject_current_button, "tooltip.reject_current"),
+                (self.restore_before_optimize_button, "tooltip.restore_before_optimize"),
+                (self.snapshot_note_edit, "tooltip.snapshot_note"),
+                (self.save_snapshot_button, "tooltip.save_snapshot"),
+                (self.snapshot_combo, "tooltip.snapshot_selector"),
+                (self.restore_snapshot_button, "tooltip.restore_snapshot"),
+                (self.batch_add_button, "tooltip.batch_add"),
+                (self.batch_run_button, "tooltip.batch_run"),
+                (self.batch_resume_check, "tooltip.resume_checkpoint"),
+                (self.evolution_y_label, "tooltip.evolution_parameter"),
+                (self.evolution_parameter_combo, "tooltip.evolution_parameter"),
+            ):
+                widget.setToolTip(self._tr(key))
+
+            for form, field, key in (
+                (self.fit_session_form, self.reviewer_edit, "tooltip.reviewer"),
+                (self.fit_session_form, self.review_notes_edit, "tooltip.review_notes"),
+                (self.fit_session_form, self.snapshot_save_row, "tooltip.snapshot_note"),
+                (self.fit_session_form, self.snapshot_restore_row, "tooltip.snapshot_selector"),
+                (self.analysis_form, self.q_min_edit, "tooltip.q_min"),
+                (self.analysis_form, self.q_max_edit, "tooltip.q_max"),
+                (self.analysis_form, self.draw_axis_deg_spin, "tooltip.draw_axis"),
+                (self.analysis_form, self.ridge_method_combo, "tooltip.ridge_method"),
+                (self.analysis_form, self.n_angular_bins_spin, "tooltip.angular_bins"),
+                (self.analysis_form, self.n_ridge_angles_spin, "tooltip.ridge_angles"),
+                (self.analysis_form, self.n_radial_bins_spin, "tooltip.radial_bins"),
+                (self.analysis_form, self.curvature_sigma_spin, "tooltip.curvature_sigma"),
+                (
+                    self.analysis_form,
+                    self.curvature_percentile_spin,
+                    "tooltip.curvature_percentile",
+                ),
+                (self.analysis_form, self.normal_step_spin, "tooltip.normal_step"),
+                (self.analysis_form, self.max_pixels_spin, "tooltip.max_pixels"),
+                (self.batch_form, self.batch_mode_combo, "tooltip.batch_mode"),
+                (self.batch_form, self.batch_manifest_edit, "tooltip.manifest"),
+                (self.batch_form, self.batch_checkpoint_edit, "tooltip.checkpoint"),
+                (self.batch_form, self.batch_output_edit, "tooltip.output"),
+            ):
+                self._set_form_tooltip(form, field, key)
+
+            self.roi_type_label.setToolTip(self._tr("tooltip.roi_type"))
+            rectangle_keys = (
+                "tooltip.roi_x0",
+                "tooltip.roi_y0",
+                "tooltip.roi_x1",
+                "tooltip.roi_y1",
+            )
+            for (label, spin), key in zip(self._rectangle_roi_widgets, rectangle_keys):
+                tooltip = self._tr(key)
+                label.setToolTip(tooltip)
+                spin.setToolTip(tooltip)
+            ellipse_keys = (
+                "tooltip.roi_cx",
+                "tooltip.roi_cy",
+                "tooltip.roi_rx",
+                "tooltip.roi_ry",
+                "tooltip.roi_angle",
+            )
+            for (label, spin), key in zip(self._ellipse_roi_widgets, ellipse_keys):
+                tooltip = self._tr(key)
+                label.setToolTip(tooltip)
+                spin.setToolTip(tooltip)
+
+            for combo, data, key in (
+                (self.roi_type_combo, "rectangle", "tooltip.combo.rectangle"),
+                (self.roi_type_combo, "ellipse", "tooltip.combo.ellipse"),
+                (self.ridge_method_combo, "radial_peak", "tooltip.combo.radial_peak"),
+                (
+                    self.ridge_method_combo,
+                    "surface_curvature",
+                    "tooltip.combo.surface_curvature",
+                ),
+                (self.batch_mode_combo, "independent", "tooltip.combo.independent"),
+                (self.batch_mode_combo, "warm_start", "tooltip.combo.warm_start"),
+            ):
+                self._set_combo_item_tooltip(combo, data, key)
+            self._refresh_snapshot_item_tooltips()
+            self._refresh_evolution_item_tooltips()
+
         def _render_metric_labels(self) -> None:
             self.rmse_label.setText(f"RMSE: {self._metric_display['rmse']}")
             self.ndata_label.setText(
@@ -1324,6 +1510,7 @@ if QT_AVAILABLE:
             self.parameter_model.set_language(self._language)
             self.views.set_language(self._language)
             self._sync_fit_session_controls(preserve_edits=True)
+            self._apply_tooltips()
             self._render_status()
             self._render_metric_labels()
 
@@ -1543,7 +1730,14 @@ if QT_AVAILABLE:
                 data_changed = getattr(self.parameter_model, "dataChanged", None)
                 index = getattr(self.parameter_model, "index", None)
                 if data_changed is not None and hasattr(data_changed, "emit") and callable(index):
-                    data_changed.emit(index(row_index, 6), index(row_index, 6), [QtCore.Qt.ItemDataRole.DisplayRole])
+                    data_changed.emit(
+                        index(row_index, 0),
+                        index(row_index, self.parameter_model.columnCount() - 1),
+                        [
+                            QtCore.Qt.ItemDataRole.DisplayRole,
+                            QtCore.Qt.ItemDataRole.ToolTipRole,
+                        ],
+                    )
 
         @property
         def fit_session(self) -> dict[str, Any]:
@@ -1780,6 +1974,7 @@ if QT_AVAILABLE:
                     self.snapshot_combo.setCurrentIndex(selected)
                 else:
                     self.snapshot_combo.setCurrentIndex(self.snapshot_combo.count() - 1)
+            self._refresh_snapshot_item_tooltips()
             self.snapshot_combo.blockSignals(False)
             self.restore_snapshot_button.setEnabled(bool(self.snapshot_combo.count()))
             self.restore_before_optimize_button.setEnabled(
@@ -3310,6 +3505,7 @@ if QT_AVAILABLE:
             self.evolution_parameter_combo.blockSignals(True)
             self.evolution_parameter_combo.clear()
             self.evolution_parameter_combo.addItems(numeric_keys)
+            self._refresh_evolution_item_tooltips()
             preferred = self.evolution_y_key if self.evolution_y_key in numeric_keys else (
                 "rmse" if "rmse" in numeric_keys else (numeric_keys[0] if numeric_keys else "")
             )
