@@ -13,6 +13,7 @@ def _ridge(
     width: float = 0.08,
     count: int = 72,
     continuity_fraction: float = 1.0,
+    q_unit: str = "nm^-1",
 ) -> SimpleNamespace:
     points = [
         {
@@ -29,6 +30,7 @@ def _ridge(
         valid_fraction=1.0,
         continuity_fraction=continuity_fraction,
         continuity_score=continuity_fraction,
+        q_unit=q_unit,
     )
 
 
@@ -74,6 +76,14 @@ def test_p4_engineering_quality_warns_when_theta_is_unidentifiable() -> None:
 
     assert result["status"] == "WARN"
     assert "orientation_identifiability" in result["flags"]
+
+
+def test_p4_engineering_quality_never_passes_uncalibrated_pixel_q() -> None:
+    result = evaluate_p4_ellipse_quality(_ridge(q_unit="pixel-q"), _fit())
+
+    assert result["status"] == "WARN"
+    assert result["metrics"]["q_unit"] == "pixel-q"
+    assert "physical_q_declared" in result["flags"]
 
 
 def test_p4_engineering_quality_fails_without_two_branch_support() -> None:

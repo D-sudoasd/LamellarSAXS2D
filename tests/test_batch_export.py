@@ -224,6 +224,15 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
     assert run[7].warm_start_from == FrameRef(paths[0]).key
 
 
+def test_batch_rejects_top_level_fail_status(tmp_path: Path) -> None:
+    path = _touch_frames(tmp_path, ["frame1.tif"])[0]
+
+    run = run_batch([path], lambda _frame: {"status": "FAIL"})
+
+    assert run[0].status == "failed"
+    assert "status=FAIL" in (run[0].error or "")
+
+
 def test_frame_ref_key_uses_canonical_path_frame_and_dataset_identity(tmp_path: Path) -> None:
     left = tmp_path / "left" / "frame.npy"
     right = tmp_path / "right" / "frame.npy"

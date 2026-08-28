@@ -669,6 +669,7 @@ def config_fingerprint(config: Any = None, *, mode: str = "independent") -> str:
 
 _QUALITY_FAILURE_STATUSES = {
     "error",
+    "fail",
     "failed",
     "failure",
     "invalid",

@@ -11,6 +11,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +94,11 @@ def _finite(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if np.isfinite(number) else None
+
+
+def _quality_status(value: Any) -> str | None:
+    status = str(value or "").strip().upper()
+    return status if status in {"PASS", "WARN", "FAIL"} else None
 
 
 def _jsonable(value: Any) -> Any:
@@ -283,8 +289,11 @@ def _t1_case_passes(
 ) -> bool:
     expected_rejection, _rejection_reasons = _t1_expected_rejection(truth)
     if expected_rejection:
-        return quality_status == "FAIL" or int(metrics.get("valid_lobe_count", 0)) == 0
-    return quality_status != "FAIL" and all(
+        return quality_status == "FAIL" or (
+            quality_status in {"PASS", "WARN"}
+            and int(metrics.get("valid_lobe_count", 0)) == 0
+        )
+    return quality_status in {"PASS", "WARN"} and all(
         (
             _threshold_check(metrics.get("ridge_median_error_px"), maximum=float(thresholds["ridge_detector_median_error_px_max"])),
             _threshold_check(metrics.get("ridge_p95_error_px"), maximum=float(thresholds["ridge_detector_p95_error_px_max"])),
@@ -316,6 +325,8 @@ def _t2_metrics(result: Any, projection_reference: np.ndarray) -> dict[str, Any]
             "ridge_error_local_fwhm_fraction": None,
             "truth_reference_median_error_q": None,
             "truth_reference_p95_error_q": None,
+            "truth_reference_median_error_local_fwhm_fraction": None,
+            "truth_reference_p95_error_local_fwhm_fraction": None,
             "valid_ridge_count": int(len(detected)),
         }
     reference = np.asarray(projection_reference, dtype=float)
@@ -340,6 +351,16 @@ def _t2_metrics(result: Any, projection_reference: np.ndarray) -> dict[str, Any]
         ),
         "truth_reference_median_error_q": float(np.median(reverse_distances)),
         "truth_reference_p95_error_q": float(np.percentile(reverse_distances, 95.0)),
+        "truth_reference_median_error_local_fwhm_fraction": (
+            float(np.median(reverse_distances) / median_width)
+            if median_width is not None and median_width > 0
+            else None
+        ),
+        "truth_reference_p95_error_local_fwhm_fraction": (
+            float(np.percentile(reverse_distances, 95.0) / median_width)
+            if median_width is not None and median_width > 0
+            else None
+        ),
         "valid_ridge_count": int(detected.shape[0]),
     }
 
@@ -389,7 +410,7 @@ def _run_t1(
         arrays = _case_arrays(npz_path)
         result = _analyze_case(arrays, q_window=(0.15, 1.25), ridge_method=ridge_method)
         metrics = _t1_metrics(result, truth)
-        quality_status = str(result.ellipse_fit.get("quality_status") or "FAIL")
+        quality_status = _quality_status(result.ellipse_fit.get("quality_status")) or "UNKNOWN"
         expected_rejection, rejection_reasons = _t1_expected_rejection(truth)
         passed = _t1_case_passes(truth, metrics, quality_status, thresholds)
         cases.append(
@@ -402,6 +423,8 @@ def _run_t1(
                 "metrics": metrics,
                 "fit": _fit_summary(result),
                 "input_sha256": _sha256(npz_path),
+                "truth_path": truth_path.as_posix(),
+                "truth_sha256": _sha256(truth_path),
             }
         )
     passed_count = sum(bool(case["passed"]) for case in cases)
@@ -436,13 +459,24 @@ def _run_t2(
         arrays = _case_arrays(npz_path)
         result = _analyze_case(arrays, q_window=(0.30, 0.80), ridge_method=ridge_method)
         metrics = _t2_metrics(result, np.asarray(arrays.get("projection_reference", []), dtype=float))
-        quality_status = str(result.ellipse_fit.get("quality_status") or "FAIL")
+        quality_status = _quality_status(result.ellipse_fit.get("quality_status")) or "UNKNOWN"
         expected_rejection = category in {"2-point", "non_elliptical"}
         classification_correct = (
-            quality_status == "FAIL" if expected_rejection else quality_status != "FAIL"
+            quality_status == "FAIL"
+            if expected_rejection
+            else quality_status in {"PASS", "WARN"}
         )
-        ridge_pass = _threshold_check(
-            metrics.get("ridge_error_local_fwhm_fraction"), maximum=maximum_fraction
+        ridge_pass = all(
+            (
+                _threshold_check(
+                    metrics.get("ridge_error_local_fwhm_fraction"),
+                    maximum=maximum_fraction,
+                ),
+                _threshold_check(
+                    metrics.get("truth_reference_p95_error_local_fwhm_fraction"),
+                    maximum=maximum_fraction,
+                ),
+            )
         )
         projection_truth = entry.get("projection_truth", {})
         projection_targets = {
@@ -559,7 +593,27 @@ def _load_r0_rows(manifest_path: Path) -> list[dict[str, str]]:
     expected = [f"blind_{index:03d}" for index in range(1, 9)]
     if [row.get("blind_id") for row in rows] != expected:
         raise ValueError("R0 P4 manifest must contain blind_001 through blind_008 in order")
+    for row in rows:
+        declared = str(row.get("sha256", "") or "").strip().lower()
+        if re.fullmatch(r"[0-9a-f]{64}", declared) is None:
+            raise ValueError(
+                f"R0 row {row.get('blind_id')} must declare a complete 64-character SHA-256"
+            )
     return rows
+
+
+def _r0_quality_summary(frames: Sequence[Mapping[str, Any]]) -> tuple[str, dict[str, int]]:
+    counts = {status: 0 for status in ("PASS", "WARN", "FAIL", "UNKNOWN")}
+    for frame in frames:
+        fit = frame.get("fit", {})
+        value = fit.get("quality_status") if isinstance(fit, Mapping) else None
+        status = _quality_status(value)
+        counts[status if status is not None else "UNKNOWN"] += 1
+    if len(frames) != 8 or counts["FAIL"] or counts["UNKNOWN"]:
+        return "FAIL", counts
+    if counts["WARN"]:
+        return "WARN", counts
+    return "PASS", counts
 
 
 def _run_r0(
@@ -572,10 +626,12 @@ def _run_r0(
     progress: Progress,
 ) -> dict[str, Any]:
     package = package.resolve()
+    manifest_before = _sha256(manifest_path)
     poni_before = _sha256(poni)
     mask_before = _sha256(mask)
     frames: list[dict[str, Any]] = []
-    for row in _load_r0_rows(manifest_path):
+    rows = _load_r0_rows(manifest_path)
+    for row in rows:
         blind_id = str(row["blind_id"])
         relative = row.get("source_path_relative_package") or row.get("source_path")
         if not relative:
@@ -584,8 +640,8 @@ def _run_r0(
         if not source.is_relative_to(package):
             raise ValueError(f"R0 source escapes package root: {source}")
         before = _sha256(source)
-        declared = str(row.get("sha256", "") or "").lower()
-        if declared and declared != before.lower():
+        declared = str(row["sha256"]).strip().lower()
+        if declared != before.lower():
             raise ValueError(f"R0 manifest hash mismatch for {blind_id}: {source}")
         progress(f"P4 R0: {blind_id}")
         result = analyze_frame(
@@ -617,6 +673,25 @@ def _run_r0(
             for item in result.observables.get("lobes", [])
             if isinstance(item, Mapping)
         ]
+        ridge_rows = _ridge_rows(result)
+        ridge_q = np.asarray(
+            [
+                value
+                for item in ridge_rows
+                if (value := _finite(item.get("q"))) is not None
+            ],
+            dtype=float,
+        )
+        all_ridge_rows = [item for item in result.ridges if isinstance(item, Mapping)]
+        rejection_reasons: dict[str, int] = {}
+        for item in all_ridge_rows:
+            if bool(item.get("valid", item.get("accepted", True))):
+                continue
+            reason = str(item.get("reason") or "unspecified")
+            rejection_reasons[reason] = rejection_reasons.get(reason, 0) + 1
+        ridge_bundle = result.observables.get("ridge", {})
+        if not isinstance(ridge_bundle, Mapping):
+            ridge_bundle = {}
         frames.append(
             {
                 "blind_id": blind_id,
@@ -625,31 +700,45 @@ def _run_r0(
                 "input_sha256_before": before,
                 "input_sha256_after": after,
                 "input_unchanged": True,
-                "valid_ridge_count": len(_ridge_rows(result)),
+                "valid_ridge_count": len(ridge_rows),
+                "ridge_q_statistics_nm_inv": {
+                    "minimum": float(np.min(ridge_q)) if ridge_q.size else None,
+                    "median": float(np.median(ridge_q)) if ridge_q.size else None,
+                    "maximum": float(np.max(ridge_q)) if ridge_q.size else None,
+                },
+                "ridge_quality": {
+                    "q_unit": ridge_bundle.get("q_unit"),
+                    "valid_fraction": ridge_bundle.get("valid_fraction"),
+                    "continuity_fraction": ridge_bundle.get("continuity_fraction"),
+                    "continuity_score": ridge_bundle.get("continuity_score"),
+                    "trajectory_count": len(
+                        {
+                            int(item["trajectory_id"])
+                            for item in ridge_rows
+                            if item.get("trajectory_id") is not None
+                        }
+                    ),
+                    "rejection_reasons": rejection_reasons,
+                },
                 "valid_lobe_count": sum(bool(item["valid"]) for item in lobe_rows),
                 "lobes": lobe_rows,
                 "fit": _fit_summary(result),
             }
         )
-    counts = {
-        status: sum(frame["fit"].get("quality_status") == status for frame in frames)
-        for status in ("PASS", "WARN", "FAIL")
-    }
+    engineering_status, counts = _r0_quality_summary(frames)
+    manifest_after = _sha256(manifest_path)
     poni_after = _sha256(poni)
     mask_after = _sha256(mask)
-    if poni_before != poni_after or mask_before != mask_after:
-        raise RuntimeError("PONI or mask changed during P4 analysis")
-    engineering_status = (
-        "FAIL"
-        if counts["FAIL"]
-        else ("WARN" if counts["WARN"] else "PASS")
-    )
+    if manifest_before != manifest_after or poni_before != poni_after or mask_before != mask_after:
+        raise RuntimeError("R0 manifest, PONI or mask changed during P4 analysis")
     return {
         "status": engineering_status,
         "scientific_status": "NOT_ACCEPTED",
         "frame_count": len(frames),
         "quality_counts": counts,
         "support_files_unchanged": True,
+        "manifest_sha256_before": manifest_before,
+        "manifest_sha256_after": manifest_after,
         "poni_sha256_before": poni_before,
         "poni_sha256_after": poni_after,
         "mask_sha256_before": mask_before,
@@ -884,13 +973,16 @@ def run_p4_engineering(
             "reason": "R0 arguments were not supplied",
         }
 
-    r0_incomplete = report["r0"]["status"] in {"NOT_RUN", "FAIL"}
+    r0_status = str(report["r0"]["status"])
+    r0_incomplete = r0_status in {"NOT_RUN", "FAIL"}
     algorithm_fail = (
         report["t1"]["status"] == "FAIL"
         or report["t2"]["status"] == "FAIL"
         or r0_incomplete
     )
-    report["engineering_status"] = "FAIL" if algorithm_fail else "PASS"
+    report["engineering_status"] = (
+        "FAIL" if algorithm_fail else ("WARN" if r0_status == "WARN" else "PASS")
+    )
     report["p4_go_no_go"] = "NO_GO"
     report["p4_go_no_go_reasons"] = [
         "P3 human consensus is incomplete",

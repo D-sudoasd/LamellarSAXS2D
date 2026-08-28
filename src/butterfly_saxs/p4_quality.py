@@ -48,6 +48,33 @@ def _finite(value: Any) -> float | None:
     return number if np.isfinite(number) else None
 
 
+def _physical_q_unit(value: Any) -> bool:
+    normalized = (
+        str(value or "unknown")
+        .strip()
+        .casefold()
+        .replace(" ", "")
+        .replace("⁻¹", "^-1")
+        .replace("−", "-")
+        .replace("å", "a")
+        .replace("Å", "a")
+    )
+    return normalized in {
+        "1/nm",
+        "nm^-1",
+        "nm-1",
+        "nm**-1",
+        "1/a",
+        "a^-1",
+        "a-1",
+        "a**-1",
+        "1/angstrom",
+        "angstrom^-1",
+        "angstrom-1",
+        "angstrom**-1",
+    }
+
+
 def _point_rows(ridge: Any) -> list[Any]:
     points = _read(ridge, "points", ridge)
     if points is None or isinstance(points, (str, bytes, Mapping)):
@@ -169,6 +196,11 @@ def evaluate_p4_ellipse_quality(
         for point in valid_rows
         if (value := _read(point, "trajectory_id", None)) is not None
     }
+    q_unit = _read(ridge, "q_unit", None)
+    if q_unit is None and rows:
+        q_unit = _read(rows[0], "q_unit", None)
+    if q_unit is None:
+        q_unit = _read(ellipse, "q_unit", "unknown")
 
     checks: list[dict[str, Any]] = []
 
@@ -190,6 +222,19 @@ def evaluate_p4_ellipse_quality(
         solver_success,
         True,
         "solver converged" if solver_success else "ellipse solver did not converge",
+    )
+
+    physical_q = _physical_q_unit(q_unit)
+    add(
+        "physical_q_declared",
+        "PASS" if physical_q else "WARN",
+        str(q_unit or "unknown"),
+        "nm^-1 or Å^-1",
+        (
+            "ridge coordinates have a declared physical reciprocal-space unit"
+            if physical_q
+            else "ridge coordinates are uncalibrated; geometry may run but cannot receive an engineering PASS"
+        ),
     )
 
     finite_geometry = all(
@@ -378,6 +423,7 @@ def evaluate_p4_ellipse_quality(
         "metrics": {
             "n_points_total": len(rows),
             "n_points_valid": len(valid_rows),
+            "q_unit": str(q_unit or "unknown"),
             "valid_fraction": valid_fraction,
             "continuity_fraction": continuity_fraction,
             "continuity_score": continuity_score,
