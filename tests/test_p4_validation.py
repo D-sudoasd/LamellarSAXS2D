@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+from butterfly_saxs.benchmark_t1 import generate_case
 from butterfly_saxs.cli import main
 from butterfly_saxs.p4_validation import (
     _assigned_periodic_errors,
     _load_r0_rows,
     _r0_quality_summary,
+    _t2_expected_outcome,
+    _t2_projection_contract_complete,
+    _t1_visible_ridge_angles,
     run_p4_engineering,
 )
 
@@ -18,6 +23,66 @@ def test_p4_periodic_lobe_assignment_wraps_at_180_degrees() -> None:
     errors = _assigned_periodic_errors([-179.5, 30.0], [179.5, 31.0])
 
     assert sorted(errors) == pytest.approx([1.0, 1.0])
+
+
+def test_t1_f1_reference_uses_visible_truth_sectors_not_latent_full_ellipse() -> None:
+    sample = generate_case("noiseless_default")
+    arrays = {
+        "truth_intensity": sample.truth_intensity,
+        "valid_mask": ~sample.mask,
+        "qx": sample.qx,
+        "qy": sample.qy,
+        "q": sample.q,
+        "q_unit": sample.truth["q_unit"],
+    }
+
+    angles = _t1_visible_ridge_angles(arrays)
+
+    assert angles is not None
+    assert 0 < len(angles) < 72
+    assert all(np.isfinite(value) for value in angles)
+
+
+@pytest.mark.parametrize(
+    ("category", "projection_evaluable", "expected"),
+    [
+        ("2-point", False, "reject_nonellipse_or_insufficient"),
+        ("non_elliptical", True, "reject_nonellipse_or_insufficient"),
+        ("eyebrow", False, "reject_information_insufficient_for_ellipse"),
+        ("butterfly", False, "reject_information_insufficient_for_ellipse"),
+        ("butterfly", True, "fit_projection_ellipse"),
+    ],
+)
+def test_t2_expected_outcome_respects_available_projection_truth(
+    category: str,
+    projection_evaluable: bool,
+    expected: str,
+) -> None:
+    assert (
+        _t2_expected_outcome(category, projection_evaluable=projection_evaluable)
+        == expected
+    )
+
+
+def test_t2_information_insufficient_cases_do_not_complete_ellipse_contract() -> None:
+    cases = [
+        {
+            "expected_outcome": "reject_nonellipse_or_insufficient",
+            "projection_thresholds_evaluable": False,
+        },
+        {
+            "expected_outcome": "reject_information_insufficient_for_ellipse",
+            "projection_thresholds_evaluable": False,
+        },
+    ]
+
+    assert not _t2_projection_contract_complete(cases)
+
+    cases[1] = {
+        "expected_outcome": "fit_projection_ellipse",
+        "projection_thresholds_evaluable": True,
+    }
+    assert _t2_projection_contract_complete(cases)
 
 
 def test_p4_cli_help_is_available() -> None:

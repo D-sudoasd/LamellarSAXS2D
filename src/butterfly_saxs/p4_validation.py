@@ -22,7 +22,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
 from .benchmark_t1 import DEFAULT_CASE_NAMES as T1_DEFAULT_CASE_NAMES
-from .observables import ellipse_radius
+from .observables import ellipse_radius, measure_radial_ridges
 from .pipeline import analyze_frame
 
 
@@ -146,6 +146,11 @@ def _case_arrays(path: Path) -> dict[str, np.ndarray | str]:
             "valid_mask": np.asarray(archive["valid_mask"], dtype=bool),
             "q_unit": str(archive["q_unit"]),
             **(
+                {"truth_intensity": np.asarray(archive["truth_intensity"], dtype=float)}
+                if "truth_intensity" in archive.files
+                else {}
+            ),
+            **(
                 {"projection_reference": np.asarray(archive["projection_reference"], dtype=float)}
                 if "projection_reference" in archive.files
                 else {}
@@ -188,13 +193,41 @@ def _ridge_rows(result: Any) -> list[dict[str, Any]]:
     ]
 
 
-def _t1_metrics(result: Any, truth: Mapping[str, Any]) -> dict[str, Any]:
+def _t1_visible_ridge_angles(arrays: Mapping[str, Any]) -> set[float] | None:
+    truth_intensity = arrays.get("truth_intensity")
+    if truth_intensity is None:
+        return None
+    qmap = {
+        "qx": arrays["qx"],
+        "qy": arrays["qy"],
+        "q": arrays["q"],
+        "q_unit": arrays["q_unit"],
+    }
+    track = measure_radial_ridges(
+        {"data": truth_intensity, "valid_mask": arrays["valid_mask"]},
+        qmap,
+        (0.15, 1.25),
+        n_angles=72,
+        n_bins=128,
+    )
+    return {
+        round(float(np.degrees(angle)), 6)
+        for angle in track.angles[track.valid]
+    }
+
+
+def _t1_metrics(
+    result: Any,
+    truth: Mapping[str, Any],
+    arrays: Mapping[str, Any],
+) -> dict[str, Any]:
     parameters = dict(truth.get("truth_parameters", truth.get("parameters", {})))
     a = float(parameters["a"])
     b = float(parameters["b"])
     theta = float(parameters["theta"])
     rows = _ridge_rows(result)
     errors_q: list[float] = []
+    error_angles_deg: list[float] = []
     for row in rows:
         angle_deg = _finite(row.get("angle_deg", row.get("theta_deg")))
         observed_q = _finite(row.get("q"))
@@ -204,6 +237,7 @@ def _t1_metrics(result: Any, truth: Mapping[str, Any]) -> dict[str, Any]:
         plus = float(ellipse_radius(angle, a, b, theta))
         minus = float(ellipse_radius(angle, a, b, -theta))
         errors_q.append(min(abs(observed_q - plus), abs(observed_q - minus)))
+        error_angles_deg.append(angle_deg)
     spacing = np.asarray(truth.get("q_spacing", ()), dtype=float)
     q_step = float(np.median(spacing[np.isfinite(spacing) & (spacing > 0)])) if spacing.size else float("nan")
     errors_px = np.asarray(errors_q, dtype=float) / q_step if np.isfinite(q_step) and q_step > 0 else np.asarray([])
@@ -226,12 +260,28 @@ def _t1_metrics(result: Any, truth: Mapping[str, Any]) -> dict[str, Any]:
     fit_cx = _finite(ellipse.get("parameters", {}).get("center_qx"))
     fit_cy = _finite(ellipse.get("parameters", {}).get("center_qy"))
     center_q = float(np.hypot(fit_cx, fit_cy)) if fit_cx is not None and fit_cy is not None else None
-    matched = int(np.count_nonzero(errors_px <= 1.0)) if errors_px.size else 0
-    denominator = 72
+    truth_visible_angles = _t1_visible_ridge_angles(arrays)
+    denominator = len(truth_visible_angles) if truth_visible_angles is not None else 72
+    matched = sum(
+        bool(error <= 1.0)
+        and (
+            truth_visible_angles is None
+            or round(float(angle_deg), 6) in truth_visible_angles
+        )
+        for error, angle_deg in zip(errors_px, error_angles_deg)
+    )
+    false_positive = max(0, len(rows) - matched)
+    false_negative = max(0, denominator - matched)
+    precision = matched / (matched + false_positive) if matched + false_positive else 0.0
+    recall = matched / (matched + false_negative) if matched + false_negative else 0.0
     return {
         "ridge_median_error_px": float(np.median(errors_px)) if errors_px.size else None,
         "ridge_p95_error_px": float(np.percentile(errors_px, 95.0)) if errors_px.size else None,
         "ridge_f1_at_1px": float(2.0 * matched / (len(rows) + denominator)) if rows else 0.0,
+        "ridge_precision_at_1px": float(precision),
+        "ridge_recall_at_1px": float(recall),
+        "truth_visible_ridge_count": int(denominator),
+        "truth_visibility_method": "same_sampling_noiseless_truth_continuity_track",
         "lobe_periodic_angle_error_deg": max(lobe_errors) if lobe_errors else None,
         "valid_lobe_count": len(measured_lobes),
         "truth_lobe_count": len(truth_lobes),
@@ -409,7 +459,7 @@ def _run_t1(
         truth = _read_json(truth_path)
         arrays = _case_arrays(npz_path)
         result = _analyze_case(arrays, q_window=(0.15, 1.25), ridge_method=ridge_method)
-        metrics = _t1_metrics(result, truth)
+        metrics = _t1_metrics(result, truth, arrays)
         quality_status = _quality_status(result.ellipse_fit.get("quality_status")) or "UNKNOWN"
         expected_rejection, rejection_reasons = _t1_expected_rejection(truth)
         passed = _t1_case_passes(truth, metrics, quality_status, thresholds)
@@ -436,6 +486,22 @@ def _run_t1(
     }
 
 
+def _t2_expected_outcome(category: str, *, projection_evaluable: bool) -> str:
+    if category in {"2-point", "non_elliptical"}:
+        return "reject_nonellipse_or_insufficient"
+    if not projection_evaluable:
+        return "reject_information_insufficient_for_ellipse"
+    return "fit_projection_ellipse"
+
+
+def _t2_projection_contract_complete(cases: Sequence[Mapping[str, Any]]) -> bool:
+    return bool(cases) and all(
+        case.get("expected_outcome") == "reject_nonellipse_or_insufficient"
+        or bool(case.get("projection_thresholds_evaluable"))
+        for case in cases
+    )
+
+
 def _run_t2(
     manifest_path: Path,
     thresholds: Mapping[str, Any],
@@ -460,24 +526,6 @@ def _run_t2(
         result = _analyze_case(arrays, q_window=(0.30, 0.80), ridge_method=ridge_method)
         metrics = _t2_metrics(result, np.asarray(arrays.get("projection_reference", []), dtype=float))
         quality_status = _quality_status(result.ellipse_fit.get("quality_status")) or "UNKNOWN"
-        expected_rejection = category in {"2-point", "non_elliptical"}
-        classification_correct = (
-            quality_status == "FAIL"
-            if expected_rejection
-            else quality_status in {"PASS", "WARN"}
-        )
-        ridge_pass = all(
-            (
-                _threshold_check(
-                    metrics.get("ridge_error_local_fwhm_fraction"),
-                    maximum=maximum_fraction,
-                ),
-                _threshold_check(
-                    metrics.get("truth_reference_p95_error_local_fwhm_fraction"),
-                    maximum=maximum_fraction,
-                ),
-            )
-        )
         projection_truth = entry.get("projection_truth", {})
         projection_targets = {
             "a": _finite(projection_truth.get("a")) if isinstance(projection_truth, Mapping) else None,
@@ -489,6 +537,24 @@ def _run_t2(
             ),
         }
         projection_evaluable = all(value is not None for value in projection_targets.values())
+        expected_outcome = _t2_expected_outcome(
+            category,
+            projection_evaluable=projection_evaluable,
+        )
+        expected_rejection = expected_outcome.startswith("reject_")
+        classification_correct = (
+            quality_status == "FAIL"
+            if expected_rejection
+            else quality_status in {"PASS", "WARN"}
+        )
+        ridge_localization_pass = _threshold_check(
+            metrics.get("ridge_error_local_fwhm_fraction"),
+            maximum=maximum_fraction,
+        )
+        ridge_coverage_pass = _threshold_check(
+            metrics.get("truth_reference_p95_error_local_fwhm_fraction"),
+            maximum=maximum_fraction,
+        )
         projection_errors = {
             "a_relative_error": (
                 abs(float(result.ellipse_fit.get("a")) - float(projection_targets["a"]))
@@ -516,32 +582,58 @@ def _run_t2(
                 else None
             ),
         }
-        projection_pass = projection_evaluable and all(
-            (
-                _threshold_check(
-                    projection_errors["a_relative_error"],
-                    maximum=float(thresholds["projection_a_relative_error_max"]),
-                ),
-                _threshold_check(
-                    projection_errors["b_relative_error"],
-                    maximum=float(thresholds["projection_b_relative_error_max"]),
-                ),
-                _threshold_check(
-                    projection_errors["tilt_error_deg"],
-                    maximum=float(thresholds["projection_tilt_error_deg_max"]),
-                ),
+        projection_pass = (
+            all(
+                (
+                    _threshold_check(
+                        projection_errors["a_relative_error"],
+                        maximum=float(thresholds["projection_a_relative_error_max"]),
+                    ),
+                    _threshold_check(
+                        projection_errors["b_relative_error"],
+                        maximum=float(thresholds["projection_b_relative_error_max"]),
+                    ),
+                    _threshold_check(
+                        projection_errors["tilt_error_deg"],
+                        maximum=float(thresholds["projection_tilt_error_deg_max"]),
+                    ),
+                )
             )
+            if projection_evaluable
+            else None
         )
-        passed = classification_correct and (
-            expected_rejection or (ridge_pass and projection_pass)
-        )
+        if expected_outcome == "reject_nonellipse_or_insufficient":
+            passed = classification_correct
+        elif expected_outcome == "reject_information_insufficient_for_ellipse":
+            passed = (
+                classification_correct
+                and ridge_localization_pass
+                and not ridge_coverage_pass
+            )
+        else:
+            passed = (
+                classification_correct
+                and ridge_localization_pass
+                and ridge_coverage_pass
+                and bool(projection_pass)
+            )
         cases.append(
             {
                 "case_id": case_id,
                 "category": category,
+                "expected_outcome": expected_outcome,
                 "expected_rejection": expected_rejection,
                 "classification_correct": classification_correct,
+                "ridge_localization_threshold_passed": ridge_localization_pass,
+                "ridge_coverage_threshold_passed": ridge_coverage_pass,
                 "projection_thresholds_evaluable": projection_evaluable,
+                "projection_parameter_status": (
+                    "PASS"
+                    if projection_pass is True
+                    else "FAIL"
+                    if projection_pass is False
+                    else "NOT_APPLICABLE"
+                ),
                 "projection_targets": projection_targets,
                 "projection_errors": projection_errors,
                 "projection_thresholds_passed": projection_pass,
@@ -561,27 +653,36 @@ def _run_t2(
         classification_accuracy,
         minimum=float(thresholds["pattern_class_accuracy_min"]),
     )
-    projection_contract_complete = all(
-        bool(case["expected_rejection"])
-        or bool(case["projection_thresholds_evaluable"])
-        for case in cases
+    available_contract_passed = (
+        passed_count == len(cases) and classification_threshold_passed
     )
+    projection_contract_complete = _t2_projection_contract_complete(cases)
     suite_passed = (
-        passed_count == len(cases)
-        and classification_threshold_passed
+        available_contract_passed
         and projection_contract_complete
     )
     return {
         "status": "PASS" if suite_passed else "FAIL",
         "passed_count": passed_count,
         "case_count": len(cases),
+        "available_contract_passed": available_contract_passed,
         "pattern_class_accuracy": classification_accuracy,
         "pattern_class_accuracy_threshold_passed": classification_threshold_passed,
+        "independent_ellipse_generalization_status": (
+            "PASS"
+            if suite_passed
+            else "FAIL"
+            if projection_contract_complete
+            else "NOT_TESTED"
+        ),
         "projection_threshold_contract_complete": projection_contract_complete,
         "projection_threshold_contract_reason": (
             None
             if projection_contract_complete
-            else "current T2 projection truth has no explicit a/b/tilt targets"
+            else (
+                "current T2 supplies independent analytic ridge arcs but no independently "
+                "generated ellipse a/b/tilt targets"
+            )
         ),
         "cases": cases,
     }
