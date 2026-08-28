@@ -169,6 +169,8 @@ chi_max_deg = -170
 .\.venv-project\Scripts\python.exe -m butterfly_saxs gui data\frame_0001.cbf --poni geometry\detector.poni
 ```
 
+首次启动默认显示中文。顶栏 `语言 / Language` 菜单可选择 `中文` 或 `English`，切换后窗口、按钮、页签、提示、状态栏、表头、测量图标签和 Fit session 会立即更新，无需重启。选择通过应用级 `QSettings` 的 `ui/language` 键全局记忆，不进入 schema 2 项目 JSON。参数键、q 单位、flags、`manual_status=unreviewed/accepted/rejected`、文件路径和 evidence provenance 始终保持机器可读原值，仅显示文字变化。
+
 UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY/NPZ/HDF5/CSV/TXT，后者可通过 CLI/API 或注入服务使用。典型顺序：
 
 1. `Project → Open image…` 载入图像；多帧/数据集在项目或服务参数中指定 `frame`/`dataset`。
@@ -178,12 +180,12 @@ UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY
 5. `Preview` 根据当前参数显示 observed/model/residual/overlay；Overlay 中青色虚线双椭圆来自右侧当前模型参数，橙色实线椭圆来自观测 ridge 的独立拟合，两者不得混作同一证据。`Optimize` 在后台精修可变参数；`Auto preview` 控制参数改变后的自动预览。状态栏显示 RMSE、ndata、flags、coverage。
 6. 在 `Fit session` 中填写 `Snapshot note` 后点击 `Save snapshot`，可保存多个带顺序和备注的完整参数表；`Restore snapshot` 精确恢复所选参数。每次 Optimize 前软件还会自动保存一次完整状态，`Restore before optimize` 可撤销本次自动精修。取消任务或忽略迟到结果后，旧 worker 不会覆盖当前参数。
 7. 最新一次 Preview 或 Optimize 成功后，填写 `Reviewer`，再点 `Accept current` 或 `Reject current`。修改参数、分析范围、输入、PONI、mask 或 ROI 后，状态会立即回到 `unreviewed`，必须重新 Preview 才能审核或导出。`accepted` 只表示该审核者接受当前人工拟合会话，不表示软件或 P3 科学门给出 PASS。
-8. `Project → Export evidence…` 选择输出目录，固定生成 `observed.png`、`model.png`、`residual.png`、`overlay.png`、`parameters.csv`、`fit_session.json` 和 `provenance.json`。输入是当前屏幕对应的最新 Preview/Optimize、参数表和审核状态；输出默认不覆盖已有同名文件。成功标准是状态栏显示 `Exported 7 evidence files`，七个文件均非空，`parameters.csv` 与当前参数表一致，两个 JSON 中 q 单位、输入路径/hash 和 `manual_status` 可复核。未审核结果也可以导出，但必须保持 `unreviewed`。
+8. `Project → Export evidence…`（中文界面为“项目 → 导出证据…”）选择输出目录，固定生成 `observed.png`、`model.png`、`residual.png`、`overlay.png`、`parameters.csv`、`fit_session.json` 和 `provenance.json`。输入是当前屏幕对应的最新 Preview/Optimize、参数表和审核状态；输出默认不覆盖已有同名文件。成功标准是状态栏显示导出 7 个证据文件，七个文件均非空，`parameters.csv` 与当前参数表一致，两个 JSON 中 q 单位、输入路径/hash 和 `manual_status` 可复核。未审核结果也可以导出，但必须保持 `unreviewed`。
 9. `Project → Save project…` 保存 schema 2 JSON 项目。它保存当前输入、PONI、mask、ROI、参数规格、人工审核状态、Optimize 前后摘要、参数快照、batch 帧列表和 batch 设置；不会把探测器尺寸的 observed/model/residual/qmap 数组塞进项目 JSON。重新打开后会恢复可复现输入与会话状态，再点击 Preview 重建四视图。相对路径按该 JSON 所在目录解析；CLI 的 TOML 仍是另一种项目格式，不要把二者当作同一 schema。
 
 参数 `Vary=false` 是当前帧的固定参数；`Expr` 是受限、可审计的表达式绑定，绑定量不进入自由优化向量。固定参数的 stderr 不是零，见科学文档。
 
-载入物理 PONI 后，`a`、`b`、径向宽度和背景宽度等 q 参数的 Unit 会刷新为当前 q 单位。`q min/q max` 只接受有限数值或 `Auto`，非法文本以及 `q min >= q max` 会在任务启动前报错。Preview/Optimize 若失败或没有返回新 model/residual，界面会清空旧图并显示失败状态，避免把上一轮结果误认为本轮结果。
+载入物理 PONI 后，`a`、`b`、径向宽度和背景宽度等 q 参数的 Unit 会刷新为当前 q 单位。`q min/q max` 只接受有限数值或自动范围标记（中文为 `自动`，英文为 `Auto`），非法文本以及 `q min >= q max` 会在任务启动前报错。Preview/Optimize 若失败或没有返回新 model/residual，界面会清空旧图并显示失败状态，避免把上一轮结果误认为本轮结果。
 
 ## 6. 批处理、warm start 与恢复
 

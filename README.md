@@ -118,6 +118,7 @@ LamellarSAXS2D 面向取向层片体系的各向异性二维 SAXS 花样，提�
 - 提取径向/方位剖面、lobe、ridge，并在 q 空间拟合共享中心和半轴的镜像双椭圆。
 - 可选像素级 `full2d` 经验精修，支持参数边界、固定、表达式绑定、权重和残差诊断。
 - Qt 界面提供 Observed、Model、Residual、Overlay 四视图和可编辑参数表；人工修改参数后，Preview 会同步更新经验模型及 Overlay 中的模型双椭圆，Optimize 只作为当前单帧的可选辅助。
+- 顶栏 `语言 / Language` 菜单可在中文和 English 间即时切换；首次启动默认中文，选择保存在应用级 `QSettings` 中，不写入科研项目 JSON，也不改变参数、单位、flags 或审核状态码。
 - UI 可保存带备注的参数快照、恢复 Optimize 前状态，并由具名审核者显式 Accept/Reject 当前 Preview 或 Optimize；该人工会话状态不等于科学 PASS。`Export evidence…` 默认不覆盖，固定导出四张诊断图、参数 CSV、会话 JSON 和 provenance JSON。
 - 支持独立拟合或质量门控的 warm start、checkpoint 恢复、失败帧隔离及 CSV/JSON/NPZ 可审计导出。
 

@@ -9,8 +9,13 @@ import pytest
 pytest.importorskip("PySide6")
 pytest.importorskip("pyqtgraph")
 
-from butterfly_saxs.ui import MainWindow
+from butterfly_saxs.ui import MainWindow as _MainWindow
 from butterfly_saxs.ui.views import ViewGrid
+
+
+def MainWindow(*args, **kwargs):  # noqa: N802 - compact legacy-English test seam
+    kwargs.setdefault("language", "en")
+    return _MainWindow(*args, **kwargs)
 
 
 class _BatchEngine:

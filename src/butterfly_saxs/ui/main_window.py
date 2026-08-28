@@ -20,6 +20,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Callable
 
+from .i18n import DEFAULT_LANGUAGE, LANGUAGE_SETTING_KEY, translate, validate_language
 from .models import ParameterRow, ParameterTableModel
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .views import PLOT_AVAILABLE, ViewGrid
@@ -260,13 +261,23 @@ def _result_value(result: Any, names: tuple[str, ...], default: Any = None) -> A
 def _analysis_scalar(value: Any, *, default: Any = None) -> Any:
     """Parse a line-edit analysis value while preserving ``Auto`` as ``None``."""
 
-    if value is None or (isinstance(value, str) and value.strip().lower() in {"", "auto"}):
+    if value is None or (
+        isinstance(value, str) and value.strip().lower() in {"", "auto", "自动"}
+    ):
         return default
     try:
         number = float(value)
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
+
+
+_BATCH_STATUS_KEYS = {
+    "ready": "status.ready",
+    "ok": "status.batch_ok",
+    "failed": "status.batch_failed",
+    "skipped": "status.batch_skipped",
+}
 
 
 def _parameter_number(parameters: Mapping[str, Any], names: tuple[str, ...]) -> float | None:
@@ -401,8 +412,31 @@ if QT_AVAILABLE:
             mask_dataset: str | None = None,
             auto_preview: bool = True,
             debounce_ms: int = 250,
+            language: str | None = None,
+            settings: Any = None,
         ) -> None:
             super().__init__(parent)
+            self._settings = (
+                settings
+                if settings is not None
+                else QtCore.QSettings("LamellarSAXS2D", "LamellarSAXS2D")
+            )
+            if language is None:
+                stored_language = self._settings.value(
+                    LANGUAGE_SETTING_KEY,
+                    DEFAULT_LANGUAGE,
+                )
+                try:
+                    self._language = validate_language(stored_language)
+                except ValueError:
+                    self._language = DEFAULT_LANGUAGE
+            else:
+                self._language = validate_language(language)
+            self._status_key = "status.ready"
+            self._status_values: dict[str, Any] = {}
+            self._displayed_flags_text = "—"
+            self._metric_display = {"rmse": "—", "ndata": "—", "coverage": "—"}
+            self._ridge_plot_q_unit = "map unit"
             if analysis_service is not None:
                 self.engine = analysis_service
             elif engine is not None:
@@ -466,7 +500,11 @@ if QT_AVAILABLE:
                 source_parameters = _read(self.engine, ("parameters", "parameter_set", "params"), None)
             if source_parameters is None:
                 source_parameters = _default_parameter_rows()
-            self.parameter_model = ParameterTableModel(source_parameters, self)
+            self.parameter_model = ParameterTableModel(
+                source_parameters,
+                self,
+                language=self._language,
+            )
 
             self._build_actions()
             self._build_central_pages()
@@ -481,50 +519,67 @@ if QT_AVAILABLE:
             self._debounce_timer.timeout.connect(self._on_debounce_timeout)
             self.parameter_model.parameterChanged.connect(self._on_parameter_changed)
 
-            self.setWindowTitle("LamellarSAXS2D · 2D Refinement")
             self.setMinimumSize(980, 680)
             self.resize(1440, 900)
-            self._set_status("Ready")
+            self._retranslate_ui()
+            self._set_status("status.ready")
 
         # ----- UI construction -------------------------------------------------
 
         def _build_actions(self) -> None:
-            file_menu = self.menuBar().addMenu("&Project")
+            self.project_menu = self.menuBar().addMenu("&Project")
             self.open_project_action = QtGui.QAction("Open project…", self)
             self.open_project_action.setObjectName("openProjectAction")
             self.open_project_action.triggered.connect(self.load_project)
-            file_menu.addAction(self.open_project_action)
+            self.project_menu.addAction(self.open_project_action)
             self.save_project_action = QtGui.QAction("Save project…", self)
             self.save_project_action.setObjectName("saveProjectAction")
             self.save_project_action.triggered.connect(self.save_project)
-            file_menu.addAction(self.save_project_action)
+            self.project_menu.addAction(self.save_project_action)
             self.open_image_action = QtGui.QAction("Open image…", self)
             self.open_image_action.setObjectName("openImageAction")
             self.open_image_action.triggered.connect(self.open_image)
-            file_menu.addAction(self.open_image_action)
+            self.project_menu.addAction(self.open_image_action)
             self.open_poni_action = QtGui.QAction("Select PONI…", self)
             self.open_poni_action.setObjectName("openPoniAction")
             self.open_poni_action.triggered.connect(self.select_poni)
-            file_menu.addAction(self.open_poni_action)
+            self.project_menu.addAction(self.open_poni_action)
             self.open_mask_action = QtGui.QAction("Select external mask…", self)
             self.open_mask_action.setObjectName("openMaskAction")
             self.open_mask_action.triggered.connect(self.select_mask)
-            file_menu.addAction(self.open_mask_action)
+            self.project_menu.addAction(self.open_mask_action)
             self.clear_mask_action = QtGui.QAction("Clear mask", self)
             self.clear_mask_action.setObjectName("clearMaskAction")
             self.clear_mask_action.triggered.connect(self.clear_external_mask)
-            file_menu.addAction(self.clear_mask_action)
+            self.project_menu.addAction(self.clear_mask_action)
             self.export_evidence_action = QtGui.QAction("Export evidence…", self)
             self.export_evidence_action.setObjectName("exportEvidenceAction")
             self.export_evidence_action.setToolTip(
                 "导出当前 Preview/Optimize 的四图、参数、审核记录与 provenance；不会自动判定 scientific PASS"
             )
             self.export_evidence_action.triggered.connect(self.export_manual_evidence)
-            file_menu.addAction(self.export_evidence_action)
-            file_menu.addSeparator()
-            close_action = QtGui.QAction("Close", self)
-            close_action.triggered.connect(self.close)
-            file_menu.addAction(close_action)
+            self.project_menu.addAction(self.export_evidence_action)
+            self.project_menu.addSeparator()
+            self.close_action = QtGui.QAction("Close", self)
+            self.close_action.setObjectName("closeAction")
+            self.close_action.triggered.connect(self.close)
+            self.project_menu.addAction(self.close_action)
+
+            self.language_menu = self.menuBar().addMenu("&Language")
+            self.language_action_group = QtGui.QActionGroup(self)
+            self.language_action_group.setExclusive(True)
+            self.chinese_action = QtGui.QAction("中文", self)
+            self.chinese_action.setObjectName("chineseLanguageAction")
+            self.chinese_action.setCheckable(True)
+            self.chinese_action.setData("zh_CN")
+            self.english_action = QtGui.QAction("English", self)
+            self.english_action.setObjectName("englishLanguageAction")
+            self.english_action.setCheckable(True)
+            self.english_action.setData("en")
+            for action in (self.chinese_action, self.english_action):
+                self.language_action_group.addAction(action)
+                self.language_menu.addAction(action)
+            self.language_action_group.triggered.connect(self._on_language_action)
 
             self.file_toolbar = self.addToolBar("Project")
             self.file_toolbar.setObjectName("projectToolbar")
@@ -542,7 +597,7 @@ if QT_AVAILABLE:
             self.refinement_page = QtWidgets.QWidget(self.pages)
             refinement_layout = QtWidgets.QVBoxLayout(self.refinement_page)
             refinement_layout.setContentsMargins(4, 4, 4, 4)
-            self.views = ViewGrid(self.refinement_page)
+            self.views = ViewGrid(self.refinement_page, language=self._language)
             self.views.setObjectName("viewGrid")
             refinement_layout.addWidget(self.views, 1)
             self.pages.addTab(self.refinement_page, "Refinement")
@@ -617,24 +672,25 @@ if QT_AVAILABLE:
 
             self._build_analysis_controls(panel, layout)
 
-            roi_box = QtWidgets.QGroupBox("Exclusion ROI (pixel)", panel)
-            roi_layout = QtWidgets.QGridLayout(roi_box)
-            self.roi_type_combo = QtWidgets.QComboBox(roi_box)
+            self.roi_group = QtWidgets.QGroupBox("Exclusion ROI (pixel)", panel)
+            roi_layout = QtWidgets.QGridLayout(self.roi_group)
+            self.roi_type_combo = QtWidgets.QComboBox(self.roi_group)
             self.roi_type_combo.setObjectName("roiTypeCombo")
             self.roi_type_combo.addItem("Rectangle", "rectangle")
             self.roi_type_combo.addItem("Ellipse", "ellipse")
             self.roi_type_combo.currentIndexChanged.connect(self._update_roi_controls)
-            roi_layout.addWidget(QtWidgets.QLabel("Type"), 0, 0)
+            self.roi_type_label = QtWidgets.QLabel("Type", self.roi_group)
+            roi_layout.addWidget(self.roi_type_label, 0, 0)
             roi_layout.addWidget(self.roi_type_combo, 0, 1, 1, 3)
-            self.roi_x0 = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_y0 = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_x1 = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_y1 = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_cx = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_cy = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_rx = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_ry = QtWidgets.QDoubleSpinBox(roi_box)
-            self.roi_angle = QtWidgets.QDoubleSpinBox(roi_box)
+            self.roi_x0 = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_y0 = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_x1 = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_y1 = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_cx = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_cy = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_rx = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_ry = QtWidgets.QDoubleSpinBox(self.roi_group)
+            self.roi_angle = QtWidgets.QDoubleSpinBox(self.roi_group)
             for spin in (
                 self.roi_x0,
                 self.roi_y0,
@@ -679,10 +735,12 @@ if QT_AVAILABLE:
             self.clear_roi_button.clicked.connect(self.clear_exclusion_roi)
             roi_layout.addWidget(self.apply_roi_button, 4, 0, 1, 2)
             roi_layout.addWidget(self.clear_roi_button, 4, 2, 1, 2)
-            layout.addWidget(roi_box)
+            layout.addWidget(self.roi_group)
 
-            session_box = QtWidgets.QGroupBox("Fit session", panel)
-            session_form = QtWidgets.QFormLayout(session_box)
+            self.fit_session_group = QtWidgets.QGroupBox("Fit session", panel)
+            self.fit_session_form = QtWidgets.QFormLayout(self.fit_session_group)
+            session_form = self.fit_session_form
+            session_box = self.fit_session_group
             self.manual_status_label = QtWidgets.QLabel("unreviewed", session_box)
             self.manual_status_label.setObjectName("manualStatusLabel")
             session_form.addRow("Manual status", self.manual_status_label)
@@ -718,7 +776,8 @@ if QT_AVAILABLE:
             self.snapshot_note_edit = QtWidgets.QLineEdit(session_box)
             self.snapshot_note_edit.setObjectName("snapshotNoteEdit")
             self.snapshot_note_edit.setPlaceholderText("required snapshot note")
-            snapshot_save_row = QtWidgets.QHBoxLayout()
+            self.snapshot_save_row = QtWidgets.QHBoxLayout()
+            snapshot_save_row = self.snapshot_save_row
             snapshot_save_row.addWidget(self.snapshot_note_edit, 1)
             self.save_snapshot_button = QtWidgets.QPushButton("Save snapshot", session_box)
             self.save_snapshot_button.setObjectName("saveSnapshotButton")
@@ -731,11 +790,12 @@ if QT_AVAILABLE:
             self.restore_snapshot_button = QtWidgets.QPushButton("Restore snapshot", session_box)
             self.restore_snapshot_button.setObjectName("restoreSnapshotButton")
             self.restore_snapshot_button.clicked.connect(lambda _checked=False: self.restore_snapshot())
-            snapshot_restore_row = QtWidgets.QHBoxLayout()
+            self.snapshot_restore_row = QtWidgets.QHBoxLayout()
+            snapshot_restore_row = self.snapshot_restore_row
             snapshot_restore_row.addWidget(self.snapshot_combo, 1)
             snapshot_restore_row.addWidget(self.restore_snapshot_button)
             session_form.addRow("Saved snapshots", snapshot_restore_row)
-            layout.addWidget(session_box)
+            layout.addWidget(self.fit_session_group)
             self._sync_fit_session_controls()
             self._update_roi_controls()
             self.parameters_dock.setWidget(panel)
@@ -781,7 +841,8 @@ if QT_AVAILABLE:
             lower.setObjectName("measurementTablesSplitter")
             lobe_panel = QtWidgets.QWidget(lower)
             lobe_layout = QtWidgets.QVBoxLayout(lobe_panel)
-            lobe_layout.addWidget(QtWidgets.QLabel("Four-lobe measurements"))
+            self.lobe_panel_label = QtWidgets.QLabel("Four-lobe measurements", lobe_panel)
+            lobe_layout.addWidget(self.lobe_panel_label)
             self.lobe_table = QtWidgets.QTableWidget(0, 8, lobe_panel)
             self.lobe_table.setObjectName("lobeTable")
             self.lobe_table.setHorizontalHeaderLabels(
@@ -794,7 +855,8 @@ if QT_AVAILABLE:
 
             ridge_panel = QtWidgets.QWidget(lower)
             ridge_layout = QtWidgets.QVBoxLayout(ridge_panel)
-            ridge_layout.addWidget(QtWidgets.QLabel("Ridge q vs angle / accepted"))
+            self.ridge_panel_label = QtWidgets.QLabel("Ridge q vs angle / accepted", ridge_panel)
+            ridge_layout.addWidget(self.ridge_panel_label)
             self.ridge_table = QtWidgets.QTableWidget(0, 4, ridge_panel)
             self.ridge_table.setObjectName("ridgeTable")
             self.ridge_table.setHorizontalHeaderLabels(["Angle (deg)", "q", "Accepted", "Method"])
@@ -805,7 +867,11 @@ if QT_AVAILABLE:
 
             ellipse_panel = QtWidgets.QWidget(lower)
             ellipse_layout = QtWidgets.QVBoxLayout(ellipse_panel)
-            ellipse_layout.addWidget(QtWidgets.QLabel("Ellipse core quantities / quality"))
+            self.ellipse_panel_label = QtWidgets.QLabel(
+                "Ellipse core quantities / quality",
+                ellipse_panel,
+            )
+            ellipse_layout.addWidget(self.ellipse_panel_label)
             self.ellipse_table = QtWidgets.QTableWidget(0, 2, ellipse_panel)
             self.ellipse_table.setObjectName("ellipseTable")
             self.ellipse_table.setHorizontalHeaderLabels(["Quantity", "Value"])
@@ -820,7 +886,8 @@ if QT_AVAILABLE:
             """Build explicit q/measurement controls beside the fit table."""
 
             self.analysis_group = QtWidgets.QGroupBox("Analysis / Measurement", parent)
-            form = QtWidgets.QFormLayout(self.analysis_group)
+            self.analysis_form = QtWidgets.QFormLayout(self.analysis_group)
+            form = self.analysis_form
             self.q_min_edit = QtWidgets.QLineEdit("Auto", self.analysis_group)
             self.q_min_edit.setObjectName("qMinEdit")
             self.q_min_edit.setPlaceholderText("Auto")
@@ -904,7 +971,8 @@ if QT_AVAILABLE:
             toolbar.addWidget(self.batch_run_button)
             toolbar.addStretch(1)
             layout.addLayout(toolbar)
-            options = QtWidgets.QFormLayout()
+            self.batch_form = QtWidgets.QFormLayout()
+            options = self.batch_form
             self.batch_mode_combo = QtWidgets.QComboBox(self.batch_page)
             self.batch_mode_combo.setObjectName("batchModeCombo")
             self.batch_mode_combo.addItem("Independent", "independent")
@@ -943,7 +1011,8 @@ if QT_AVAILABLE:
             self.evolution_page = QtWidgets.QWidget(self.pages)
             layout = QtWidgets.QVBoxLayout(self.evolution_page)
             selector_row = QtWidgets.QHBoxLayout()
-            selector_row.addWidget(QtWidgets.QLabel("Y parameter"))
+            self.evolution_y_label = QtWidgets.QLabel("Y parameter", self.evolution_page)
+            selector_row.addWidget(self.evolution_y_label)
             self.evolution_parameter_combo = QtWidgets.QComboBox(self.evolution_page)
             self.evolution_parameter_combo.setObjectName("evolutionParameterCombo")
             self.evolution_parameter_combo.currentTextChanged.connect(self._render_evolution)
@@ -983,6 +1052,280 @@ if QT_AVAILABLE:
             self.coverage_label = QtWidgets.QLabel("coverage: —")
             self.coverage_label.setObjectName("coverageLabel")
             status.addPermanentWidget(self.coverage_label)
+
+        # ----- runtime language -----------------------------------------------
+
+        @property
+        def language(self) -> str:
+            """Current UI language code (``zh_CN`` or ``en``)."""
+
+            return self._language
+
+        def _tr(self, key: str, **values: Any) -> str:
+            return translate(self._language, key, **values)
+
+        def _on_language_action(self, action: Any) -> None:
+            self.set_language(str(action.data()))
+
+        def set_language(self, language: str, persist: bool = True) -> None:
+            """Switch visible text without touching scientific or project state."""
+
+            resolved = validate_language(language)
+            changed = resolved != self._language
+            self._language = resolved
+            if changed:
+                self._retranslate_ui()
+            else:
+                self.chinese_action.setChecked(resolved == "zh_CN")
+                self.english_action.setChecked(resolved == "en")
+            if persist:
+                self._settings.setValue(LANGUAGE_SETTING_KEY, resolved)
+                self._settings.sync()
+
+        def _set_form_label(self, form: Any, field: Any, key: str) -> None:
+            label = form.labelForField(field)
+            if label is not None:
+                label.setText(self._tr(key))
+
+        def _set_combo_text(self, combo: Any, data: str, key: str) -> None:
+            index = combo.findData(data)
+            if index >= 0:
+                combo.setItemText(index, self._tr(key))
+
+        def _render_metric_labels(self) -> None:
+            self.rmse_label.setText(f"RMSE: {self._metric_display['rmse']}")
+            self.ndata_label.setText(
+                f"{self._tr('metric.ndata')}: {self._metric_display['ndata']}"
+            )
+            self.flags_label.setText(
+                f"{self._tr('metric.flags')}: {self._displayed_flags_text}"
+            )
+            self.coverage_label.setText(
+                f"{self._tr('metric.coverage')}: {self._metric_display['coverage']}"
+            )
+
+        def _render_status(self) -> None:
+            values = dict(self._status_values)
+            kind_key = values.pop("kind_key", None)
+            if kind_key is not None:
+                values["kind"] = self._tr(str(kind_key))
+            self.status_message.setText(self._tr(self._status_key, **values))
+
+        def _retranslate_ui(self) -> None:
+            """Refresh every user-facing label while preserving widget data."""
+
+            self.setWindowTitle(self._tr("app.title"))
+            self.project_menu.setTitle(self._tr("menu.project"))
+            self.language_menu.setTitle(self._tr("menu.language"))
+            self.chinese_action.setText(self._tr("language.zh_CN"))
+            self.english_action.setText(self._tr("language.en"))
+            self.chinese_action.setChecked(self._language == "zh_CN")
+            self.english_action.setChecked(self._language == "en")
+            for action, key in (
+                (self.open_project_action, "action.open_project"),
+                (self.save_project_action, "action.save_project"),
+                (self.open_image_action, "action.open_image"),
+                (self.open_poni_action, "action.select_poni"),
+                (self.open_mask_action, "action.select_mask"),
+                (self.clear_mask_action, "action.clear_mask"),
+                (self.export_evidence_action, "action.export_evidence"),
+                (self.close_action, "action.close"),
+            ):
+                action.setText(self._tr(key))
+            self.export_evidence_action.setToolTip(self._tr("tooltip.export_evidence"))
+            self.file_toolbar.setWindowTitle(self._tr("toolbar.project"))
+
+            for page, key in (
+                (self.refinement_page, "tab.refinement"),
+                (self.measurements_page, "tab.measurements"),
+                (self.batch_page, "tab.batch"),
+                (self.evolution_page, "tab.evolution"),
+            ):
+                self.pages.setTabText(self.pages.indexOf(page), self._tr(key))
+            self.parameters_dock.setWindowTitle(self._tr("dock.parameters"))
+
+            for widget, key in (
+                (self.preview_button, "button.preview"),
+                (self.optimize_button, "button.optimize"),
+                (self.cancel_button, "button.cancel"),
+                (self.ignore_late_result_button, "button.ignore_late"),
+                (self.clear_mask_button, "button.clear_mask"),
+                (self.apply_roi_button, "button.apply"),
+                (self.clear_roi_button, "button.clear"),
+                (self.accept_current_button, "button.accept_current"),
+                (self.reject_current_button, "button.reject_current"),
+                (self.restore_before_optimize_button, "button.restore_before_optimize"),
+                (self.save_snapshot_button, "button.save_snapshot"),
+                (self.restore_snapshot_button, "button.restore_snapshot"),
+                (self.batch_add_button, "button.add_frames"),
+                (self.batch_run_button, "button.run_batch"),
+            ):
+                widget.setText(self._tr(key))
+            self.auto_preview_check.setText(self._tr("check.auto_preview"))
+            self.batch_resume_check.setText(self._tr("check.resume_checkpoint"))
+            for widget, key in (
+                (self.preview_button, "tooltip.preview"),
+                (self.optimize_button, "tooltip.optimize"),
+                (self.cancel_button, "tooltip.cancel"),
+                (self.ignore_late_result_button, "tooltip.ignore_late"),
+                (self.clear_mask_button, "tooltip.clear_mask"),
+                (self.accept_current_button, "tooltip.accept_current"),
+                (self.reject_current_button, "tooltip.reject_current"),
+                (self.restore_before_optimize_button, "tooltip.restore_before_optimize"),
+            ):
+                widget.setToolTip(self._tr(key))
+
+            self.roi_group.setTitle(self._tr("group.roi"))
+            self.roi_type_label.setText(self._tr("label.type"))
+            self._set_combo_text(self.roi_type_combo, "rectangle", "combo.rectangle")
+            self._set_combo_text(self.roi_type_combo, "ellipse", "combo.ellipse")
+
+            self.fit_session_group.setTitle(self._tr("group.fit_session"))
+            for field, key in (
+                (self.manual_status_label, "label.manual_status"),
+                (self.reviewer_edit, "label.reviewer"),
+                (self.review_notes_edit, "label.review_notes"),
+                (self.snapshot_save_row, "label.snapshot_note"),
+                (self.snapshot_restore_row, "label.saved_snapshots"),
+            ):
+                self._set_form_label(self.fit_session_form, field, key)
+            self.reviewer_edit.setPlaceholderText(self._tr("placeholder.reviewer"))
+            self.review_notes_edit.setPlaceholderText(self._tr("placeholder.review_notes"))
+            self.snapshot_note_edit.setPlaceholderText(self._tr("placeholder.snapshot_note"))
+
+            self.analysis_group.setTitle(self._tr("group.analysis"))
+            for field, key in (
+                (self.q_min_edit, "label.q_min"),
+                (self.q_max_edit, "label.q_max"),
+                (self.draw_axis_deg_spin, "label.draw_axis"),
+                (self.ridge_method_combo, "label.ridge_method"),
+                (self.n_angular_bins_spin, "label.angular_bins"),
+                (self.n_ridge_angles_spin, "label.ridge_angles"),
+                (self.n_radial_bins_spin, "label.radial_bins"),
+                (self.curvature_sigma_spin, "label.curvature_sigma"),
+                (self.curvature_percentile_spin, "label.curvature_percentile"),
+                (self.normal_step_spin, "label.normal_step"),
+                (self.max_pixels_spin, "label.max_pixels"),
+            ):
+                self._set_form_label(self.analysis_form, field, key)
+            auto_text = self._tr("placeholder.auto")
+            for edit in (self.q_min_edit, self.q_max_edit):
+                if edit.text().strip().lower() in {"", "auto", "自动"}:
+                    edit.setText(auto_text)
+                edit.setPlaceholderText(auto_text)
+            self.max_pixels_spin.setSpecialValueText(self._tr("special.all_pixels"))
+            self._set_combo_text(self.ridge_method_combo, "radial_peak", "combo.radial_peak")
+            self._set_combo_text(
+                self.ridge_method_combo,
+                "surface_curvature",
+                "combo.surface_curvature",
+            )
+
+            for field, key in (
+                (self.batch_mode_combo, "label.mode"),
+                (self.batch_manifest_edit, "label.manifest"),
+                (self.batch_checkpoint_edit, "label.checkpoint"),
+                (self.batch_output_edit, "label.output"),
+            ):
+                self._set_form_label(self.batch_form, field, key)
+            self._set_combo_text(self.batch_mode_combo, "independent", "combo.independent")
+            self._set_combo_text(self.batch_mode_combo, "warm_start", "combo.warm_start")
+            self.batch_manifest_edit.setPlaceholderText(self._tr("placeholder.manifest"))
+            self.batch_checkpoint_edit.setPlaceholderText(self._tr("placeholder.checkpoint"))
+            self.batch_output_edit.setPlaceholderText(self._tr("placeholder.output"))
+            self.batch_table.setHorizontalHeaderLabels(
+                [self._tr("header.frame"), self._tr("header.status"), "RMSE"]
+            )
+            for row in range(self.batch_table.rowCount()):
+                item = self.batch_table.item(row, 1)
+                if item is None:
+                    continue
+                raw_status = str(item.data(QtCore.Qt.ItemDataRole.UserRole) or "")
+                status_key = _BATCH_STATUS_KEYS.get(raw_status.casefold())
+                if status_key is not None:
+                    item.setText(self._tr(status_key))
+
+            self.evolution_y_label.setText(self._tr("label.y_parameter"))
+            if self.evolution_plot is not None:
+                self.evolution_plot.setLabel(
+                    "left",
+                    self.evolution_y_key or self._tr("axis.value"),
+                )
+                self.evolution_plot.setLabel("bottom", self._tr("axis.frame_time"))
+            elif hasattr(self, "evolution_placeholder"):
+                self.evolution_placeholder.setText(
+                    self._tr("measurement.evolution_placeholder")
+                )
+
+            self.lobe_panel_label.setText(self._tr("measurement.lobes"))
+            self.ridge_panel_label.setText(self._tr("measurement.ridge"))
+            self.ellipse_panel_label.setText(self._tr("measurement.ellipse"))
+            self.lobe_table.setHorizontalHeaderLabels(
+                [
+                    self._tr("header.angle_deg"),
+                    self._tr("header.intensity"),
+                    self._tr("header.baseline"),
+                    self._tr("header.snr"),
+                    self._tr("header.fwhm_deg"),
+                    self._tr("header.coverage"),
+                    self._tr("header.valid"),
+                    self._tr("header.flags"),
+                ]
+            )
+            self.ridge_table.setHorizontalHeaderLabels(
+                [
+                    self._tr("header.angle_deg"),
+                    self._tr("header.q"),
+                    self._tr("header.accepted"),
+                    self._tr("header.method"),
+                ]
+            )
+            self.ellipse_table.setHorizontalHeaderLabels(
+                [self._tr("header.quantity"), self._tr("header.value")]
+            )
+            if self.angular_plot is not None:
+                self.angular_plot.setLabel("bottom", self._tr("axis.azimuth"))
+                self.angular_plot.setLabel("left", self._tr("axis.angular_intensity"))
+                self.ridge_plot.setLabel("bottom", self._tr("axis.azimuth"))
+                self.ridge_plot.setLabel(
+                    "left",
+                    self._tr("axis.ridge_q", unit=self._ridge_plot_q_unit),
+                )
+            else:
+                self.angular_placeholder.setText(
+                    self._tr("measurement.angular_placeholder")
+                )
+                self.ridge_placeholder.setText(
+                    self._tr("measurement.ridge_placeholder")
+                )
+
+            ellipse_keys = (
+                "ellipse.a",
+                "ellipse.b",
+                "ellipse.axis_ratio",
+                "ellipse.ellipticity",
+                "ellipse.theta",
+                "ellipse.ln",
+                "ellipse.lz",
+                "ellipse.rmse",
+                "ellipse.rss",
+                "ellipse.n_points",
+                "ellipse.quality",
+                "ellipse.flags",
+                "ellipse.phi_app",
+                "ellipse.alpha_candidate",
+                "ellipse.psi_candidate",
+            )
+            for row, key in enumerate(ellipse_keys):
+                item = self.ellipse_table.item(row, 0)
+                if item is not None:
+                    item.setText(self._tr(key))
+
+            self.parameter_model.set_language(self._language)
+            self.views.set_language(self._language)
+            self._sync_fit_session_controls(preserve_edits=True)
+            self._render_status()
+            self._render_metric_labels()
 
         # ----- data and parameters ---------------------------------------------
 
@@ -1039,7 +1382,7 @@ if QT_AVAILABLE:
             values: dict[str, float | None] = {}
             for name, widget in (("q_min", self.q_min_edit), ("q_max", self.q_max_edit)):
                 text = widget.text().strip()
-                if text.lower() in {"", "auto"}:
+                if text.lower() in {"", "auto", "自动"}:
                     values[name] = None
                     continue
                 try:
@@ -1092,8 +1435,17 @@ if QT_AVAILABLE:
             for widget in widgets:
                 widget.blockSignals(True)
             try:
-                self.q_min_edit.setText("Auto" if merged.get("q_min") in (None, "") else str(merged.get("q_min")))
-                self.q_max_edit.setText("Auto" if merged.get("q_max") in (None, "") else str(merged.get("q_max")))
+                auto_text = self._tr("placeholder.auto")
+                self.q_min_edit.setText(
+                    auto_text
+                    if merged.get("q_min") in (None, "")
+                    else str(merged.get("q_min"))
+                )
+                self.q_max_edit.setText(
+                    auto_text
+                    if merged.get("q_max") in (None, "")
+                    else str(merged.get("q_max"))
+                )
                 self.draw_axis_deg_spin.setValue(float(merged.get("draw_axis_deg", 90.0)))
                 method = str(merged.get("ridge_method", "radial_peak")).lower().replace("-", "_")
                 if method == "curvature":
@@ -1394,15 +1746,20 @@ if QT_AVAILABLE:
                     session["snapshots"].append(item)
             return session
 
-        def _sync_fit_session_controls(self) -> None:
+        def _sync_fit_session_controls(self, *, preserve_edits: bool = False) -> None:
             """Refresh the compact right-dock controls from session state."""
 
             if not hasattr(self, "manual_status_label"):
                 return
             status = str(self._fit_session.get("manual_status", "unreviewed"))
-            self.manual_status_label.setText(status)
-            self.reviewer_edit.setText(str(self._fit_session.get("reviewed_by", "") or ""))
-            self.review_notes_edit.setText(str(self._fit_session.get("review_notes", "") or ""))
+            self.manual_status_label.setText(self._tr(f"manual.{status}"))
+            if not preserve_edits:
+                self.reviewer_edit.setText(
+                    str(self._fit_session.get("reviewed_by", "") or "")
+                )
+                self.review_notes_edit.setText(
+                    str(self._fit_session.get("review_notes", "") or "")
+                )
             selected = self.snapshot_combo.currentData() if self.snapshot_combo.count() else None
             self.snapshot_combo.blockSignals(True)
             self.snapshot_combo.clear()
@@ -1412,7 +1769,11 @@ if QT_AVAILABLE:
                     if not isinstance(snapshot, Mapping):
                         continue
                     note = str(snapshot.get("note", "") or "")
-                    label = f"{index + 1}: {note or '(no note)'}"
+                    label = self._tr(
+                        "snapshot.label",
+                        index=index + 1,
+                        note=note or self._tr("snapshot.no_note"),
+                    )
                     self.snapshot_combo.addItem(label, index)
             if self.snapshot_combo.count():
                 if isinstance(selected, int) and 0 <= selected < self.snapshot_combo.count():
@@ -1450,11 +1811,11 @@ if QT_AVAILABLE:
 
             reviewer = self.reviewer_edit.text().strip()
             if not reviewer:
-                self._set_status("Reviewer is required for Accept/Reject", flags="review_required")
+                self._set_status("status.reviewer_required", flags="review_required")
                 return False
             if not self._current_result_is_reviewable():
                 self._set_status(
-                    "Run Preview or Optimize for the current settings before review",
+                    "status.review_result_required",
                     flags="review_required",
                 )
                 return False
@@ -1467,7 +1828,7 @@ if QT_AVAILABLE:
             )
             self._sync_fit_session_controls()
             self._set_status(
-                "Manual fit accepted" if status == "accepted" else "Manual fit rejected",
+                "status.manual_accepted" if status == "accepted" else "status.manual_rejected",
                 flags=f"manual_{status}",
             )
             return True
@@ -1548,7 +1909,7 @@ if QT_AVAILABLE:
 
             if not self._current_result_is_reviewable():
                 self._set_status(
-                    "Run Preview or Optimize after the latest edit before export",
+                    "status.evidence_stale",
                     flags="evidence_stale",
                 )
                 return False
@@ -1559,14 +1920,14 @@ if QT_AVAILABLE:
                 != str(self._fit_session.get("review_notes", "") or "")
             ):
                 self._set_status(
-                    "Review fields changed; press Accept current or Reject current again",
+                    "status.review_fields_changed",
                     flags="review_required",
                 )
                 return False
             if isinstance(path, bool) or path is None:
                 chosen = QtWidgets.QFileDialog.getExistingDirectory(
                     self,
-                    "Select an empty folder for manual-fit evidence",
+                    self._tr("dialog.evidence_folder"),
                     "",
                 )
                 if not chosen:
@@ -1588,10 +1949,18 @@ if QT_AVAILABLE:
                     force=bool(force),
                 )
             except (OSError, TypeError, ValueError) as exc:
-                self._set_status(f"Evidence export failed: {exc}", flags="evidence_error")
+                self._set_status(
+                    "status.evidence_failed",
+                    flags="evidence_error",
+                    error=exc,
+                )
                 return False
             self._last_evidence_paths = dict(written)
-            self._set_status(f"Exported 7 evidence files to {Path(path)}", flags="evidence_exported")
+            self._set_status(
+                "status.evidence_exported",
+                flags="evidence_exported",
+                path=Path(path),
+            )
             return True
 
         export_evidence = export_manual_evidence
@@ -1602,7 +1971,7 @@ if QT_AVAILABLE:
             before = self._fit_session.get("optimize_before")
             parameters = before.get("parameters") if isinstance(before, Mapping) else None
             if not isinstance(parameters, Mapping):
-                self._set_status("No Optimize-before snapshot is available", flags="snapshot_missing")
+                self._set_status("status.no_optimize_snapshot", flags="snapshot_missing")
                 return False
             self._invalidate_pending_work(clear_fit=True)
             self._fit_session_restore_active = True
@@ -1621,7 +1990,7 @@ if QT_AVAILABLE:
             self._fit_session["optimize_after"] = None
             self._sync_fit_session_controls()
             self._refresh_model_overlay()
-            self._set_status("Restored parameters before Optimize", flags="snapshot_restored")
+            self._set_status("status.restored_before_optimize", flags="snapshot_restored")
             return True
 
         def save_snapshot(self, note: str | None = None) -> bool:
@@ -1631,7 +2000,7 @@ if QT_AVAILABLE:
                 note = self.snapshot_note_edit.text()
             note = str(note).strip()
             if not note:
-                self._set_status("Snapshot note is required", flags="snapshot_note_required")
+                self._set_status("status.snapshot_note_required", flags="snapshot_note_required")
                 return False
             snapshots = self._fit_session.setdefault("snapshots", [])
             snapshot = {
@@ -1645,7 +2014,11 @@ if QT_AVAILABLE:
             self._sync_fit_session_controls()
             self.snapshot_combo.setCurrentIndex(self.snapshot_combo.count() - 1)
             self.snapshot_note_edit.clear()
-            self._set_status(f"Saved snapshot {snapshot['order']}: {note}")
+            self._set_status(
+                "status.snapshot_saved",
+                index=snapshot["order"],
+                note=note,
+            )
             return True
 
         def restore_snapshot(self, index: int | None = None, *_: Any) -> bool:
@@ -1655,7 +2028,7 @@ if QT_AVAILABLE:
                 index = None
             snapshots = self._fit_session.get("snapshots", [])
             if not isinstance(snapshots, list) or not snapshots:
-                self._set_status("No saved snapshot is available", flags="snapshot_missing")
+                self._set_status("status.no_snapshot", flags="snapshot_missing")
                 return False
             if index is None:
                 selected = self.snapshot_combo.currentData()
@@ -1663,11 +2036,11 @@ if QT_AVAILABLE:
             try:
                 snapshot = snapshots[int(index)]
             except (IndexError, TypeError, ValueError):
-                self._set_status("Selected snapshot is invalid", flags="snapshot_invalid")
+                self._set_status("status.snapshot_invalid", flags="snapshot_invalid")
                 return False
             parameters = snapshot.get("parameters") if isinstance(snapshot, Mapping) else None
             if not isinstance(parameters, Mapping):
-                self._set_status("Selected snapshot has no parameter table", flags="snapshot_invalid")
+                self._set_status("status.snapshot_no_parameters", flags="snapshot_invalid")
                 return False
             self._invalidate_pending_work(clear_fit=True)
             self._fit_session_restore_active = True
@@ -1688,7 +2061,12 @@ if QT_AVAILABLE:
             self.snapshot_combo.setCurrentIndex(int(index))
             self._refresh_model_overlay()
             note = str(snapshot.get("note", "") or "")
-            self._set_status(f"Restored snapshot {int(index) + 1}: {note}", flags="snapshot_restored")
+            self._set_status(
+                "status.snapshot_restored",
+                flags="snapshot_restored",
+                index=int(index) + 1,
+                note=note,
+            )
             return True
 
         # Descriptive aliases keep the small public API discoverable for
@@ -1730,7 +2108,7 @@ if QT_AVAILABLE:
                         self._qy = _read(self._qmap, ("qy", "qy_nm_inv"), self._qy)
                         self._refresh_q_parameter_units()
                 except Exception as exc:
-                    self._set_status(f"Geometry update failed: {exc}", flags="error")
+                    self._set_status("status.geometry_failed", flags="error", error=exc)
             # Keep the overlay background synchronized even before the first
             # preview result arrives.  q extent is computed by ViewGrid only
             # for the overlay; the other three views remain pixel-space.
@@ -1746,7 +2124,7 @@ if QT_AVAILABLE:
                 self._recompute_external_mask(update_widgets=False)
             if mask_cleared_for_shape:
                 self._set_status(
-                    "External mask cleared: image shape changed",
+                    "status.mask_shape_changed",
                     flags="mask_cleared_shape_changed",
                 )
 
@@ -1755,7 +2133,7 @@ if QT_AVAILABLE:
         def set_poni(self, path: str | Path | Any) -> bool:
             setter = getattr(self.engine, "set_poni", None)
             if not callable(setter):
-                self._set_status("Current engine does not support PONI", flags="error")
+                self._set_status("status.no_poni_support", flags="error")
                 return False
             self._invalidate_pending_work(clear_fit=True)
             self._mark_manual_unreviewed()
@@ -1776,16 +2154,25 @@ if QT_AVAILABLE:
                             valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                             external_mask=self._external_mask,
                         )
-                self._set_status(f"PONI loaded: {Path(path).name if isinstance(path, (str, Path)) else self._poni_path}")
+                self._set_status(
+                    "status.poni_loaded",
+                    name=Path(path).name if isinstance(path, (str, Path)) else self._poni_path,
+                )
                 return True
             except Exception as exc:
-                self._set_status(f"PONI load failed: {exc}", flags="error")
+                self._set_status("status.poni_failed", flags="error", error=exc)
                 return False
 
         def select_poni(self, path: str | Path | bool | None = None) -> bool:
             if isinstance(path, bool) or path is None:
                 chosen, _ = QtWidgets.QFileDialog.getOpenFileName(
-                    self, "Select pyFAI PONI", "", "PONI files (*.poni);;All files (*)"
+                    self,
+                    self._tr("dialog.select_poni"),
+                    "",
+                    self._tr(
+                        "filter.poni",
+                        all_files=self._tr("filter.all_files"),
+                    ),
                 )
                 if not chosen:
                     return False
@@ -1806,16 +2193,19 @@ if QT_AVAILABLE:
             if isinstance(path, bool) or path is None:
                 chosen, _ = QtWidgets.QFileDialog.getOpenFileName(
                     self,
-                    "Open 2D SAXS image",
+                    self._tr("dialog.open_image"),
                     "",
-                    "Detector images (*.cbf *.edf *.tif *.tiff *.npy *.npz *.h5 *.hdf5);;All files (*)",
+                    self._tr(
+                        "filter.images",
+                        all_files=self._tr("filter.all_files"),
+                    ),
                 )
                 if not chosen:
                     return False
                 path = chosen
             loader = getattr(self.engine, "load_image", None)
             if not callable(loader):
-                self._set_status("Current engine does not support image loading", flags="error")
+                self._set_status("status.no_image_support", flags="error")
                 return False
             selected_mask_frame = self._mask_frame if mask_frame is None else mask_frame
             selected_mask_dataset = self._mask_dataset if mask_dataset is None else mask_dataset
@@ -1864,10 +2254,10 @@ if QT_AVAILABLE:
                     else:
                         self._file_mask = _np.asarray(external_mask, dtype=bool) if _np is not None else external_mask
                     self._recompute_external_mask(update_widgets=False)
-                self._set_status(f"Loaded {Path(path).name}")
+                self._set_status("status.image_loaded", name=Path(path).name)
                 return True
             except Exception as exc:
-                self._set_status(f"Image load failed: {exc}", flags="error")
+                self._set_status("status.image_failed", flags="error", error=exc)
                 return False
 
         load_image = open_image
@@ -1928,10 +2318,10 @@ if QT_AVAILABLE:
                 if update_widgets:
                     self._sync_roi_widgets()
                 excluded = int(_np.count_nonzero(self._external_mask))
-                self._set_status(f"Mask/ROI applied ({excluded} excluded pixels)")
+                self._set_status("status.mask_applied", count=excluded)
                 return True
             except Exception as exc:
-                self._set_status(f"Mask/ROI apply failed: {exc}", flags="error")
+                self._set_status("status.mask_apply_failed", flags="error", error=exc)
                 return False
 
         def select_mask(
@@ -1946,9 +2336,12 @@ if QT_AVAILABLE:
             if isinstance(path, bool) or path is None:
                 chosen, _ = QtWidgets.QFileDialog.getOpenFileName(
                     self,
-                    "Select external detector mask",
+                    self._tr("dialog.select_mask"),
                     "",
-                    "Mask files (*.npy *.npz *.cbf *.edf *.tif *.tiff *.h5 *.hdf5 *.csv *.txt);;All files (*)",
+                    self._tr(
+                        "filter.masks",
+                        all_files=self._tr("filter.all_files"),
+                    ),
                 )
                 if not chosen:
                     return False
@@ -1962,10 +2355,10 @@ if QT_AVAILABLE:
                     # an image is loaded, so older worker results must expire.
                     self._invalidate_pending_work(clear_fit=True)
                 self._mark_manual_unreviewed()
-                self._set_status(f"Mask loaded: {Path(path).name}")
+                self._set_status("status.mask_loaded", name=Path(path).name)
                 return True
             except Exception as exc:
-                self._set_status(f"Mask load failed: {exc}", flags="error")
+                self._set_status("status.mask_failed", flags="error", error=exc)
                 return False
 
         open_mask = select_mask
@@ -1987,7 +2380,7 @@ if QT_AVAILABLE:
                     valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                     external_mask=None,
                 )
-            self._set_status("External mask cleared")
+            self._set_status("status.mask_cleared")
             return True
 
         def _sync_roi_widgets(self) -> None:
@@ -2035,34 +2428,34 @@ if QT_AVAILABLE:
                             "angle_deg": float(spec.get("angle_deg", spec.get("angle", 0.0))),
                         }
                     except (KeyError, TypeError, ValueError):
-                        self._set_status("Ellipse ROI requires cx,cy,rx,ry,angle", flags="error")
+                        self._set_status("status.ellipse_roi_fields", flags="error")
                         return False
                     if not all(math.isfinite(float(spec[key])) for key in ("cx", "cy", "rx", "ry", "angle_deg")) or spec["rx"] <= 0 or spec["ry"] <= 0:
-                        self._set_status("Ellipse ROI requires finite positive radii", flags="error")
+                        self._set_status("status.ellipse_roi_radii", flags="error")
                         return False
                     self._exclusion_roi = dict(spec)
                 else:
                     try:
                         spec = {"type": "rectangle", **{key: float(spec[key]) for key in ("x0", "y0", "x1", "y1")}}
                     except (KeyError, TypeError, ValueError):
-                        self._set_status("Rectangle ROI requires x0,y0,x1,y1", flags="error")
+                        self._set_status("status.rectangle_roi_fields", flags="error")
                         return False
                     if not all(math.isfinite(float(spec[key])) for key in ("x0", "y0", "x1", "y1")) or spec["x1"] <= spec["x0"] or spec["y1"] <= spec["y0"]:
-                        self._set_status("Rectangle ROI bounds are invalid", flags="error")
+                        self._set_status("status.rectangle_roi_bounds", flags="error")
                         return False
                     self._exclusion_roi = tuple(spec[key] for key in ("x0", "y0", "x1", "y1"))
             else:
                 try:
                     values = tuple(float(item) for item in roi)
                 except (TypeError, ValueError):
-                    self._set_status("ROI requires x0,y0,x1,y1", flags="error")
+                    self._set_status("status.roi_fields", flags="error")
                     return False
                 if len(values) != 4 or not all(math.isfinite(item) for item in values):
-                    self._set_status("ROI requires four finite coordinates", flags="error")
+                    self._set_status("status.roi_finite", flags="error")
                     return False
                 x0, y0, x1, y1 = values
                 if x1 <= x0 or y1 <= y0:
-                    self._set_status("ROI upper bounds must exceed lower bounds", flags="error")
+                    self._set_status("status.roi_bounds", flags="error")
                     return False
                 self._exclusion_roi = values
                 spec = {"type": "rectangle", "x0": x0, "x1": x1, "y0": y0, "y1": y1}
@@ -2118,7 +2511,7 @@ if QT_AVAILABLE:
                     valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                     external_mask=None,
                 )
-            self._set_status("Exclusion ROI cleared")
+            self._set_status("status.roi_cleared")
             return True
 
         def _reference_axis_deg(self) -> float:
@@ -2162,7 +2555,7 @@ if QT_AVAILABLE:
                 except Exception:
                     pass
             self._set_busy(False, "edited")
-            self._set_status("Parameters changed")
+            self._set_status("status.parameters_changed")
             self._mark_manual_unreviewed()
             self._refresh_model_overlay()
             if self.auto_preview:
@@ -2175,7 +2568,11 @@ if QT_AVAILABLE:
                 self._generation.next()
                 self._mark_manual_unreviewed()
                 self._set_busy(False, "edited")
-                self._set_status(f"Analysis settings invalid: {exc}", flags="invalid_analysis")
+                self._set_status(
+                    "status.analysis_invalid",
+                    flags="invalid_analysis",
+                    error=exc,
+                )
                 return
             self._generation.next()
             self._analysis_settings = self.analysis_settings
@@ -2189,7 +2586,7 @@ if QT_AVAILABLE:
                     # authoritative worker seam in that case.
                     pass
             self._set_busy(False, "edited")
-            self._set_status("Analysis settings changed")
+            self._set_status("status.analysis_changed")
             self._mark_manual_unreviewed()
             self._refresh_model_overlay()
             if self.auto_preview:
@@ -2230,7 +2627,11 @@ if QT_AVAILABLE:
                 if kind in {"preview", "optimize"}:
                     self._mark_manual_unreviewed()
                 self._set_busy(False, "edited")
-                self._set_status(f"Analysis settings invalid: {exc}", flags="invalid_analysis")
+                self._set_status(
+                    "status.analysis_invalid",
+                    flags="invalid_analysis",
+                    error=exc,
+                )
                 return generation
             generation = self._generation.next()
             if kind in {"preview", "optimize"}:
@@ -2293,7 +2694,7 @@ if QT_AVAILABLE:
             self._last_result_signature = None
             self._sync_fit_session_controls()
             self._set_busy(False, "cancelled")
-            self._set_status("Cancelled; late results ignored")
+            self._set_status("status.cancelled_late")
 
         def ignore_late_result(self) -> None:
             """Advance the generation gate while preserving the current view."""
@@ -2302,7 +2703,7 @@ if QT_AVAILABLE:
             self._last_result_signature = None
             self._sync_fit_session_controls()
             self._set_busy(False, "ignored")
-            self._set_status("Late result ignored")
+            self._set_status("status.late_ignored")
 
         ignore_late_results = ignore_late_result
 
@@ -2353,7 +2754,12 @@ if QT_AVAILABLE:
                 self._fit_session["manual_status"] = "unreviewed"
             self._sync_fit_session_controls()
             self._set_busy(False, kind)
-            self._set_status(f"{kind} failed: {error}", flags="error")
+            self._set_status(
+                "status.job_error",
+                flags="error",
+                kind_key=f"job.{kind}",
+                error=error,
+            )
 
         def _apply_result(self, result: Any) -> None:
             if result is None:
@@ -2429,7 +2835,13 @@ if QT_AVAILABLE:
                 status = mapping.get("status", "ok")
                 rmse = mapping.get("rmse", mapping.get("metrics", {}).get("rmse") if isinstance(mapping.get("metrics"), Mapping) else None)
                 self.batch_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(str(frame)))
-                self.batch_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(str(status)))
+                raw_status = str(status)
+                status_key = _BATCH_STATUS_KEYS.get(raw_status.casefold())
+                status_item = QtWidgets.QTableWidgetItem(
+                    self._tr(status_key) if status_key is not None else raw_status
+                )
+                status_item.setData(QtCore.Qt.ItemDataRole.UserRole, raw_status)
+                self.batch_table.setItem(row_index, 1, status_item)
                 self.batch_table.setItem(row_index, 2, QtWidgets.QTableWidgetItem(_format_metric(rmse)))
 
         def _update_measurements(self, result: Any) -> None:
@@ -2480,7 +2892,11 @@ if QT_AVAILABLE:
                 rejected_x: list[float] = []
                 rejected_y: list[float] = []
                 q_unit = str(_read(ridge, ("q_unit",), "unknown") or "unknown")
-                self.ridge_plot.setLabel("left", f"Ridge q ({q_unit})")
+                self._ridge_plot_q_unit = q_unit
+                self.ridge_plot.setLabel(
+                    "left",
+                    self._tr("axis.ridge_q", unit=q_unit),
+                )
                 for point in point_rows:
                     raw_angle = _read(point, ("angle_deg",), None)
                     if raw_angle is None:
@@ -2552,23 +2968,23 @@ if QT_AVAILABLE:
                     self.lobe_table.setItem(row_index, column, QtWidgets.QTableWidgetItem(value))
 
             ellipse_rows = (
-                ("a (major q)", _read(ellipse, ("a",), None)),
-                ("b (minor q)", _read(ellipse, ("b",), None)),
-                ("axis ratio", _read(ellipse, ("axis_ratio", "axes_ratio"), None)),
-                ("ellipticity", _read(ellipse, ("ellipticity", "eccentricity"), None)),
+                (self._tr("ellipse.a"), _read(ellipse, ("a",), None)),
+                (self._tr("ellipse.b"), _read(ellipse, ("b",), None)),
+                (self._tr("ellipse.axis_ratio"), _read(ellipse, ("axis_ratio", "axes_ratio"), None)),
+                (self._tr("ellipse.ellipticity"), _read(ellipse, ("ellipticity", "eccentricity"), None)),
                 # Keep ellipse theta semantically separate from lobe-derived
                 # phi/alpha/psi; no relabelling is performed here.
-                ("theta (ellipse axis, deg)", _read(ellipse, ("theta_deg", "angle_deg"), None)),
-                ("Ln from minor axis (nm)", _read(ellipse, ("Ln_from_minor_axis_nm",), None)),
-                ("Lz from draw axis (nm)", _read(ellipse, ("Lz_from_draw_axis_nm",), None)),
-                ("RMSE", _read(ellipse, ("rmse", "residual_rms"), None)),
-                ("RSS", _read(ellipse, ("rss",), None)),
-                ("n points", _read(ellipse, ("n_points", "n_data"), None)),
-                ("quality / success", _read(ellipse, ("success",), None)),
-                ("flags", ", ".join(str(item) for item in _sequence(_read(ellipse, ("flags",), ())))),
-                ("phi app (lobe-derived, deg)", _read(observables, ("phi_app_deg",), None)),
-                ("alpha candidate (not inferred)", _read(observables, ("alpha_candidate_deg",), None)),
-                ("psi candidate (not inferred)", _read(observables, ("psi_candidate_deg",), None)),
+                (self._tr("ellipse.theta"), _read(ellipse, ("theta_deg", "angle_deg"), None)),
+                (self._tr("ellipse.ln"), _read(ellipse, ("Ln_from_minor_axis_nm",), None)),
+                (self._tr("ellipse.lz"), _read(ellipse, ("Lz_from_draw_axis_nm",), None)),
+                (self._tr("ellipse.rmse"), _read(ellipse, ("rmse", "residual_rms"), None)),
+                (self._tr("ellipse.rss"), _read(ellipse, ("rss",), None)),
+                (self._tr("ellipse.n_points"), _read(ellipse, ("n_points", "n_data"), None)),
+                (self._tr("ellipse.quality"), _read(ellipse, ("success",), None)),
+                (self._tr("ellipse.flags"), ", ".join(str(item) for item in _sequence(_read(ellipse, ("flags",), ())))),
+                (self._tr("ellipse.phi_app"), _read(observables, ("phi_app_deg",), None)),
+                (self._tr("ellipse.alpha_candidate"), _read(observables, ("alpha_candidate_deg",), None)),
+                (self._tr("ellipse.psi_candidate"), _read(observables, ("psi_candidate_deg",), None)),
             )
             self.ellipse_table.setRowCount(len(ellipse_rows) if ellipse is not None or observables is not None else 0)
             for row_index, (name, value) in enumerate(ellipse_rows if ellipse is not None or observables is not None else ()):
@@ -2611,14 +3027,15 @@ if QT_AVAILABLE:
             else:
                 flags_text = ", ".join(str(item) for item in (flags or [])) or "—"
             self.last_metrics = {"rmse": rmse, "ndata": ndata, "flags": flags, "valid_fraction": coverage}
-            self.rmse_label.setText(f"RMSE: {_format_metric(rmse)}")
-            self.ndata_label.setText(f"ndata: {ndata if ndata is not None else '—'}")
-            self.flags_label.setText(f"flags: {flags_text}")
+            self._metric_display["rmse"] = _format_metric(rmse)
+            self._metric_display["ndata"] = ndata if ndata is not None else "—"
+            self._displayed_flags_text = flags_text
             try:
                 coverage_text = _format_metric(float(coverage) * 100.0) + "%" if coverage is not None else "—"
             except (TypeError, ValueError):
                 coverage_text = "—"
-            self.coverage_label.setText(f"coverage: {coverage_text}")
+            self._metric_display["coverage"] = coverage_text
+            self._render_metric_labels()
 
         # ----- project persistence ---------------------------------------------
 
@@ -2683,7 +3100,10 @@ if QT_AVAILABLE:
                 path = None
             if path is None:
                 chosen, _ = QtWidgets.QFileDialog.getSaveFileName(
-                    self, "Save LamellarSAXS2D project", "", "JSON project (*.json)"
+                    self,
+                    self._tr("dialog.save_project"),
+                    "",
+                    self._tr("filter.project"),
                 )
                 if not chosen:
                     return False
@@ -2696,10 +3116,10 @@ if QT_AVAILABLE:
                     encoding="utf-8",
                 )
             except (OSError, TypeError, ValueError) as exc:
-                self._set_status(f"Save failed: {exc}", flags="error")
+                self._set_status("status.save_failed", flags="error", error=exc)
                 return False
             self._project_path = target
-            self._set_status(f"Saved {target.name}")
+            self._set_status("status.saved", name=target.name)
             return True
 
         def load_project(self, path: str | Path | bool | None = None) -> bool:
@@ -2707,7 +3127,10 @@ if QT_AVAILABLE:
                 path = None
             if path is None:
                 chosen, _ = QtWidgets.QFileDialog.getOpenFileName(
-                    self, "Open LamellarSAXS2D project", "", "JSON project (*.json)"
+                    self,
+                    self._tr("dialog.open_project"),
+                    "",
+                    self._tr("filter.project"),
                 )
                 if not chosen:
                     return False
@@ -2803,10 +3226,10 @@ if QT_AVAILABLE:
                     self._fit_session_restore_active = False
                 self._sync_fit_session_controls()
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
-                self._set_status(f"Load failed: {exc}", flags="error")
+                self._set_status("status.load_failed", flags="error", error=exc)
                 return False
             self._project_path = target
-            self._set_status(f"Loaded {target.name}")
+            self._set_status("status.loaded", name=target.name)
             return True
 
         open_project = load_project
@@ -2816,9 +3239,12 @@ if QT_AVAILABLE:
         def _choose_batch_files(self) -> None:
             files, _ = QtWidgets.QFileDialog.getOpenFileNames(
                 self,
-                "Select 2D SAXS frames",
+                self._tr("dialog.select_frames"),
                 "",
-                "Detector images (*.cbf *.edf *.tif *.tiff);;All files (*)",
+                self._tr(
+                    "filter.images_batch",
+                    all_files=self._tr("filter.all_files"),
+                ),
             )
             if files:
                 self.set_batch_frames(files)
@@ -2828,7 +3254,9 @@ if QT_AVAILABLE:
             self.batch_table.setRowCount(len(self.batch_frames))
             for row, frame in enumerate(self.batch_frames):
                 self.batch_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(frame)))
-                self.batch_table.setItem(row, 1, QtWidgets.QTableWidgetItem("Ready"))
+                status_item = QtWidgets.QTableWidgetItem(self._tr("status.ready"))
+                status_item.setData(QtCore.Qt.ItemDataRole.UserRole, "ready")
+                self.batch_table.setItem(row, 1, status_item)
                 self.batch_table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
 
         def run_batch(self, frames: Iterable[Any] | bool | None = None) -> int:
@@ -2900,7 +3328,10 @@ if QT_AVAILABLE:
             if self.evolution_plot is None:
                 return
             self.evolution_plot.clear()
-            self.evolution_plot.setLabel("left", self.evolution_y_key or "value")
+            self.evolution_plot.setLabel(
+                "left",
+                self.evolution_y_key or self._tr("axis.value"),
+            )
             rows = self._evolution_rows
             x_values = [
                 _numeric(row.get("time", row.get("time_s", row.get("frame", index))), index)
@@ -2927,24 +3358,37 @@ if QT_AVAILABLE:
             self.ignore_late_result_button.setEnabled(bool(busy))
             self.batch_progress.setVisible(busy and kind == "batch")
             if busy:
-                self._set_status(f"Running {kind}…")
+                self._set_status("status.running", kind_key=f"job.{kind}")
             elif kind:
                 if result_ok is False:
-                    self._set_status(f"{kind.title()} failed", flags="result_failed")
+                    self._set_status(
+                        "status.job_failed",
+                        flags="result_failed",
+                        kind_key=f"job.{kind}",
+                    )
                     return
-                status = {
-                    "preview": "Preview complete",
-                    "optimize": "Optimize complete",
-                    "batch": "Batch complete",
-                    "cancelled": "Cancelled",
-                    "ignored": "Late result ignored",
-                }.get(kind, "Ready")
-                self._set_status(status)
+                status_key = {
+                    "preview": "status.preview_complete",
+                    "optimize": "status.optimize_complete",
+                    "batch": "status.batch_complete",
+                    "cancelled": "status.cancelled",
+                    "ignored": "status.late_ignored",
+                }.get(kind, "status.ready")
+                self._set_status(status_key)
 
-        def _set_status(self, text: str, *, flags: str | None = None) -> None:
-            self.status_message.setText(text)
+        def _set_status(
+            self,
+            key: str,
+            *,
+            flags: str | None = None,
+            **values: Any,
+        ) -> None:
+            self._status_key = key
+            self._status_values = dict(values)
+            self._render_status()
             if flags is not None:
-                self.flags_label.setText(f"flags: {flags}")
+                self._displayed_flags_text = str(flags)
+                self._render_metric_labels()
 
         def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
             self.cancel_jobs()
@@ -3041,6 +3485,7 @@ def create_app(
     config_path: str | Path | None = None,
     mask_frame: int | None = None,
     mask_dataset: str | None = None,
+    language: str | None = None,
 ) -> tuple[Any, RefinementMainWindow]:
     """Create a QApplication and a real-service workbench without showing it."""
 
@@ -3098,6 +3543,7 @@ def create_app(
         mask_frame=selected_mask_frame,
         mask_dataset=selected_mask_dataset,
         auto_preview=not bool(options.no_auto_preview),
+        language=language,
     )
     selected_input = (
         input_path

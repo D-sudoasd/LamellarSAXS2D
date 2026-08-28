@@ -15,7 +15,20 @@ import math
 from numbers import Real
 from typing import Any, Callable
 
+from .i18n import translate, validate_language
 from .qt_compat import QT_AVAILABLE, QtCore
+
+
+_HEADER_KEYS = (
+    "header.parameter",
+    "header.value",
+    "header.min",
+    "header.max",
+    "header.vary",
+    "header.expr",
+    "header.unit",
+    "header.stderr",
+)
 
 
 def _read_value(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -166,9 +179,31 @@ if QT_AVAILABLE:
         COLUMN_WIDTHS = (128, 82, 72, 72, 58, 112, 70, 76)
         headers = HEADER_LABELS
 
-        def __init__(self, parameters: Any = None, parent: Any = None) -> None:
+        def __init__(
+            self,
+            parameters: Any = None,
+            parent: Any = None,
+            *,
+            language: str = "en",
+        ) -> None:
             super().__init__(parent)
+            self._language = validate_language(language)
             self._rows: list[ParameterRow] = coerce_parameter_rows(parameters)
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def set_language(self, language: str) -> None:
+            resolved = validate_language(language)
+            if resolved == self._language:
+                return
+            self._language = resolved
+            self.headerDataChanged.emit(
+                QtCore.Qt.Orientation.Horizontal,
+                0,
+                len(self.COLUMNS) - 1,
+            )
 
         @property
         def rows(self) -> list[ParameterRow]:
@@ -184,7 +219,7 @@ if QT_AVAILABLE:
             if role not in (None, QtCore.Qt.ItemDataRole.DisplayRole):
                 return None
             if orientation == QtCore.Qt.Orientation.Horizontal:
-                return self.COLUMNS[section][1]
+                return translate(self._language, _HEADER_KEYS[section])
             return str(section + 1)
 
         def _value_for(self, row: ParameterRow, key: str) -> Any:
@@ -326,10 +361,24 @@ else:
         COLUMN_WIDTHS = (128, 82, 72, 72, 58, 112, 70, 76)
         headers = HEADER_LABELS
 
-        def __init__(self, parameters: Any = None, parent: Any = None) -> None:
+        def __init__(
+            self,
+            parameters: Any = None,
+            parent: Any = None,
+            *,
+            language: str = "en",
+        ) -> None:
             del parent
+            self._language = validate_language(language)
             self._rows = coerce_parameter_rows(parameters)
             self._callbacks: list[Callable[[str, str, Any], None]] = []
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def set_language(self, language: str) -> None:
+            self._language = validate_language(language)
 
         @property
         def rows(self) -> list[ParameterRow]:

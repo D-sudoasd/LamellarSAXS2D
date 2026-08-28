@@ -6,7 +6,16 @@ from collections.abc import Mapping
 from math import cos, pi, sin
 from typing import Any
 
+from .i18n import translate, validate_language
 from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets
+
+
+_VIEW_TITLE_KEYS = {
+    "Observed": "view.observed",
+    "Model": "view.model",
+    "Residual": "view.residual",
+    "Overlay": "view.overlay",
+}
 
 try:  # pyqtgraph is optional even when PySide6 is available
     import pyqtgraph as _pg
@@ -217,9 +226,11 @@ if QT_AVAILABLE:
         arrays and dictionaries without knowing anything about Qt.
         """
 
-        def __init__(self, title: str, parent: Any = None) -> None:
+        def __init__(self, title: str, parent: Any = None, *, language: str = "en") -> None:
             super().__init__(parent)
             self.title = title
+            self._title_key = _VIEW_TITLE_KEYS.get(title)
+            self._language = validate_language(language)
             self.image_data: Any = None
             self.image_extent: tuple[float, float, float, float] | None = None
             self.ridge_points: list[tuple[float, float]] = []
@@ -260,6 +271,23 @@ if QT_AVAILABLE:
                 self.placeholder = QtWidgets.QLabel("pyqtgraph 不可用")
                 self.placeholder.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)  # type: ignore[name-defined]
                 layout.addWidget(self.placeholder, 1)
+            self.set_language(self._language)
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def set_language(self, language: str) -> None:
+            self._language = validate_language(language)
+            if self._title_key is not None:
+                self.title_label.setText(translate(self._language, self._title_key))
+            if self.plot is not None:
+                self.plot.setLabel("bottom", translate(self._language, "axis.x_pixel"))
+                self.plot.setLabel("left", translate(self._language, "axis.y_pixel"))
+            elif hasattr(self, "placeholder"):
+                self.placeholder.setText(
+                    translate(self._language, "view.pyqtgraph_unavailable")
+                )
 
         def set_image(
             self,
@@ -450,14 +478,16 @@ if QT_AVAILABLE:
     class ViewGrid(QtWidgets.QWidget):
         """Four-view layout shared by the refinement and batch pages."""
 
-        def __init__(self, parent: Any = None) -> None:
+        def __init__(self, parent: Any = None, *, language: str = "en") -> None:
             super().__init__(parent)
+            self._language = validate_language(language)
+            self._q_unit = "unknown"
             layout = QtWidgets.QGridLayout(self)
             layout.setContentsMargins(2, 2, 2, 2)
-            self.observed = PatternView("Observed", self)
-            self.model = PatternView("Model", self)
-            self.residual = PatternView("Residual", self)
-            self.overlay = PatternView("Overlay", self)
+            self.observed = PatternView("Observed", self, language=self._language)
+            self.model = PatternView("Model", self, language=self._language)
+            self.residual = PatternView("Residual", self, language=self._language)
+            self.overlay = PatternView("Overlay", self, language=self._language)
             layout.addWidget(self.observed, 0, 0)
             layout.addWidget(self.model, 0, 1)
             layout.addWidget(self.residual, 1, 0)
@@ -468,6 +498,21 @@ if QT_AVAILABLE:
                 "residual": self.residual,
                 "overlay": self.overlay,
             }
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def _set_overlay_axis_labels(self) -> None:
+            if self.overlay.plot is not None:
+                self.overlay.plot.setLabel("bottom", f"qx ({self._q_unit})")
+                self.overlay.plot.setLabel("left", f"qy ({self._q_unit})")
+
+        def set_language(self, language: str) -> None:
+            self._language = validate_language(language)
+            for view in self.views.values():
+                view.set_language(self._language)
+            self._set_overlay_axis_labels()
 
         def set_images(
             self,
@@ -500,10 +545,8 @@ if QT_AVAILABLE:
             extent = q_extent if q_extent is not None else _q_extent(qx, qy)
             if observed_array is not None:
                 self.overlay.set_image(observed_array, levels=shared, extent=extent)
-            if self.overlay.plot is not None:
-                unit = str(q_unit or "unknown")
-                self.overlay.plot.setLabel("bottom", f"qx ({unit})")
-                self.overlay.plot.setLabel("left", f"qy ({unit})")
+            self._q_unit = str(q_unit or "unknown")
+            self._set_overlay_axis_labels()
 
         def set_overlay(
             self,
@@ -547,9 +590,11 @@ else:
     class PatternView:
         """Qt-free data sink matching :class:`PatternView`'s API."""
 
-        def __init__(self, title: str, parent: Any = None) -> None:
+        def __init__(self, title: str, parent: Any = None, *, language: str = "en") -> None:
             del parent
             self.title = title
+            self._title_key = _VIEW_TITLE_KEYS.get(title)
+            self._language = validate_language(language)
             self.image_data: Any = None
             self.image_extent: tuple[float, float, float, float] | None = None
             self.ridge_points: list[tuple[float, float]] = []
@@ -557,6 +602,15 @@ else:
             self.model_ellipses: list[Any] = []
             self.roi: tuple[float, float, float, float] | None = None
             self.roi_specs: list[Any] = []
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def set_language(self, language: str) -> None:
+            self._language = validate_language(language)
+            if self._title_key is not None:
+                self.title = translate(self._language, self._title_key)
 
         def set_image(
             self,
@@ -620,18 +674,28 @@ else:
     class ViewGrid:
         """Qt-free four-view container useful for batch scripts."""
 
-        def __init__(self, parent: Any = None) -> None:
+        def __init__(self, parent: Any = None, *, language: str = "en") -> None:
             del parent
-            self.observed = PatternView("Observed")
-            self.model = PatternView("Model")
-            self.residual = PatternView("Residual")
-            self.overlay = PatternView("Overlay")
+            self._language = validate_language(language)
+            self.observed = PatternView("Observed", language=self._language)
+            self.model = PatternView("Model", language=self._language)
+            self.residual = PatternView("Residual", language=self._language)
+            self.overlay = PatternView("Overlay", language=self._language)
             self.views = {
                 "observed": self.observed,
                 "model": self.model,
                 "residual": self.residual,
                 "overlay": self.overlay,
             }
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def set_language(self, language: str) -> None:
+            self._language = validate_language(language)
+            for view in self.views.values():
+                view.set_language(self._language)
 
         def set_images(
             self,
