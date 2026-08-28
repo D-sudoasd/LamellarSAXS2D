@@ -117,7 +117,7 @@ LamellarSAXS2D 面向取向层片体系的各向异性二维 SAXS 花样，提�
 - 生成 P3 同模型/独立 FFT 基准、8 帧盲标包，并提供缺证据即 No-Go 的只读证据门；是否进入下一阶段由团队依据报告决定。
 - 提取径向/方位剖面、lobe、ridge，并在 q 空间拟合共享中心和半轴的镜像双椭圆。
 - 可选像素级 `full2d` 经验精修，支持参数边界、固定、表达式绑定、权重和残差诊断。
-- Qt 界面提供 Observed、Model、Residual、Overlay 四视图、参数表、预览、后台优化、批处理和演化图。
+- Qt 界面提供 Observed、Model、Residual、Overlay 四视图和可编辑参数表；人工修改参数后，Preview 会同步更新经验模型及 Overlay 中的模型双椭圆，Optimize 只作为当前单帧的可选辅助。
 - 支持独立拟合或质量门控的 warm start、checkpoint 恢复、失败帧隔离及 CSV/JSON/NPZ 可审计导出。
 
 ### 安装与使用
@@ -133,7 +133,7 @@ bsaxs gui data/frame_0001.cbf --poni geometry/detector.poni
 bsaxs preflight data/package --manifest manifest.csv -o results/validation/preflight
 ```
 
-支持的 Python 版本为 3.11–3.13；3.14 及更高版本不在本项目支持契约内。`annotation-pack` 用于从 R0 清单生成 8 帧只读盲标包，`p3-status` 用于汇总 T1/T2/人工证据并报告 `go`/`no_go`；证据门不运行拟合，也不强制阻止后续阶段。详见 [P3 基准协议](docs/validation/benchmark_protocol.md) 和[操作与输入输出指南](docs/user_guide_zh.md)。
+支持的 Python 版本为 3.11–3.13；3.14 及更高版本不在本项目支持契约内。`annotation-pack` 用于从 R0 清单生成 8 帧只读盲标包，`p3-status` 用于汇总 T1/T2/人工证据并报告 `go`/`no_go`，`p4-evaluate` 用于运行 ridge/lobe/双椭圆工程验证；这些工程报告不替代人工拟合接受或科学证据门。详见 [P3 基准协议](docs/validation/benchmark_protocol.md) 和[操作与输入输出指南](docs/user_guide_zh.md)。
 
 批处理、mask、项目配置、字段和失败恢复见[操作与输入输出指南](docs/user_guide_zh.md)；模型参数、单位和可解释性边界见[科学量与解释边界](docs/scientific_basis_zh.md)。
 

@@ -225,8 +225,13 @@ def _t1_metrics(
     a = float(parameters["a"])
     b = float(parameters["b"])
     theta = float(parameters["theta"])
+    spacing = np.asarray(truth.get("q_spacing", ()), dtype=float).ravel()
+    if spacing.shape != (2,) or not np.all(np.isfinite(spacing)) or np.any(spacing <= 0.0):
+        raise ValueError("T1 truth q_spacing must contain positive finite (dq_y, dq_x)")
+    dq_y, dq_x = (float(spacing[0]), float(spacing[1]))
     rows = _ridge_rows(result)
     errors_q: list[float] = []
+    errors_detector_px: list[float] = []
     error_angles_deg: list[float] = []
     for row in rows:
         angle_deg = _finite(row.get("angle_deg", row.get("theta_deg")))
@@ -236,11 +241,19 @@ def _t1_metrics(
         angle = np.deg2rad(angle_deg)
         plus = float(ellipse_radius(angle, a, b, theta))
         minus = float(ellipse_radius(angle, a, b, -theta))
-        errors_q.append(min(abs(observed_q - plus), abs(observed_q - minus)))
+        radial_error = min(abs(observed_q - plus), abs(observed_q - minus))
+        errors_q.append(radial_error)
+        errors_detector_px.append(
+            float(
+                np.hypot(
+                    radial_error * np.cos(angle) / dq_x,
+                    radial_error * np.sin(angle) / dq_y,
+                )
+            )
+        )
         error_angles_deg.append(angle_deg)
-    spacing = np.asarray(truth.get("q_spacing", ()), dtype=float)
-    q_step = float(np.median(spacing[np.isfinite(spacing) & (spacing > 0)])) if spacing.size else float("nan")
-    errors_px = np.asarray(errors_q, dtype=float) / q_step if np.isfinite(q_step) and q_step > 0 else np.asarray([])
+    errors_q_array = np.asarray(errors_q, dtype=float)
+    errors_px = np.asarray(errors_detector_px, dtype=float)
 
     lobes = result.observables.get("lobes", [])
     measured_lobes = [
@@ -277,6 +290,15 @@ def _t1_metrics(
     return {
         "ridge_median_error_px": float(np.median(errors_px)) if errors_px.size else None,
         "ridge_p95_error_px": float(np.percentile(errors_px, 95.0)) if errors_px.size else None,
+        "ridge_median_error_q": (
+            float(np.median(errors_q_array)) if errors_q_array.size else None
+        ),
+        "ridge_p95_error_q": (
+            float(np.percentile(errors_q_array, 95.0)) if errors_q_array.size else None
+        ),
+        "ridge_q_unit": str(truth.get("q_unit", arrays.get("q_unit", "unknown"))),
+        "detector_error_method": "axis_aligned_q_grid_jacobian_dy_dx",
+        "q_spacing_dy_dx": [dq_y, dq_x],
         "ridge_f1_at_1px": float(2.0 * matched / (len(rows) + denominator)) if rows else 0.0,
         "ridge_precision_at_1px": float(precision),
         "ridge_recall_at_1px": float(recall),
@@ -294,8 +316,8 @@ def _t1_metrics(
             else None
         ),
         "ellipse_center_equivalent_pixel_error": (
-            center_q / q_step
-            if center_q is not None and np.isfinite(q_step) and q_step > 0
+            float(np.hypot(fit_cx / dq_x, fit_cy / dq_y))
+            if center_q is not None and fit_cx is not None and fit_cy is not None
             else None
         ),
         "valid_ridge_count": len(rows),

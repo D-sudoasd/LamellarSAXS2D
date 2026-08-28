@@ -175,10 +175,12 @@ UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY
 2. `Project → Select PONI…` 载入几何；`Project → Select external mask…` 载入外部无效像素 mask。
 3. 在右侧参数表编辑 `Value`、`Min`、`Max`、`Vary`、`Expr`、`Unit`。角度的公共 UI 字段使用 degree 标注；内部求解器可用弧度，但不要把 degree 与 radian 混填。
 4. 在 `Exclusion ROI (pixel)` 选择 `Rectangle` 或 `Ellipse`，填写边界/中心与半径，点击 `Apply`；`Clear` 清除 UI 排除区。
-5. `Preview` 根据当前参数显示 observed/model/residual/overlay；`Optimize` 在后台精修可变参数；`Auto preview` 控制参数改变后的自动预览。状态栏显示 RMSE、ndata、flags、coverage。
+5. `Preview` 根据当前参数显示 observed/model/residual/overlay；Overlay 中青色虚线双椭圆来自右侧当前模型参数，橙色实线椭圆来自观测 ridge 的独立拟合，两者不得混作同一证据。`Optimize` 在后台精修可变参数；`Auto preview` 控制参数改变后的自动预览。状态栏显示 RMSE、ndata、flags、coverage。
 6. `Project → Save project…` 保存 JSON 项目。它保存当前输入、PONI、mask、ROI、参数规格、batch 帧列表和 batch 设置；载入时，相对文件/目录路径按该 JSON 所在目录解析。CLI 的 TOML 仍是另一种项目格式，不要把二者当作同一 schema。
 
 参数 `Vary=false` 是当前帧的固定参数；`Expr` 是受限、可审计的表达式绑定，绑定量不进入自由优化向量。固定参数的 stderr 不是零，见科学文档。
+
+载入物理 PONI 后，`a`、`b`、径向宽度和背景宽度等 q 参数的 Unit 会刷新为当前 q 单位。`q min/q max` 只接受有限数值或 `Auto`，非法文本以及 `q min >= q max` 会在任务启动前报错。Preview/Optimize 若失败或没有返回新 model/residual，界面会清空旧图并显示失败状态，避免把上一轮结果误认为本轮结果。
 
 ## 6. 批处理、warm start 与恢复
 
@@ -315,3 +317,20 @@ $projectRoot = (Get-Location).Path
   --annotation-status <annotation_status.json> `
   -o <新的总览输出目录>
 ```
+
+## 10. P4 ridge/lobe/双椭圆工程验证
+
+`p4-evaluate` 运行固定 T1/T2 套件，并可选读取固定 8 帧 R0 包。它用于检查软件是否能定位 ridge/lobe、拟合或拒绝双椭圆以及保留输入哈希，不会自动填写人工标注，也不会把工程结果写成科学接受。
+
+```powershell
+.\.venv-project\Scripts\bsaxs.exe p4-evaluate `
+  --t1-manifest results\validation\synthetic_same_model\p3_run\truth_manifest.json `
+  --t2-manifest results\validation\synthetic_independent\p3_run\truth_manifest.json `
+  --thresholds configs\acceptance_thresholds_draft_v1.json `
+  --skip-sensitivity `
+  -o results\validation\p4_engineering\p4_run
+```
+
+需要同时运行 R0 固定 8 帧时，再提供 `--r0-package`、`--r0-manifest`、`--poni` 和 `--mask`。输出目录必须是新目录，主要文件为 `p4_engineering_report.json` 和 `p4_summary.csv`；`0` 表示当前工程合同为 GO，`1` 表示工程 No-Go，`2` 表示输入、路径或参数错误。T1 的 detector-pixel 误差按合成线性 q 网格的 `(dq_y, dq_x)` 分轴换算；该口径不能直接冒充一般 PONI 曲线 q-map 的完整仪器分辨率。`results/validation/` 是本地证据目录，不应上传 GitHub。
+
+即使 P4 工程主链可以执行，缺少真实人工 consensus、人工重复性、仪器 q 分辨率和冻结阈值时，P3 科学门禁仍为 No-Go。工程继续实施与正式科学验收是两件事。

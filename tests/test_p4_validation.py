@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from butterfly_saxs.p4_validation import (
     _r0_quality_summary,
     _t2_expected_outcome,
     _t2_projection_contract_complete,
+    _t1_metrics,
     _t1_visible_ridge_angles,
     run_p4_engineering,
 )
@@ -41,6 +43,38 @@ def test_t1_f1_reference_uses_visible_truth_sectors_not_latent_full_ellipse() ->
     assert angles is not None
     assert 0 < len(angles) < 72
     assert all(np.isfinite(value) for value in angles)
+
+
+def test_t1_detector_error_uses_axis_specific_q_spacing() -> None:
+    result = SimpleNamespace(
+        ridges=[
+            {"valid": True, "angle_deg": 0.0, "q": 1.2},
+            {"valid": True, "angle_deg": 90.0, "q": 1.1},
+        ],
+        observables={"lobes": []},
+        ellipse_fit={
+            "a": 1.0,
+            "b": 1.0,
+            "theta_deg": 0.0,
+            "parameters": {"center_qx": 0.2, "center_qy": 0.1},
+        },
+    )
+    truth = {
+        "q_spacing": [0.1, 0.2],
+        "q_unit": "nm^-1",
+        "truth_parameters": {"a": 1.0, "b": 1.0, "theta": 0.0},
+        "ridge_truth": {"lobe_angles_deg": []},
+    }
+
+    metrics = _t1_metrics(result, truth, {})
+
+    assert metrics["ridge_median_error_px"] == pytest.approx(1.0)
+    assert metrics["ridge_p95_error_px"] == pytest.approx(1.0)
+    assert metrics["ridge_median_error_q"] == pytest.approx(0.15)
+    assert metrics["ellipse_center_equivalent_pixel_error"] == pytest.approx(
+        np.sqrt(2.0)
+    )
+    assert metrics["detector_error_method"] == "axis_aligned_q_grid_jacobian_dy_dx"
 
 
 @pytest.mark.parametrize(

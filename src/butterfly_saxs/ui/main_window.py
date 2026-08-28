@@ -268,6 +268,82 @@ def _analysis_scalar(value: Any, *, default: Any = None) -> Any:
     return number if math.isfinite(number) else default
 
 
+def _parameter_number(parameters: Mapping[str, Any], names: tuple[str, ...]) -> float | None:
+    """Read one scalar from the editable table's plain parameter mapping."""
+
+    for name in names:
+        value = parameters.get(name)
+        if isinstance(value, Mapping):
+            value = _read(value, ("value", "val", "initial", "best"), None)
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def model_ellipse_pair(parameters: Mapping[str, Any], *, reference_axis_deg: float = 0.0) -> list[dict[str, Any]]:
+    """Build the two editable model ellipses for the q-space overlay.
+
+    These curves are generated only from the current parameter table.  They
+    are intentionally returned separately from measured-fit ellipses so a
+    preview cannot be mistaken for an observation-derived fit.
+    """
+
+    a = _parameter_number(parameters, ("a", "q_major"))
+    ratio = _parameter_number(parameters, ("axis_ratio",))
+    b = _parameter_number(parameters, ("b", "q_minor"))
+    if b is None and a is not None and ratio is not None:
+        b = a * ratio if ratio <= 1.0 else a / ratio
+    if a is None or b is None or a <= 0.0 or b <= 0.0:
+        return []
+    theta_deg = _parameter_number(parameters, ("theta_deg", "orientation_deg", "angle_deg"))
+    if theta_deg is None:
+        theta = _parameter_number(parameters, ("theta", "orientation", "angle"))
+        theta_deg = math.degrees(theta) if theta is not None else 0.0
+    return [
+        {
+            "cx": 0.0,
+            "cy": 0.0,
+            "a": float(a),
+            "b": float(b),
+            "angle_deg": float(reference_axis_deg) + float(theta_deg),
+            "source": "model",
+        },
+        {
+            "cx": 0.0,
+            "cy": 0.0,
+            "a": float(a),
+            "b": float(b),
+            "angle_deg": float(reference_axis_deg) - float(theta_deg),
+            "source": "model",
+        },
+    ]
+
+
+def _result_has_failure(result: Any) -> bool:
+    """Return whether a result carries an explicit failure condition."""
+
+    status = str(_read(result, ("status", "solver_status"), "") or "").lower()
+    if status in {"fail", "failed", "error"}:
+        return True
+    quality = str(_read(result, ("quality_status",), "") or "").upper()
+    if quality == "FAIL":
+        return True
+    metrics = _read(result, ("metrics", "statistics", "summary"), {})
+    if isinstance(metrics, Mapping) and metrics.get("success") is False:
+        return True
+    flags = _read(metrics, ("flags", "flag"), _read(result, ("flags", "flag"), []))
+    if isinstance(flags, str):
+        flags = [flags]
+    return any(
+        any(token in str(flag).lower() for token in ("failed", "error", "invalid", "no_engine", "exception"))
+        for flag in (flags or [])
+    )
+
+
 def _sequence(value: Any) -> list[Any]:
     """Convert optional NumPy/iterable profile fields without truth testing arrays."""
 
@@ -345,6 +421,9 @@ if QT_AVAILABLE:
             self._config_path: str | None = None
             self._last_result: Any = None
             self._last_error: str | None = None
+            self._fit_ridge_points: Any = []
+            self._observed_fit_ellipses: list[Any] = []
+            self._model_ellipses: list[Any] = []
             self.last_metrics: dict[str, Any] = {}
             self._analysis_settings: dict[str, Any] = deepcopy(DEFAULT_ANALYSIS_SETTINGS)
             self.evolution_records: list[Any] = []
@@ -858,6 +937,25 @@ if QT_AVAILABLE:
                 "max_pixels": int(self.max_pixels_spin.value()),
             }
 
+        def _validate_analysis_controls(self) -> None:
+            """Reject malformed q bounds before starting a worker."""
+
+            values: dict[str, float | None] = {}
+            for name, widget in (("q_min", self.q_min_edit), ("q_max", self.q_max_edit)):
+                text = widget.text().strip()
+                if text.lower() in {"", "auto"}:
+                    values[name] = None
+                    continue
+                try:
+                    number = float(text)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{name} must be a finite number or Auto") from exc
+                if not math.isfinite(number):
+                    raise ValueError(f"{name} must be a finite number or Auto")
+                values[name] = number
+            if values["q_min"] is not None and values["q_max"] is not None and values["q_min"] >= values["q_max"]:
+                raise ValueError("q min must be smaller than q max")
+
         def set_analysis_settings(
             self,
             settings: Mapping[str, Any] | None,
@@ -932,6 +1030,9 @@ if QT_AVAILABLE:
             self._set_busy(False)
             if clear_fit:
                 self.views.clear_fit()
+                self._fit_ridge_points = []
+                self._observed_fit_ellipses = []
+                self._model_ellipses = []
                 self._last_result = None
                 self._last_error = None
                 self.last_metrics = {}
@@ -955,6 +1056,27 @@ if QT_AVAILABLE:
             self._external_mask = None
             return True
 
+        def _refresh_q_parameter_units(self, q_unit: Any = None) -> None:
+            """Apply the active physical q unit to q-valued table rows."""
+
+            if q_unit is None:
+                q_unit = _read(self._qmap, ("q_unit", "unit"), None)
+                metadata = _read(self._qmap, ("metadata",), {})
+                if q_unit is None:
+                    q_unit = _read(metadata, ("q_unit", "unit"), None)
+            unit = str(q_unit or "").strip()
+            if not unit or unit.lower() in {"unknown", "pixel", "pixels", "pixel-q", "pixel_q"}:
+                return
+            q_names = {"a", "b", "q_center", "q_major", "q_minor", "radial_sigma", "radial_gamma", "radial_fwhm", "background_width"}
+            for row_index, row in enumerate(self.parameter_model.rows):
+                if row.name not in q_names or row.unit == unit:
+                    continue
+                row.unit = unit
+                data_changed = getattr(self.parameter_model, "dataChanged", None)
+                index = getattr(self.parameter_model, "index", None)
+                if data_changed is not None and hasattr(data_changed, "emit") and callable(index):
+                    data_changed.emit(index(row_index, 6), index(row_index, 6), [QtCore.Qt.ItemDataRole.DisplayRole])
+
         def set_observed_data(
             self,
             data: Any,
@@ -974,6 +1096,7 @@ if QT_AVAILABLE:
                 self._qy = _read(qmap, ("qy", "qy_nm_inv"), self._qy)
             elif qx is not None and qy is not None:
                 self._qmap = {"qx": qx, "qy": qy}
+            self._refresh_q_parameter_units()
             setter = getattr(self.engine, "set_observed", None)
             if callable(setter):
                 try:
@@ -982,6 +1105,7 @@ if QT_AVAILABLE:
                         self._qmap = state.get("qmap", self._qmap)
                         self._qx = _read(self._qmap, ("qx", "qx_nm_inv"), self._qx)
                         self._qy = _read(self._qmap, ("qy", "qy_nm_inv"), self._qy)
+                        self._refresh_q_parameter_units()
                 except Exception as exc:
                     self._set_status(f"Geometry update failed: {exc}", flags="error")
             # Keep the overlay background synchronized even before the first
@@ -1018,6 +1142,7 @@ if QT_AVAILABLE:
                     self._qmap = qmap
                     self._qx = _read(qmap, ("qx", "qx_nm_inv"), self._qx)
                     self._qy = _read(qmap, ("qy", "qy_nm_inv"), self._qy)
+                    self._refresh_q_parameter_units()
                     if self._observed is not None:
                         self.views.set_images(
                             self._observed,
@@ -1368,8 +1493,29 @@ if QT_AVAILABLE:
             self._set_status("Exclusion ROI cleared")
             return True
 
+        def _reference_axis_deg(self) -> float:
+            try:
+                return float(self.analysis_settings.get("draw_axis_deg", 90.0)) - 90.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _refresh_model_overlay(self) -> None:
+            self._model_ellipses = model_ellipse_pair(
+                self.parameter_model.parameter_values(),
+                reference_axis_deg=self._reference_axis_deg(),
+            )
+            self.views.set_overlay(
+                self._fit_ridge_points,
+                self._observed_fit_ellipses,
+                model_ellipses=self._model_ellipses,
+            )
+
         def set_fit_overlay(self, ridge_points: Any = None, ellipses: Any = None) -> None:
-            self.views.set_overlay(ridge_points, ellipses)
+            self._fit_ridge_points = [] if ridge_points is None else ridge_points
+            self._observed_fit_ellipses = [] if ellipses is None else ellipses
+            if isinstance(self._observed_fit_ellipses, Mapping):
+                self._observed_fit_ellipses = [self._observed_fit_ellipses]
+            self._refresh_model_overlay()
 
         # ----- preview/optimization lifecycle ---------------------------------
 
@@ -1389,10 +1535,18 @@ if QT_AVAILABLE:
                     pass
             self._set_busy(False, "edited")
             self._set_status("Parameters changed")
+            self._refresh_model_overlay()
             if self.auto_preview:
                 self._debounce_timer.start(self.debounce_ms)
 
         def _on_analysis_changed(self, *_: Any) -> None:
+            try:
+                self._validate_analysis_controls()
+            except ValueError as exc:
+                self._generation.next()
+                self._set_busy(False, "edited")
+                self._set_status(f"Analysis settings invalid: {exc}", flags="invalid_analysis")
+                return
             self._generation.next()
             self._analysis_settings = self.analysis_settings
             setter = getattr(self.engine, "set_analysis_settings", None)
@@ -1406,6 +1560,7 @@ if QT_AVAILABLE:
                     pass
             self._set_busy(False, "edited")
             self._set_status("Analysis settings changed")
+            self._refresh_model_overlay()
             if self.auto_preview:
                 self._debounce_timer.start(self.debounce_ms)
 
@@ -1437,6 +1592,13 @@ if QT_AVAILABLE:
             }
 
         def _start_job(self, kind: str, payload: Any = None) -> int:
+            try:
+                self._validate_analysis_controls()
+            except ValueError as exc:
+                generation = self._generation.next()
+                self._set_busy(False, "edited")
+                self._set_status(f"Analysis settings invalid: {exc}", flags="invalid_analysis")
+                return generation
             generation = self._generation.next()
             request_payload = self._payload() if payload is None else payload
             worker = AnalysisWorker(
@@ -1502,7 +1664,7 @@ if QT_AVAILABLE:
                 self._apply_result(result)
                 if kind == "optimize":
                     self._auto_scale_initial = False
-            self._set_busy(False, kind)
+            self._set_busy(False, kind, result_ok=not _result_has_failure(result))
 
         def _on_worker_error(self, generation: int, kind: str, error: Exception) -> None:
             self._workers.pop(generation, None)
@@ -1532,8 +1694,15 @@ if QT_AVAILABLE:
                         residual = obs_array - model_array
                 except Exception:
                     residual = None
+            # A partial/failed result must not leave a stale image visible.
+            if model is None:
+                self.views.model.clear_image()
+            if residual is None:
+                self.views.residual.clear_image()
             result_qx = _result_value(result, ("qx", "qx_nm_inv"), self._qx)
             result_qy = _result_value(result, ("qy", "qy_nm_inv"), self._qy)
+            result_q_unit = str(_read(result, ("q_unit",), _read(self._qmap, ("q_unit", "unit"), "unknown")) or "unknown")
+            self._refresh_q_parameter_units(result_q_unit)
             result_valid_mask = _result_value(result, ("valid_mask",), _read(self._qmap, ("valid_mask", "valid"), None))
             result_external_mask = _result_value(result, ("mask", "external_mask"), self._external_mask)
             self.views.set_images(
@@ -1542,7 +1711,7 @@ if QT_AVAILABLE:
                 residual,
                 qx=result_qx,
                 qy=result_qy,
-                q_unit=str(_read(result, ("q_unit",), _read(self._qmap, ("q_unit", "unit"), "unknown")) or "unknown"),
+                q_unit=result_q_unit,
                 valid_mask=result_valid_mask,
                 external_mask=result_external_mask,
             )
@@ -1553,10 +1722,6 @@ if QT_AVAILABLE:
                 ellipses = _result_value(ellipse_result, ("ellipses", "ellipse_pair"), [])
             if ellipses and isinstance(ellipses, Mapping):
                 ellipses = [ellipses]
-            self.set_fit_overlay(ridge_points, ellipses)
-            self._update_metrics(result, observed, residual)
-            self._update_measurements(result)
-
             fitted = _result_value(result, ("parameters", "fitted_parameters", "params"), None)
             if fitted:
                 self.parameter_model.set_rows(fitted)
@@ -1568,6 +1733,9 @@ if QT_AVAILABLE:
                         # Injected/legacy engines may expose a narrower setter;
                         # the accepted UI state remains authoritative.
                         pass
+            self.set_fit_overlay(ridge_points, ellipses)
+            self._update_metrics(result, observed, residual)
+            self._update_measurements(result)
 
         def _update_batch_rows(self, records: Iterable[Any]) -> None:
             rows = list(records)
@@ -2037,7 +2205,7 @@ if QT_AVAILABLE:
 
         # ----- status and lifetime ---------------------------------------------
 
-        def _set_busy(self, busy: bool, kind: str = "") -> None:
+        def _set_busy(self, busy: bool, kind: str = "", *, result_ok: bool | None = None) -> None:
             self.preview_button.setEnabled(not busy)
             self.optimize_button.setEnabled(not busy)
             self.batch_run_button.setEnabled(not busy)
@@ -2047,6 +2215,9 @@ if QT_AVAILABLE:
             if busy:
                 self._set_status(f"Running {kind}…")
             elif kind:
+                if result_ok is False:
+                    self._set_status(f"{kind.title()} failed", flags="result_failed")
+                    return
                 status = {
                     "preview": "Preview complete",
                     "optimize": "Optimize complete",

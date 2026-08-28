@@ -224,6 +224,7 @@ if QT_AVAILABLE:
             self.image_extent: tuple[float, float, float, float] | None = None
             self.ridge_points: list[tuple[float, float]] = []
             self.ellipses: list[Any] = []
+            self.model_ellipses: list[Any] = []
             self._overlay_items: list[Any] = []
             self.roi: tuple[float, float, float, float] | None = None
             self._roi_item: Any = None
@@ -383,6 +384,7 @@ if QT_AVAILABLE:
             ellipses: Any = None,
             *,
             ellipse_parameters: Any = None,
+            model_ellipses: Any = None,
         ) -> None:
             if ellipses is None and ellipse_parameters is not None:
                 ellipses = ellipse_parameters
@@ -393,8 +395,12 @@ if QT_AVAILABLE:
                 point_source = [point_source]
             if isinstance(ellipse_source, Mapping):
                 ellipse_source = [ellipse_source]
+            model_source = [] if model_ellipses is None else model_ellipses
+            if isinstance(model_source, Mapping):
+                model_source = [model_source]
             self.ridge_points = [point for point in (_point_xy(p) for p in point_source) if point]
             self.ellipses = list(ellipse_source)
+            self.model_ellipses = list(model_source)
             if self.plot is None or not PLOT_AVAILABLE:
                 return
             if self.ridge_points:
@@ -416,6 +422,16 @@ if QT_AVAILABLE:
                 )
                 self.plot.addItem(curve)
                 self._overlay_items.append(curve)
+            for ellipse in self.model_ellipses:
+                xy = _ellipse_xy(ellipse)
+                if xy is None:
+                    continue
+                curve = _pg.PlotDataItem(
+                    xy[0], xy[1],
+                    pen=_pg.mkPen(70, 220, 255, width=2, style=QtCore.Qt.PenStyle.DashLine),
+                )
+                self.plot.addItem(curve)
+                self._overlay_items.append(curve)
             # The image background and overlays must share the same coordinate
             # system.  Re-ranging after both are present avoids clipping a
             # ridge point when q maps are sparse or asymmetric.
@@ -428,7 +444,7 @@ if QT_AVAILABLE:
             self.set_overlay(ridge_points, ellipses)
 
         def set_ellipses(self, ellipses: Any) -> None:
-            self.set_overlay(self.ridge_points, ellipses)
+            self.set_overlay(self.ridge_points, ellipses, model_ellipses=self.model_ellipses)
 
 
     class ViewGrid(QtWidgets.QWidget):
@@ -495,6 +511,7 @@ if QT_AVAILABLE:
             ellipses: Any = None,
             *,
             ellipse_parameters: Any = None,
+            model_ellipses: Any = None,
         ) -> None:
             if ellipses is None and ellipse_parameters is not None:
                 ellipses = ellipse_parameters
@@ -502,6 +519,7 @@ if QT_AVAILABLE:
                 ridge_points,
                 ellipses,
                 ellipse_parameters=ellipse_parameters,
+                model_ellipses=model_ellipses,
             )
 
         def clear_fit(self) -> None:
@@ -509,7 +527,7 @@ if QT_AVAILABLE:
 
             self.model.clear_image()
             self.residual.clear_image()
-            self.overlay.set_overlay([], [])
+            self.overlay.set_overlay([], [], model_ellipses=[])
             try:
                 self.overlay.plot.autoRange()
             except Exception:
@@ -536,6 +554,7 @@ else:
             self.image_extent: tuple[float, float, float, float] | None = None
             self.ridge_points: list[tuple[float, float]] = []
             self.ellipses: list[Any] = []
+            self.model_ellipses: list[Any] = []
             self.roi: tuple[float, float, float, float] | None = None
             self.roi_specs: list[Any] = []
 
@@ -575,6 +594,7 @@ else:
             ellipses: Any = None,
             *,
             ellipse_parameters: Any = None,
+            model_ellipses: Any = None,
         ) -> None:
             if ellipses is None and ellipse_parameters is not None:
                 ellipses = ellipse_parameters
@@ -584,13 +604,17 @@ else:
                 point_source = [point_source]
             if isinstance(ellipse_source, Mapping):
                 ellipse_source = [ellipse_source]
+            model_source = [] if model_ellipses is None else model_ellipses
+            if isinstance(model_source, Mapping):
+                model_source = [model_source]
             self.ridge_points = [point for point in (_point_xy(p) for p in point_source) if point]
             self.ellipses = list(ellipse_source)
+            self.model_ellipses = list(model_source)
 
         set_ridge_and_ellipses = set_overlay
 
         def set_ellipses(self, ellipses: Any) -> None:
-            self.set_overlay(self.ridge_points, ellipses)
+            self.set_overlay(self.ridge_points, ellipses, model_ellipses=self.model_ellipses)
 
 
     class ViewGrid:
@@ -640,11 +664,13 @@ else:
             ellipses: Any = None,
             *,
             ellipse_parameters: Any = None,
+            model_ellipses: Any = None,
         ) -> None:
             self.overlay.set_overlay(
                 ridge_points,
                 ellipses,
                 ellipse_parameters=ellipse_parameters,
+                model_ellipses=model_ellipses,
             )
 
         def clear_fit(self) -> None:
@@ -652,7 +678,7 @@ else:
 
             self.model.clear_image()
             self.residual.clear_image()
-            self.overlay.set_overlay([], [])
+            self.overlay.set_overlay([], [], model_ellipses=[])
 
         def set_roi(self, roi: Any = None) -> None:
             for view in (self.observed, self.model, self.residual):

@@ -573,3 +573,69 @@ def test_q_overlay_keeps_pixel_roi_out_of_q_space_and_shows_mask(qtbot) -> None:
         assert grid.overlay.plot.getAxis("left").labelText == "qy (1/nm)"
         assert grid.residual.image_item.getColorMap() is not None
     grid.close()
+
+
+def test_editable_model_ellipses_are_separate_and_follow_parameters(qtbot) -> None:
+    engine = _StateEngine()
+    parameters = {
+        "a": {"value": 0.8, "unit": "unknown"},
+        "axis_ratio": {"value": 0.5, "unit": ""},
+        "theta_deg": {"value": 15.0, "unit": "degree"},
+    }
+    window = MainWindow(engine=engine, parameters=parameters, auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((4, 4)))
+    measured = {"a": 0.7, "b": 0.4, "angle_deg": 12.0, "source": "measured"}
+    window.set_fit_overlay([], [measured])
+
+    assert window.views.overlay.ellipses == [measured]
+    assert len(window.views.overlay.model_ellipses) == 2
+    assert {curve["source"] for curve in window.views.overlay.model_ellipses} == {"model"}
+    old_angles = [curve["angle_deg"] for curve in window.views.overlay.model_ellipses]
+    assert window.set_parameter("a", 1.0)
+    assert window.set_parameter("axis_ratio", 0.25)
+    assert window.set_parameter("theta_deg", 30.0)
+    updated = window.views.overlay.model_ellipses
+    assert [curve["a"] for curve in updated] == [1.0, 1.0]
+    assert [curve["b"] for curve in updated] == [0.25, 0.25]
+    assert [curve["angle_deg"] for curve in updated] != old_angles
+    assert window.views.overlay.ellipses == [measured]
+    window.close()
+
+
+def test_poni_refreshes_physical_q_units_and_partial_failure_clears_images(qtbot) -> None:
+    engine = _PoniEngine()
+    engine.parameters.update({
+        "a": {"value": 0.8, "unit": "unknown"},
+        "b": {"value": 0.4, "unit": "unknown"},
+        "radial_sigma": {"value": 0.04, "unit": "unknown"},
+    })
+    window = MainWindow(engine=engine, parameters=engine.parameters, auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.ones((4, 5))
+    window.set_observed_data(observed)
+    window._apply_result({"observed": observed, "model": observed, "residual": np.zeros_like(observed)})
+    assert window.views.model.image_data is not None
+    assert window.views.residual.image_data is not None
+    assert window.set_poni("example.poni")
+    units = {row.name: row.unit for row in window.parameter_model.rows}
+    assert units["a"] == "nm^-1"
+    assert units["b"] == "nm^-1"
+    window._apply_result({"observed": observed, "flags": ["analysis_failed:ValueError"]})
+    assert window.views.model.image_data is None
+    assert window.views.residual.image_data is None
+    assert window.status_message.text() != "Optimize complete"
+    window.close()
+
+
+def test_invalid_q_bounds_do_not_start_worker_or_fall_back_to_auto(qtbot) -> None:
+    engine = _MeasurementPageEngine()
+    window = MainWindow(engine=engine, auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((4, 5)))
+    window.q_min_edit.setText("not-a-number")
+    generation = window.request_preview()
+    assert generation > 0
+    assert engine.payloads == []
+    assert "invalid_analysis" in window.flags_label.text()
+    window.close()
