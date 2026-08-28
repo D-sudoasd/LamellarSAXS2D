@@ -872,3 +872,36 @@ def test_preview_can_be_reviewed_and_exported_but_parameter_edit_blocks_stale_re
     assert not (tmp_path / "stale-evidence").exists()
     assert "evidence_stale" in window.flags_label.text()
     window.close()
+
+
+def test_current_preview_can_be_explicitly_rejected_and_exported(qtbot, tmp_path) -> None:
+    window = MainWindow(engine=_StateEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.ones((3, 4), dtype=float)
+    model = np.zeros_like(observed)
+    window.set_observed_data(observed)
+    generation = window._generation.next()
+    window._on_worker_finished(
+        generation,
+        "preview",
+        {
+            "observed": observed,
+            "model": model,
+            "residual": observed - model,
+            "parameters": window.parameter_model.parameter_dict(),
+            "flags": ["apparent_geometry_only", "nonunique_inverse_problem"],
+        },
+    )
+
+    window.reviewer_edit.setText("Reviewer Negative")
+    window.review_notes_edit.setText("current empirical model is not suitable for this frame")
+    assert window.reject_current()
+    assert window.fit_session["manual_status"] == "rejected"
+    assert window.fit_session["accepted_parameters"] is None
+
+    evidence_dir = tmp_path / "rejected-evidence"
+    assert window.export_manual_evidence(evidence_dir)
+    exported_session = json.loads((evidence_dir / "fit_session.json").read_text(encoding="utf-8"))
+    assert exported_session["manual_status"] == "rejected"
+    assert exported_session["reviewed_by"] == "Reviewer Negative"
+    window.close()
