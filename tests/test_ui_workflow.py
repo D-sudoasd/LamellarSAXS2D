@@ -76,6 +76,36 @@ def test_overlay_has_observed_q_background_and_extent(qtbot) -> None:
         assert view_range[1][0] <= ridge[0]["qy"] <= view_range[1][1]
 
 
+def test_pattern_views_force_row_major_for_rectangular_detector_arrays(qtbot) -> None:
+    grid = ViewGrid()
+    qtbot.addWidget(grid)
+    observed = np.arange(21, dtype=float).reshape(3, 7)
+    model = observed + 10.0
+    residual = observed - model
+    yy, xx = np.indices(observed.shape, dtype=float)
+    qx = (xx - 3.0) / 10.0
+    qy = (yy - 1.0) / 20.0
+
+    grid.set_images(observed, model, residual, qx=qx, qy=qy, q_unit="nm^-1")
+
+    expected = {
+        "observed": observed,
+        "model": model,
+        "residual": residual,
+        "overlay": observed,
+    }
+    for name, view in grid.views.items():
+        assert view.image_item is not None
+        assert view.image_item.axisOrder == "row-major"
+        np.testing.assert_array_equal(view.image_data, expected[name])
+
+    for name in ("observed", "model", "residual"):
+        rect = grid.views[name].image_item.boundingRect()
+        assert rect.width() == pytest.approx(observed.shape[1])
+        assert rect.height() == pytest.approx(observed.shape[0])
+    grid.close()
+
+
 def test_parameter_edit_invalidates_an_inflight_worker_result(qtbot) -> None:
     engine = _StateEngine()
     window = MainWindow(engine=engine, auto_preview=False)

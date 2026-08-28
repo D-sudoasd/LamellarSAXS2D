@@ -274,7 +274,12 @@ if QT_AVAILABLE:
             kwargs = {}
             if levels is not None:
                 kwargs["levels"] = levels
-            self.image_item.setImage(self.image_data, autoLevels=levels is None, **kwargs)
+            self.image_item.setImage(
+                self.image_data,
+                autoLevels=levels is None,
+                axisOrder="row-major",
+                **kwargs,
+            )
             if extent is not None:
                 xmin, xmax, ymin, ymax = extent
                 try:
