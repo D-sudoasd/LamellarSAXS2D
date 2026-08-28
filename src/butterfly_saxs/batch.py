@@ -808,6 +808,18 @@ def _nested_quality_failure(name: str, result: Any) -> str | None:
     status = _named_value(result, "status")
     if _is_failure_status(status):
         return f"{name}.status={status}"
+    quality_status = _named_value(result, "quality_status")
+    if _is_failure_status(quality_status) or (
+        isinstance(quality_status, str) and quality_status.strip().casefold() == "fail"
+    ):
+        return f"{name}.quality_status={quality_status}"
+    quality = _named_value(result, "quality")
+    nested_quality_status = _named_value(quality, "status")
+    if _is_failure_status(nested_quality_status) or (
+        isinstance(nested_quality_status, str)
+        and nested_quality_status.strip().casefold() == "fail"
+    ):
+        return f"{name}.quality.status={nested_quality_status}"
     flag = _quality_failure_flag(_named_value(result, "flags"))
     if flag is not None:
         return f"{name}.flags={flag}"

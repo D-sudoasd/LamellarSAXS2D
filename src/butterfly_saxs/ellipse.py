@@ -147,6 +147,12 @@ class EllipseFitResult:
     scipy_result: OptimizeResult | None = field(default=None, repr=False)
     model: str = "ellipse"
     reference_axis: float = 0.0
+    # The symmetric solver records its deterministic multistart audit trail.
+    # These defaults keep the single-ellipse result/API unchanged.
+    candidate_solutions: tuple[dict[str, Any], ...] = ()
+    selected_start_index: int = 0
+    multistart_count: int = 1
+    branch_assignment: np.ndarray | None = None
 
     @property
     def parameter_set(self) -> ParameterSet:
@@ -583,9 +589,41 @@ def _bound_diagnostics(parameters: ParameterSet, values: Mapping[str, float]) ->
     return flags, status
 
 
+def _branch_assignment(points: np.ndarray, parameters: ParameterSet, labels: np.ndarray | None,
+                       *, residual: ResidualKind, reference_axis: float,
+                       components: int) -> np.ndarray | None:
+    """Return stable component labels for the selected symmetric solution."""
+
+    if components != 2:
+        return None
+    if labels is not None:
+        # Explicit supervision is authoritative; do not recompute or reorder it.
+        return np.asarray(labels, dtype=int).copy()
+    values = parameters.resolve()
+    geometry = EllipseGeometry.from_values(values)
+    plus = EllipseGeometry(
+        geometry.cx, geometry.cy, geometry.a, geometry.axis_ratio,
+        float(reference_axis) + geometry.theta,
+    )
+    minus = EllipseGeometry(
+        geometry.cx, geometry.cy, geometry.a, geometry.axis_ratio,
+        float(reference_axis) - geometry.theta,
+    )
+    residual_function = _residual_function(residual)
+    r_plus = np.asarray(residual_function(points, plus), dtype=float)
+    r_minus = np.asarray(residual_function(points, minus), dtype=float)
+    # Tie-breaking to branch 0 makes the result deterministic at the symmetry
+    # axis and matches symmetric_ellipse_residuals.
+    return np.where(np.abs(r_plus) <= np.abs(r_minus), 0, 1).astype(int)
+
+
 def _make_result(parameters: ParameterSet, scipy_result: OptimizeResult | None, residuals: np.ndarray,
                  *, model: str, points: np.ndarray, components: int, labels: np.ndarray | None,
-                 reference_axis: float = 0.0) -> EllipseFitResult:
+                 reference_axis: float = 0.0,
+                 candidate_solutions: tuple[dict[str, Any], ...] = (),
+                 selected_start_index: int = 0,
+                 multistart_count: int = 1,
+                 residual: ResidualKind = "sampson") -> EllipseFitResult:
     values = parameters.resolve()
     free_names = parameters.free_names
     jacobian = None if scipy_result is None else np.asarray(getattr(scipy_result, "jac", None), dtype=float)
@@ -641,13 +679,25 @@ def _make_result(parameters: ParameterSet, scipy_result: OptimizeResult | None, 
         scipy_result=scipy_result,
         model=model,
         reference_axis=float(reference_axis),
+        candidate_solutions=candidate_solutions,
+        selected_start_index=int(selected_start_index),
+        multistart_count=int(multistart_count),
+        branch_assignment=_branch_assignment(
+            points,
+            parameters,
+            labels,
+            residual=residual,
+            reference_axis=reference_axis,
+            components=components,
+        ),
     )
 
 
 def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[ParameterSet], np.ndarray],
              *, loss: str, f_scale: float, max_nfev: int | None, model: str,
              components: int, labels: np.ndarray | None,
-             reference_axis: float = 0.0) -> EllipseFitResult:
+             reference_axis: float = 0.0,
+             residual: ResidualKind = "sampson") -> EllipseFitResult:
     if f_scale <= 0 or not np.isfinite(f_scale):
         raise ValueError("f_scale must be finite and positive")
     loss = str(loss).lower()
@@ -702,6 +752,7 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
             components=components,
             labels=labels,
             reference_axis=reference_axis,
+            residual=residual,
         )
     residuals = np.asarray(objective(parameters), dtype=float)
     return _make_result(
@@ -713,6 +764,7 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
         components=components,
         labels=labels,
         reference_axis=reference_axis,
+        residual=residual,
     )
 
 
@@ -787,13 +839,72 @@ symmetric_double_ellipse_residuals = symmetric_ellipse_residuals
 symmetric_double_ellipse_residual = symmetric_ellipse_residuals
 
 
+def _validate_multistart_count(multistart: Any) -> int:
+    if isinstance(multistart, (bool, np.bool_)) or not isinstance(multistart, (int, np.integer)):
+        raise TypeError("multistart must be an integer >= 1")
+    count = int(multistart)
+    if count < 1:
+        raise ValueError("multistart must be an integer >= 1")
+    return count
+
+
+def _multistart_parameter_sets(parameters: ParameterSet, count: int) -> tuple[ParameterSet, ...]:
+    """Build deterministic starts while preserving free/fixed/tied semantics."""
+
+    if count == 1 or not parameters.free_names:
+        return tuple(parameters.copy() for _ in range(count))
+    base = parameters.free_vector()
+    lower, upper = parameters.free_bounds()
+    # Fractions are deliberately fixed (no RNG/seed dependency).  They cover
+    # both sides and the centre of each finite interval, while the first start
+    # remains exactly the caller's editable initial value.
+    fractions = (0.20, 0.80, 0.35, 0.65, 0.50, 0.10, 0.90)
+    offsets = (-1.5, 1.5, -0.75, 0.75, 0.0, -2.0, 2.0)
+    starts: list[ParameterSet] = [parameters.copy()]
+    for start_index in range(1, count):
+        vector = base.copy()
+        fraction = fractions[(start_index - 1) % len(fractions)]
+        offset = offsets[(start_index - 1) % len(offsets)]
+        for index, (value, lo, hi) in enumerate(zip(base, lower, upper)):
+            if np.isfinite(lo) and np.isfinite(hi):
+                vector[index] = lo + fraction * (hi - lo)
+            else:
+                scale = max(abs(float(value)), abs(float(lo)) if np.isfinite(lo) else 0.0,
+                            abs(float(hi)) if np.isfinite(hi) else 0.0, 1.0)
+                vector[index] = float(value) + offset * scale
+                if np.isfinite(lo):
+                    vector[index] = max(vector[index], lo)
+                if np.isfinite(hi):
+                    vector[index] = min(vector[index], hi)
+        candidate = parameters.copy()
+        candidate.set_free_vector(vector)
+        # Resolving here makes a tied-expression failure belong to the
+        # offending deterministic start, before scipy is invoked.
+        candidate.resolve()
+        starts.append(candidate)
+    return tuple(starts)
+
+
+def _candidate_solution_record(start_index: int, start: ParameterSet, result: EllipseFitResult) -> dict[str, Any]:
+    return {
+        "start_index": int(start_index),
+        "start_values": dict(start.resolve()),
+        "values": dict(result.values),
+        "success": bool(result.success),
+        "finite_cost": bool(np.isfinite(result.cost)),
+        "cost": float(result.cost),
+        "message": str(result.message),
+    }
+
+
 def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, Any] | None = None, *,
                            params: ParameterSet | Mapping[str, Any] | None = None,
                            residual: ResidualKind = "sampson", loss: str = "soft_l1", f_scale: float = 1.0,
                            labels: Any = None, weights: Any = None, max_nfev: int | None = None,
                            config: Any = None, residual_kind: str | None = None,
                            reference_axis_deg: float = 0.0,
-                           reference_axis: float | None = None) -> EllipseFitResult:
+                           reference_axis: float | None = None,
+                           multistart: int = 7) -> EllipseFitResult:
     """Fit a mirror-symmetric pair of ellipses sharing centre and axes."""
 
     if parameters is not None and params is not None:
@@ -806,6 +917,7 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
         f_scale = getattr(config, "f_scale", f_scale)
         max_nfev = getattr(config, "max_nfev", max_nfev)
         reference_axis_deg = getattr(config, "reference_axis_deg", reference_axis_deg)
+        multistart = getattr(config, "multistart", multistart)
     if residual_kind is not None:
         residual = residual_kind
     points = _coerce_points(points)
@@ -851,9 +963,46 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
             weights=weights,
             reference_axis=reference,
         )
-    return _run_fit(points, parameter_set, objective, loss=loss, f_scale=f_scale, max_nfev=max_nfev,
-                    model="symmetric_double_ellipse", components=2, labels=labels,
-                    reference_axis=reference)
+    multistart_count = _validate_multistart_count(multistart)
+    starts = _multistart_parameter_sets(parameter_set, multistart_count)
+    candidates: list[tuple[int, EllipseFitResult, dict[str, Any]]] = []
+    for start_index, start in enumerate(starts):
+        result = _run_fit(
+            points,
+            start,
+            objective,
+            loss=loss,
+            f_scale=f_scale,
+            max_nfev=max_nfev,
+            model="symmetric_double_ellipse",
+            components=2,
+            labels=labels,
+            reference_axis=reference,
+            residual=residual,
+        )
+        candidates.append((start_index, result, _candidate_solution_record(start_index, start, result)))
+    # Prefer a solver-reported success, then finite cost, then the smallest
+    # cost.  The final index tie-break is explicit for reproducibility.
+    selected_index, selected, _ = min(
+        candidates,
+        key=lambda item: (
+            not bool(item[1].success),
+            not bool(np.isfinite(item[1].cost)),
+            float(item[1].cost) if np.isfinite(item[1].cost) else float("inf"),
+            item[0],
+        ),
+    )
+    records = tuple(item[2] for item in candidates)
+    return EllipseFitResult(
+        **{
+            field_name: getattr(selected, field_name)
+            for field_name in EllipseFitResult.__dataclass_fields__
+            if field_name not in {"candidate_solutions", "selected_start_index", "multistart_count"}
+        },
+        candidate_solutions=records,
+        selected_start_index=int(selected_index),
+        multistart_count=multistart_count,
+    )
 
 
 fit_double_ellipse = fit_symmetric_ellipses

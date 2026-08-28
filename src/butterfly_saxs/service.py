@@ -909,6 +909,21 @@ def _public_ridges(observables: Any) -> list[dict[str, Any]]:
                 "snr": _as_public_scalar(_read(point, ("snr",), None)),
                 "method": str(_read(point, ("method",), "observed")),
                 "coverage": _as_public_scalar(_read(point, ("coverage",), None)),
+                "score": _as_public_scalar(_read(point, ("score", "point_score"), None)),
+                "continuity_score": _as_public_scalar(_read(point, ("continuity_score",), None)),
+                "trajectory_id": _read(point, ("trajectory_id",), None),
+                "branch_id": _read(point, ("branch_id", "component"), None),
+                "radial_fwhm": _as_public_scalar(_read(point, ("radial_fwhm",), None)),
+                "azimuthal_fwhm": _as_public_scalar(_read(point, ("azimuthal_fwhm",), None)),
+                "local_q_step": _as_public_scalar(_read(point, ("local_q_step",), None)),
+                "q_normal_step": _as_public_scalar(_read(point, ("q_normal_step",), None)),
+                "q_scale_anisotropy": _as_public_scalar(
+                    _read(point, ("q_scale_anisotropy",), None)
+                ),
+                "pixel_x": _as_public_scalar(_read(point, ("pixel_x",), None)),
+                "pixel_y": _as_public_scalar(_read(point, ("pixel_y",), None)),
+                "n_pixels": _read(point, ("n_pixels",), None),
+                "flags": list(_read(point, ("flags",), ())),
                 "valid": valid,
                 "accepted": accepted,
                 "reason": str(_read(point, ("reason",), "accepted" if accepted else "rejected")),
@@ -955,7 +970,23 @@ def _public_ellipse(ellipse: Any) -> dict[str, Any] | None:
     if theta is None:
         raw_theta = _read(ellipse, ("theta",), None)
         theta = float(np.degrees(float(raw_theta))) if raw_theta is not None else None
+    success = bool(_read(ellipse, ("success",), False))
+    quality = _read(ellipse, ("quality",), {}) or {}
+    quality_status = str(_read(quality, ("status", "engineering_status"), "") or "").upper()
+    solver_status = "ok" if success else "failed"
+    branch_assignment = _read(
+        ellipse, ("branch_assignment", "branch_assignments"), []
+    )
+    residual_values = _read(ellipse, ("residuals",), [])
+    if branch_assignment is None:
+        branch_assignment = []
+    if residual_values is None:
+        residual_values = []
     result = {
+        "status": solver_status,
+        "solver_status": solver_status,
+        "quality_status": quality_status or None,
+        "quality": _json_safe(quality),
         "a": _as_public_scalar(_read(ellipse, ("a",), None)),
         "b": _as_public_scalar(_read(ellipse, ("b",), None)),
         "q_unit": str(_read(ellipse, ("q_unit",), "unknown") or "unknown"),
@@ -972,10 +1003,25 @@ def _public_ellipse(ellipse: Any) -> dict[str, Any] | None:
         "rmse": _as_public_scalar(_read(ellipse, ("rmse", "residual_rms"), None)),
         "rss": _as_public_scalar(_read(ellipse, ("rss",), None)),
         "n_points": _read(ellipse, ("n_points", "n_data"), None),
-        "success": bool(_read(ellipse, ("success",), False)),
+        "success": success,
         "flags": list(_read(ellipse, ("flags",), ())),
         "ellipses": public_members,
         "parameter_values": _json_safe(values),
+        "stderr": _json_safe(_read(ellipse, ("stderr",), {}) or {}),
+        "condition": _as_public_scalar(
+            _read(ellipse, ("condition_number", "condition"), None)
+        ),
+        "coverage": _json_safe(_read(ellipse, ("coverage",), {}) or {}),
+        "bound_flags": _json_safe(_read(ellipse, ("bound_flags",), {}) or {}),
+        "bound_status": _json_safe(_read(ellipse, ("bound_status",), {}) or {}),
+        "branch_counts": _json_safe(_read(ellipse, ("branch_counts",), (0, 0))),
+        "branch_assignment": _json_safe(branch_assignment),
+        "residuals": _json_safe(residual_values),
+        "candidate_solutions": _json_safe(
+            _read(ellipse, ("candidate_solutions",), ()) or ()
+        ),
+        "selected_start_index": int(_read(ellipse, ("selected_start_index",), 0) or 0),
+        "multistart_count": int(_read(ellipse, ("multistart_count",), 1) or 1),
     }
     return _json_safe(result)
 
@@ -1318,6 +1364,7 @@ class ButterflyAnalysisService:
                 curvature_sigma=settings["curvature_sigma"],
                 curvature_percentile=settings["curvature_percentile"],
                 curvature_normal_step=settings["normal_step"],
+                p4_quality_thresholds=merged.get("p4_quality_thresholds"),
             )
         except Exception as exc:
             flags.append(f"observables_failed:{type(exc).__name__}")

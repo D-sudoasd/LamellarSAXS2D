@@ -147,6 +147,7 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
             "frame5.tif",
             "frame6.tif",
             "frame7.tif",
+            "frame8.tif",
         ],
     )
     calls: list[tuple[str, object]] = []
@@ -181,12 +182,22 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
                 "metrics": {"flags": ["analysis_validation_failed:q window"]},
                 "parameters": {"value": 6},
             }
-        return {"parameters": {"value": 7}}
+        if name == "frame7.tif":
+            return {
+                "ellipse_fit": {
+                    "status": "ok",
+                    "success": True,
+                    "quality_status": "FAIL",
+                },
+                "parameters": {"value": 7},
+            }
+        return {"parameters": {"value": 8}}
 
     run = run_batch(paths, analyze, mode="warm_start")
 
     assert [item.status for item in run] == [
         "ok",
+        "failed",
         "failed",
         "failed",
         "failed",
@@ -202,13 +213,15 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
         1,
         1,
         1,
+        1,
     ]
     assert "metrics.success=False" in (run[1].error or "")
     assert "ellipse_fit.status=insufficient_data" in (run[2].error or "")
     assert "full2d.status=insufficient_data" in (run[3].error or "")
     assert "intensity_fit_failed:RuntimeError" in (run[4].error or "")
     assert "analysis_validation_failed:q window" in (run[5].error or "")
-    assert run[6].warm_start_from == FrameRef(paths[0]).key
+    assert "ellipse_fit.quality_status=FAIL" in (run[6].error or "")
+    assert run[7].warm_start_from == FrameRef(paths[0]).key
 
 
 def test_frame_ref_key_uses_canonical_path_frame_and_dataset_identity(tmp_path: Path) -> None:

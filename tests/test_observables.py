@@ -14,6 +14,9 @@ from butterfly_saxs.observables import (
     measure_four_lobe_peaks,
     measure_observables,
     measure_radial_ridges,
+    RidgeTrack,
+    _annotate_ridge_continuity,
+    _write_fit_branch_ids,
 )
 from butterfly_saxs.synthetic import SyntheticFrame, SyntheticQMap, make_butterfly_sequence
 
@@ -197,6 +200,43 @@ def test_wraparound_lobe_area_uses_periodic_coordinates() -> None:
     assert 0.1 < peak.area < 2.0
 
 
+def test_symmetric_lobe_refinement_recovers_coarse_four_lobe_angle() -> None:
+    angle = np.linspace(-np.pi, np.pi, 90, endpoint=False)
+    phi = np.deg2rad(23.4)
+    sigma = np.deg2rad(6.0)
+    centres = np.asarray((phi, -phi, np.pi + phi, np.pi - phi))
+    centres = np.angle(np.exp(1j * centres))
+    intensity = np.full(angle.size, 0.2)
+    for index, centre in enumerate(centres):
+        distance = np.angle(np.exp(1j * (angle - centre)))
+        intensity += (4.0 + 0.3 * index) * np.exp(-0.5 * (distance / sigma) ** 2)
+    intensity += 0.03 * np.sin(7.0 * angle)
+    spectrum = AngularSpectrum(
+        angle=angle,
+        intensity=intensity,
+        counts=np.full(angle.size, 20, dtype=int),
+        candidate_counts=np.full(angle.size, 20, dtype=int),
+        coverage=np.ones(angle.size),
+        q_min=0.2,
+        q_max=1.0,
+        q_center=0.6,
+    )
+
+    lobes = measure_four_lobe_peaks(
+        spectrum,
+        min_prominence=0.2,
+        snr_threshold=0.5,
+        symmetric_refine=True,
+    )
+
+    assert len(lobes) == 4
+    assert all(lobe.valid for lobe in lobes)
+    assert all(lobe.refinement == "symmetric_cauchy" for lobe in lobes)
+    for expected in centres:
+        error = min(abs(np.angle(np.exp(1j * (lobe.angle - expected)))) for lobe in lobes)
+        assert np.degrees(error) < 1.0
+
+
 def test_low_snr_sector_stays_invalid_instead_of_being_mirrored():
     y, x = np.mgrid[-32:32, -32:32]
     q = np.hypot(x, y) / 32.0
@@ -275,6 +315,45 @@ def test_surface_curvature_respects_qmap_valid_mask_and_rejects_plane():
     )
     assert np.count_nonzero(track.valid) == 0
     assert np.nanmin(track.coverage) < 1.0
+
+
+def test_surface_curvature_reports_pixel_to_q_scale_without_changing_pixel_track():
+    axis = np.linspace(-1.0, 1.0, 97)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    image = np.exp(-0.5 * ((q - 0.58) / 0.025) ** 2)
+    angles = np.linspace(-np.pi, np.pi, 24, endpoint=False)
+
+    base = measure_radial_ridges(
+        SyntheticFrame(image, None),
+        SyntheticQMap(qx, qy),
+        (0.35, 0.8),
+        angles=angles,
+        ridge_method="surface_curvature",
+        curvature_sigma=1.5,
+        snr_threshold=1.0,
+    )
+    scaled = measure_radial_ridges(
+        SyntheticFrame(image, None),
+        SyntheticQMap(2.0 * qx, 2.0 * qy),
+        (0.70, 1.6),
+        angles=angles,
+        ridge_method="surface_curvature",
+        curvature_sigma=1.5,
+        snr_threshold=1.0,
+    )
+
+    paired = [
+        (left, right)
+        for left, right in zip(base.points, scaled.points)
+        if left.valid and right.valid
+    ]
+    assert len(paired) >= 16
+    for left, right in paired:
+        assert right.pixel_x == pytest.approx(left.pixel_x, abs=1e-8)
+        assert right.pixel_y == pytest.approx(left.pixel_y, abs=1e-8)
+        assert right.q_normal_step == pytest.approx(2.0 * left.q_normal_step, rel=1e-6)
+        assert np.isfinite(left.q_scale_anisotropy)
 
 
 def test_ridge_point_spacing_requires_an_explicit_physical_q_unit():
@@ -369,3 +448,95 @@ def test_physical_spacing_is_not_reported_for_a_shifted_q_ellipse():
     assert np.isnan(fit.Ln_from_minor_axis_nm)
     assert np.isnan(fit.Lz_from_draw_axis_nm)
     assert "spacing_unavailable_nonzero_center" in fit.flags
+
+
+def test_ridge_point_exposes_quality_continuity_and_identity_contract():
+    point = RidgePoint(
+        angle=0.0,
+        q=0.5,
+        q_unit="nm^-1",
+        score=3.5,
+        continuity_score=1.0,
+        trajectory_id=2,
+        branch_id=1,
+        local_q_step=0.01,
+    )
+    values = point.as_dict()
+    assert values["score"] == pytest.approx(3.5)
+    assert values["point_score"] == pytest.approx(3.5)
+    assert values["continuity_score"] == pytest.approx(1.0)
+    assert values["trajectory_id"] == 2
+    assert values["branch_id"] == 1
+    assert values["local_q_step"] == pytest.approx(0.01)
+
+
+def test_ridge_continuity_marks_jump_without_inventing_points():
+    angles = np.linspace(-np.pi, np.pi, 8, endpoint=False)
+    q_values = [0.50, 0.51, 0.52, 0.53, 1.20, 0.55, 0.56, 0.57]
+    points = [RidgePoint(float(angle), float(q), valid=True) for angle, q in zip(angles, q_values)]
+    valid_fraction, continuity_fraction, continuity_score, flags = _annotate_ridge_continuity(points, angles)
+    assert len(points) == 8
+    assert valid_fraction == pytest.approx(1.0)
+    assert continuity_fraction < 1.0
+    assert continuity_score < 1.0
+    assert "continuity_jump" in flags
+    assert any("continuity_jump" in point.flags for point in points)
+    assert len({point.trajectory_id for point in points}) >= 2
+
+
+def test_radial_continuity_keeps_ring_and_rejects_isolated_peak() -> None:
+    axis = np.linspace(-1.0, 1.0, 129)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    angle = np.arctan2(qy, qx)
+    ring = 4.0 * np.exp(-0.5 * ((q - 0.58) / 0.018) ** 2)
+    isolated = 20.0 * (
+        (np.abs(q - 0.78) < 0.012)
+        & (np.abs(np.angle(np.exp(1j * angle))) < np.deg2rad(1.0))
+    )
+
+    track = measure_radial_ridges(
+        SyntheticFrame(0.05 + ring + isolated, None),
+        SyntheticQMap(qx, qy),
+        (0.35, 0.9),
+        n_angles=36,
+        n_bins=96,
+    )
+    valid_q = track.q[track.valid]
+    assert valid_q.size >= 30
+    assert np.nanmedian(np.abs(valid_q - 0.58)) < 0.015
+    assert np.nanmax(valid_q) < 0.7
+    assert "radial_continuity_tracking" in track.flags
+
+    sparse = measure_radial_ridges(
+        SyntheticFrame(0.05 + isolated, None),
+        SyntheticQMap(qx, qy),
+        (0.35, 0.9),
+        n_angles=36,
+        n_bins=96,
+    )
+    assert np.count_nonzero(sparse.valid) == 0
+    assert all(point.reason != "accepted" for point in sparse.points)
+
+
+def test_fit_branch_assignment_is_written_to_valid_measured_points_only():
+    points = [
+        RidgePoint(0.0, 0.5, valid=True),
+        RidgePoint(np.pi / 2.0, float("nan"), valid=False),
+        RidgePoint(np.pi, 0.6, valid=True),
+    ]
+    track = RidgeTrack(
+        points=points,
+        angles=np.array([0.0, np.pi / 2.0, np.pi]),
+        q=np.array([0.5, np.nan, 0.6]),
+        valid=np.array([True, False, True]),
+        coverage=np.ones(3),
+    )
+
+    class Fit:
+        branch_assignment = np.array([1, 0])
+
+    _write_fit_branch_ids(track, Fit())
+    assert points[0].branch_id == 1
+    assert points[1].branch_id is None
+    assert points[2].branch_id == 0

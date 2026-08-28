@@ -23,12 +23,15 @@ import numpy as np
 
 try:  # scipy is a declared project dependency, but keep imports friendly.
     from scipy.ndimage import gaussian_filter, gaussian_filter1d, map_coordinates
-    from scipy.signal import find_peaks
+    from scipy.optimize import least_squares
+    from scipy.signal import find_peaks, peak_prominences
 except Exception:  # pragma: no cover - exercised only in a partial install
     gaussian_filter = None
     gaussian_filter1d = None
+    least_squares = None
     map_coordinates = None
     find_peaks = None
+    peak_prominences = None
 
 try:
     # The shared model makes a measured ridge point consumable by
@@ -139,6 +142,8 @@ class LobeMetrics(_MappingResult):
     n_pixels: int
     valid: bool = True
     flags: tuple[str, ...] = APPARENT_FLAGS
+    reason: str = "accepted"
+    refinement: str = "quadratic"
 
     @property
     def azimuth(self) -> float:
@@ -215,6 +220,13 @@ class RidgePoint(_MappingResult, _SharedRidgePoint):
         accepted: bool | None = None,
         reason: str = "",
         q_unit: str = "unknown",
+        score: float = float("nan"),
+        continuity_score: float = float("nan"),
+        trajectory_id: int | None = None,
+        branch_id: int | None = None,
+        local_q_step: float = float("nan"),
+        q_normal_step: float = float("nan"),
+        q_scale_anisotropy: float = float("nan"),
     ) -> None:
         q = float(q)
         angle = float(angle)
@@ -269,6 +281,13 @@ class RidgePoint(_MappingResult, _SharedRidgePoint):
         self.accepted = bool(valid if accepted is None else accepted)
         self.reason = str(reason or ("accepted" if self.accepted else "rejected"))
         self.q_unit = q_unit
+        self.score = float(score)
+        self.continuity_score = float(continuity_score)
+        self.trajectory_id = None if trajectory_id is None else int(trajectory_id)
+        self.branch_id = None if branch_id is None else int(branch_id)
+        self.local_q_step = float(local_q_step)
+        self.q_normal_step = float(q_normal_step)
+        self.q_scale_anisotropy = float(q_scale_anisotropy)
         self.flags = _flags_with_q_unit(self.flags, q_unit)
         self.metadata.update(
             flags=self.flags,
@@ -280,6 +299,13 @@ class RidgePoint(_MappingResult, _SharedRidgePoint):
             accepted=self.accepted,
             reason=self.reason,
             q_unit=self.q_unit,
+            score=self.score,
+            continuity_score=self.continuity_score,
+            trajectory_id=self.trajectory_id,
+            branch_id=self.branch_id,
+            local_q_step=self.local_q_step,
+            q_normal_step=self.q_normal_step,
+            q_scale_anisotropy=self.q_scale_anisotropy,
         )
 
     def keys(self) -> tuple[str, ...]:
@@ -288,7 +314,15 @@ class RidgePoint(_MappingResult, _SharedRidgePoint):
             "radial_fwhm", "azimuthal_fwhm", "area", "coverage", "n_pixels", "valid", "source", "flags",
             "qx", "qy", "method", "curvature", "normal_slope", "support",
             "pixel_y", "pixel_x", "accepted", "reason", "q_unit", "q_star_Ainv", "q_star_nm_inv", "Ln", "Ln_nm",
+            "score", "point_score", "continuity_score", "trajectory_id", "branch_id", "local_q_step",
+            "q_normal_step", "q_scale_anisotropy",
         )
+
+    @property
+    def point_score(self) -> float:
+        """Explicit alias for the point-level quality score."""
+
+        return self.score
 
     @property
     def q_star_Ainv(self) -> float:
@@ -335,6 +369,9 @@ class RidgeTrack(_MappingResult):
     coverage: np.ndarray
     flags: tuple[str, ...] = APPARENT_FLAGS
     q_unit: str = "unknown"
+    valid_fraction: float = float("nan")
+    continuity_fraction: float = float("nan")
+    continuity_score: float = float("nan")
 
     @property
     def observed_points(self) -> list[RidgePoint]:
@@ -414,6 +451,11 @@ class DoubleEllipseFit(_MappingResult):
     q_unit: str = "unknown"
     Ln_from_minor_axis_nm: float = float("nan")
     Lz_from_draw_axis_nm: float = float("nan")
+    branch_assignment: np.ndarray | None = None
+    candidate_solutions: tuple[dict[str, Any], ...] = ()
+    selected_start_index: int = 0
+    multistart_count: int = 1
+    quality: dict[str, Any] = field(default_factory=dict)
 
     @property
     def theta_deg(self) -> float:
@@ -831,6 +873,107 @@ def _linear_fwhm(x: np.ndarray, y: np.ndarray, index: int, baseline: float) -> f
     return max(0.0, right_x - left_x)
 
 
+def _refine_symmetric_lobes(
+    spectrum: AngularSpectrum | Mapping[str, Any],
+    lobes: Sequence[LobeMetrics],
+) -> list[LobeMetrics]:
+    """Refine observed candidates with one robust four-envelope angle model.
+
+    The fit estimates a common apparent lobe angle and width from the finite,
+    actually observed angular bins.  It never inserts a missing lobe: each
+    returned record still corresponds to one detected candidate and retains
+    that candidate's coverage and pixel count.
+    """
+
+    if least_squares is None or len(lobes) < 2:
+        return list(lobes)
+    angle = np.asarray(_get_field(spectrum, ("angle", "azimuth")), dtype=float)
+    intensity = np.asarray(_get_field(spectrum, ("intensity", "profile")), dtype=float)
+    counts = np.asarray(_get_field(spectrum, ("counts",)), dtype=float)
+    coverage = np.asarray(_get_field(spectrum, ("coverage",)), dtype=float)
+    finite = np.isfinite(angle) & np.isfinite(intensity) & (counts > 0)
+    if np.count_nonzero(finite) < 12:
+        return list(lobes)
+
+    x = angle[finite]
+    y = intensity[finite]
+    weights = np.clip(coverage[finite], 0.0, 1.0)
+    baseline = float(np.percentile(y, 10.0))
+    amplitude = max(float(np.percentile(y, 99.0) - baseline), np.finfo(float).eps)
+    scale = max(float(np.std(y)), np.finfo(float).eps)
+    acute = [abs((float(lobe.angle) + np.pi / 2.0) % np.pi - np.pi / 2.0) for lobe in lobes]
+    phi0 = float(np.clip(np.median(acute), 0.0, np.pi / 2.0))
+
+    def model(candidate: np.ndarray) -> np.ndarray:
+        offset, amplitude_plus, amplitude_minus, phi, sigma = candidate
+
+        def envelope(centre: float) -> np.ndarray:
+            delta = np.angle(np.exp(1j * (x - centre)))
+            return np.exp(-0.5 * (delta / sigma) ** 2)
+
+        return (
+            offset
+            + amplitude_plus * (envelope(phi) + envelope(np.pi + phi))
+            + amplitude_minus * (envelope(-phi) + envelope(np.pi - phi))
+        )
+
+    lower = np.asarray(
+        [float(np.min(y) - amplitude), 0.0, 0.0, 0.0, np.deg2rad(1.0)],
+        dtype=float,
+    )
+    upper = np.asarray(
+        [float(np.max(y)), 10.0 * amplitude, 10.0 * amplitude, np.pi / 2.0, np.deg2rad(40.0)],
+        dtype=float,
+    )
+    initial = np.asarray(
+        [baseline, amplitude, amplitude, phi0, np.deg2rad(10.0)],
+        dtype=float,
+    )
+    try:
+        fit = least_squares(
+            lambda candidate: (model(candidate) - y) * weights / scale,
+            initial,
+            bounds=(lower, upper),
+            loss="cauchy",
+            f_scale=0.5,
+            max_nfev=500,
+        )
+    except (FloatingPointError, ValueError):
+        return list(lobes)
+    if not fit.success or not np.all(np.isfinite(fit.x)):
+        return list(lobes)
+
+    phi = float(fit.x[3])
+    sigma = float(fit.x[4])
+    centres = np.asarray((phi, -phi, np.pi + phi, np.pi - phi), dtype=float)
+    centres = np.angle(np.exp(1j * centres))
+    assignments: dict[int, list[LobeMetrics]] = {}
+    for lobe in lobes:
+        index = int(np.argmin(_wrap_distance(centres, lobe.angle)))
+        assignments.setdefault(index, []).append(lobe)
+
+    overlap = bool(2.0 * phi <= 2.0 * np.sqrt(2.0 * np.log(2.0)) * sigma)
+    refined: list[LobeMetrics] = []
+    for centre_index, candidates in assignments.items():
+        candidates = sorted(candidates, key=lambda item: (item.valid, item.snr), reverse=True)
+        for rank, lobe in enumerate(candidates):
+            lobe.angle = float(centres[centre_index])
+            lobe.fwhm = float(2.0 * np.sqrt(2.0 * np.log(2.0)) * sigma)
+            lobe.refinement = "symmetric_cauchy"
+            if rank > 0:
+                lobe.valid = False
+                lobe.reason = "duplicate_symmetric_lobe_candidate"
+                lobe.flags = tuple(dict.fromkeys(lobe.flags + (lobe.reason,)))
+            elif overlap:
+                lobe.valid = False
+                lobe.reason = "overlapping_lobes_unresolved"
+                lobe.flags = tuple(dict.fromkeys(lobe.flags + (lobe.reason,)))
+            elif lobe.valid:
+                lobe.reason = "accepted"
+            refined.append(lobe)
+    return sorted(refined, key=lambda item: item.angle)
+
+
 def measure_four_lobe_peaks(
     spectrum: AngularSpectrum | Mapping[str, Any],
     *,
@@ -838,6 +981,7 @@ def measure_four_lobe_peaks(
     min_prominence: float | None = None,
     snr_threshold: float = 2.0,
     min_distance_fraction: float = 0.12,
+    symmetric_refine: bool = False,
 ) -> list[LobeMetrics]:
     """Find up to four angular lobes without completing missing quadrants."""
 
@@ -892,6 +1036,7 @@ def measure_four_lobe_peaks(
             )
         else:
             area = 0.0
+        is_valid = bool(np.isfinite(snr) and snr >= snr_threshold)
         out.append(
             LobeMetrics(
                 angle=float(peak_angle),
@@ -903,10 +1048,12 @@ def measure_four_lobe_peaks(
                 index=index,
                 coverage=float(coverage[index]) if index < len(coverage) else 0.0,
                 n_pixels=int(counts[index]) if index < len(counts) else 0,
-                valid=bool(np.isfinite(snr) and snr >= snr_threshold),
+                valid=is_valid,
+                reason="accepted" if is_valid else "low_snr",
             )
         )
-    return sorted(out, key=lambda item: item.angle)
+    out = sorted(out, key=lambda item: item.angle)
+    return _refine_symmetric_lobes(spectrum, out) if symmetric_refine and int(expected) == 4 else out
 
 
 find_four_lobe_peaks = measure_four_lobe_peaks
@@ -996,6 +1143,9 @@ def _radial_peak(profile: RadialProfile, snr_threshold: float = 2.0) -> RidgePoi
     y = np.asarray(profile.intensity, dtype=float)
     finite = np.isfinite(y) & (np.asarray(profile.counts) > 0)
     if np.count_nonzero(finite) < 3:
+        reason = "no_radial_candidate" if not np.any(finite) else "low_coverage"
+        flags = list(_flags_with_q_unit(APPARENT_FLAGS, profile.q_unit))
+        flags.append(reason)
         return RidgePoint(
             angle=profile.angle,
             q=float("nan"),
@@ -1010,7 +1160,9 @@ def _radial_peak(profile: RadialProfile, snr_threshold: float = 2.0) -> RidgePoi
             coverage=float(np.nanmean(profile.coverage)) if profile.coverage.size else 0.0,
             n_pixels=int(np.sum(profile.counts)),
             valid=False,
-            flags=APPARENT_FLAGS + ("low_coverage",),
+            flags=tuple(flags),
+            score=0.0,
+            reason=reason,
             q_unit=profile.q_unit,
         )
     baseline = float(np.nanpercentile(y[finite], 10.0))
@@ -1030,8 +1182,10 @@ def _radial_peak(profile: RadialProfile, snr_threshold: float = 2.0) -> RidgePoi
     valid = bool(np.isfinite(snr) and snr >= snr_threshold and np.isfinite(peak_q))
     if not valid:
         flags.append("low_snr")
+    reason = "accepted" if valid else "low_snr"
     coverage = float(np.sum(profile.counts) / max(1, np.sum(profile.candidate_counts)))
     q_star = float(peak_q)
+    score = float(max(0.0, snr) * max(0.0, min(1.0, coverage))) if np.isfinite(snr) else 0.0
     return RidgePoint(
         angle=profile.angle,
         q=q_star,
@@ -1047,8 +1201,212 @@ def _radial_peak(profile: RadialProfile, snr_threshold: float = 2.0) -> RidgePoi
         n_pixels=int(np.sum(profile.counts)),
         valid=valid,
         flags=tuple(flags),
+        score=score,
+        reason=reason,
         q_unit=profile.q_unit,
     )
+
+
+def _radial_noise_floor(
+    frame: Any,
+    qmap: Any,
+    q_window: Any,
+    *,
+    q_range: Any = None,
+    mask: Any = None,
+) -> float:
+    """Estimate one detector-domain noise scale for continuity candidates."""
+
+    values, q, _angle, valid = _extract_maps(frame, qmap, mask)
+    q_min, q_max = _q_limits(q, q_window, q_range)
+    selected = valid & np.isfinite(values) & (q >= q_min) & (q <= q_max)
+    observed = values[selected]
+    if observed.size < 8:
+        return float("nan")
+    median = float(np.median(observed))
+    noise = float(np.percentile(observed, 84.0) - median)
+    if not np.isfinite(noise) or noise <= np.finfo(float).eps:
+        scale = max(float(np.max(np.abs(observed))), 1.0)
+        noise = float(np.finfo(float).eps * scale)
+    return noise
+
+
+def _radial_peak_candidates(
+    profile: RadialProfile,
+    *,
+    noise_floor: float,
+    top_n: int = 6,
+    minimum_score: float = 1.75,
+) -> list[RidgePoint]:
+    """Return observed local radial peaks eligible for continuity tracking."""
+
+    if find_peaks is None or peak_prominences is None or gaussian_filter1d is None:
+        return []
+    q = np.asarray(profile.q, dtype=float)
+    y = np.asarray(profile.intensity, dtype=float)
+    counts = np.asarray(profile.counts)
+    finite = np.isfinite(y) & (counts > 0)
+    if np.count_nonzero(finite) < 3 or not np.isfinite(noise_floor) or noise_floor <= 0.0:
+        return []
+    fill = np.interp(q, q[finite], y[finite])
+    smooth = gaussian_filter1d(fill, 1.0, mode="nearest")
+    baseline = float(np.percentile(y[finite], 10.0))
+    peak_indices, _ = find_peaks(smooth, distance=4)
+    if peak_indices.size == 0:
+        return []
+    prominences = peak_prominences(smooth, peak_indices)[0]
+    order = np.argsort(prominences, kind="mergesort")[::-1][: int(top_n)]
+    coverage = float(np.sum(profile.counts) / max(1, np.sum(profile.candidate_counts)))
+    area = (
+        float(np.trapezoid(np.maximum(y[finite] - baseline, 0.0), q[finite]))
+        if np.count_nonzero(finite) > 1
+        else 0.0
+    )
+    candidates: list[RidgePoint] = []
+    for position in order:
+        index = int(peak_indices[int(position)])
+        score = float(prominences[int(position)] / noise_floor)
+        if not np.isfinite(score) or score < float(minimum_score):
+            continue
+        peak_q, peak_intensity = _quadratic_peak(q, smooth, index)
+        fwhm = _linear_fwhm(q, smooth, index, baseline)
+        candidates.append(
+            RidgePoint(
+                angle=profile.angle,
+                q=peak_q,
+                q_star=peak_q,
+                intensity=peak_intensity,
+                baseline=baseline,
+                snr=score,
+                radial_fwhm=fwhm,
+                area=area,
+                coverage=coverage,
+                n_pixels=int(np.sum(profile.counts)),
+                valid=True,
+                flags=_flags_with_q_unit(
+                    APPARENT_FLAGS + ("radial_continuity_candidate",),
+                    profile.q_unit,
+                ),
+                score=score,
+                reason="accepted",
+                q_unit=profile.q_unit,
+            )
+        )
+    return candidates
+
+
+def _reject_ridge_point(point: RidgePoint, reason: str) -> RidgePoint:
+    point.valid = False
+    point.accepted = False
+    point.reason = str(reason)
+    point.flags = tuple(dict.fromkeys(point.flags + (point.reason,)))
+    point.metadata.update(
+        flags=point.flags,
+        accepted=False,
+        reason=point.reason,
+    )
+    return point
+
+
+def _continuous_radial_points(
+    profiles: Sequence[RadialProfile],
+    *,
+    noise_floor: float,
+    minimum_track_support: int = 3,
+) -> list[RidgePoint]:
+    """Select one point per angle from real multi-peak continuity tracks."""
+
+    candidates_by_sector = [
+        _radial_peak_candidates(profile, noise_floor=noise_floor)
+        for profile in profiles
+    ]
+    nodes: list[tuple[int, RidgePoint]] = [
+        (sector, point)
+        for sector, candidates in enumerate(candidates_by_sector)
+        for point in candidates
+    ]
+    if not nodes:
+        return [
+            _reject_ridge_point(_radial_peak(profile), "no_continuous_candidate")
+            for profile in profiles
+        ]
+
+    parent = list(range(len(nodes)))
+    lookup: dict[int, list[int]] = {}
+    for node_index, (sector, _point) in enumerate(nodes):
+        lookup.setdefault(sector, []).append(node_index)
+
+    def find(node_index: int) -> int:
+        while parent[node_index] != node_index:
+            parent[node_index] = parent[parent[node_index]]
+            node_index = parent[node_index]
+        return node_index
+
+    def union(left: int, right: int) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    n_sectors = len(profiles)
+    q_step = float(
+        np.median(
+            [
+                np.median(np.diff(profile.q))
+                for profile in profiles
+                if len(profile.q) > 1
+            ]
+        )
+    )
+    for sector in range(n_sectors):
+        for left in lookup.get(sector, []):
+            for right in lookup.get((sector + 1) % n_sectors, []):
+                left_point, right_point = nodes[left][1], nodes[right][1]
+                widths = [
+                    value
+                    for value in (left_point.radial_fwhm, right_point.radial_fwhm)
+                    if np.isfinite(value) and value > 0.0
+                ]
+                width_scale = max(widths) if widths else 0.0
+                maximum_jump = max(6.0 * q_step, 0.75 * width_scale)
+                if abs(left_point.q - right_point.q) <= maximum_jump:
+                    union(left, right)
+
+    components: dict[int, list[int]] = {}
+    for node_index in range(len(nodes)):
+        components.setdefault(find(node_index), []).append(node_index)
+    support = {
+        root: len({nodes[node_index][0] for node_index in component})
+        for root, component in components.items()
+    }
+
+    selected: list[RidgePoint] = []
+    for sector, profile in enumerate(profiles):
+        eligible = [
+            node_index
+            for node_index in lookup.get(sector, [])
+            if support.get(find(node_index), 0) >= int(minimum_track_support)
+        ]
+        if eligible:
+            chosen = max(
+                eligible,
+                key=lambda node_index: (
+                    support[find(node_index)],
+                    nodes[node_index][1].score,
+                    -nodes[node_index][1].q,
+                ),
+            )
+            selected.append(nodes[chosen][1])
+            continue
+        candidates = candidates_by_sector[sector]
+        if candidates:
+            selected.append(
+                _reject_ridge_point(candidates[0], "short_disconnected_track")
+            )
+        else:
+            selected.append(
+                _reject_ridge_point(_radial_peak(profile), "no_continuous_candidate")
+            )
+    return selected
 
 
 @dataclass
@@ -1071,6 +1429,8 @@ class _CurvatureField:
     normal_x: np.ndarray
     offset: np.ndarray
     support: np.ndarray
+    q_normal_step: np.ndarray
+    q_scale_anisotropy: np.ndarray
     baseline: float
     noise: float
     q_unit: str = "unknown"
@@ -1162,6 +1522,31 @@ def _surface_curvature_field(
     normal_y = np.cos(tangent_angle)
     normal_slope = grad_x * normal_x + grad_y * normal_y
 
+    # Derivatives above intentionally remain on the detector pixel grid.  The
+    # local q-map Jacobian below records how one pixel step maps into q space,
+    # so curvature results can be compared across detector geometry/scales
+    # without pretending that pixel curvature already has reciprocal units.
+    qx_grid = q * np.cos(angle)
+    qy_grid = q * np.sin(angle)
+    dqx_dy, dqx_dx = np.gradient(qx_grid)
+    dqy_dy, dqy_dx = np.gradient(qy_grid)
+    normal_qx = dqx_dx * normal_x + dqx_dy * normal_y
+    normal_qy = dqy_dx * normal_x + dqy_dy * normal_y
+    tangent_x = -normal_y
+    tangent_y = normal_x
+    tangent_qx = dqx_dx * tangent_x + dqx_dy * tangent_y
+    tangent_qy = dqy_dx * tangent_x + dqy_dy * tangent_y
+    q_normal_step = np.hypot(normal_qx, normal_qy)
+    q_tangent_step = np.hypot(tangent_qx, tangent_qy)
+    q_scale_min = np.minimum(q_normal_step, q_tangent_step)
+    q_scale_max = np.maximum(q_normal_step, q_tangent_step)
+    q_scale_anisotropy = np.divide(
+        q_scale_max,
+        q_scale_min,
+        out=np.full_like(q_scale_max, np.nan),
+        where=q_scale_min > np.finfo(float).eps,
+    )
+
     yy, xx = np.indices(image.shape, dtype=float)
     minus = map_coordinates(
         derivative_surface,
@@ -1222,8 +1607,8 @@ def _surface_curvature_field(
         smooth=derivative_surface,
         q=q,
         angle=angle,
-        qx=q * np.cos(angle),
-        qy=q * np.sin(angle),
+        qx=qx_grid,
+        qy=qy_grid,
         valid=valid,
         candidate_domain=candidate_domain,
         ridge_candidate=ridge_candidate,
@@ -1234,6 +1619,8 @@ def _surface_curvature_field(
         normal_x=normal_x,
         offset=offset,
         support=support,
+        q_normal_step=q_normal_step,
+        q_scale_anisotropy=q_scale_anisotropy,
         baseline=baseline,
         noise=noise,
         q_unit=_q_unit(qmap),
@@ -1254,6 +1641,8 @@ def _curvature_point_for_sector(
     coverage = float(np.count_nonzero(valid_pixels) / max(1, np.count_nonzero(candidate_pixels)))
     accepted = field.ridge_candidate & sector
     if not np.any(accepted):
+        reason = "low_coverage" if coverage < 0.5 else "no_curvature_candidate"
+        flags = list(APPARENT_FLAGS + ("detector_pixel_principal_curvature", reason))
         return RidgePoint(
             angle=float(requested_angle),
             q=float("nan"),
@@ -1262,10 +1651,11 @@ def _curvature_point_for_sector(
             coverage=coverage,
             n_pixels=int(np.count_nonzero(valid_pixels)),
             valid=False,
-            flags=APPARENT_FLAGS + ("detector_pixel_principal_curvature", "no_curvature_candidate"),
+            flags=tuple(flags),
             method="surface_curvature",
             accepted=False,
-            reason="no_curvature_candidate",
+            reason=reason,
+            score=0.0,
             q_unit=field.q_unit,
         )
 
@@ -1310,8 +1700,115 @@ def _curvature_point_for_sector(
         pixel_x=sub_x,
         accepted=is_valid,
         reason=reason,
+        score=float(max(0.0, field.score[py, px]) * max(0.0, min(1.0, coverage))) if np.isfinite(field.score[py, px]) else 0.0,
+        q_normal_step=float(field.q_normal_step[py, px]),
+        q_scale_anisotropy=float(field.q_scale_anisotropy[py, px]),
         q_unit=field.q_unit,
     )
+
+
+def _annotate_ridge_continuity(
+    points: Sequence[RidgePoint],
+    requested_angles: np.ndarray,
+) -> tuple[float, float, float, tuple[str, ...]]:
+    """Attach deterministic circular continuity diagnostics to real points.
+
+    This is intentionally a small diagnostic, not a multi-track tracker.  A
+    valid point is connected to the preceding valid angular sample; missing
+    sectors create a gap and an unusually large local q change creates a
+    jump.  No point is added or mirrored when either condition is observed.
+    """
+
+    n_points = len(points)
+    if n_points == 0:
+        return 0.0, float("nan"), float("nan"), tuple()
+    angles = np.asarray(requested_angles, dtype=float).ravel()
+    if angles.size != n_points:
+        raise ValueError("requested_angles must contain one value per ridge point")
+    valid = np.asarray([bool(point.valid) and np.isfinite(point.q) for point in points], dtype=bool)
+    order = np.argsort(np.mod(angles, 2.0 * np.pi), kind="mergesort")
+    sorted_angles = np.mod(angles[order], 2.0 * np.pi)
+    full_deltas = np.mod(np.roll(sorted_angles, -1) - sorted_angles, 2.0 * np.pi)
+    positive_deltas = full_deltas[full_deltas > 1e-12]
+    expected_step = float(np.median(positive_deltas)) if positive_deltas.size else float("nan")
+    valid_positions = [int(pos) for pos, index in enumerate(order) if valid[index]]
+    if not valid_positions:
+        for point in points:
+            point.continuity_score = 0.0
+            point.trajectory_id = None
+            point.local_q_step = float("nan")
+            if "no_valid_ridge" not in point.flags:
+                point.flags = tuple(point.flags) + ("no_valid_ridge",)
+                point.metadata["flags"] = point.flags
+        return 0.0, 0.0, 0.0, ("no_valid_ridge",)
+
+    q_valid = np.asarray([points[index].q for index in order if valid[index]], dtype=float)
+    q_scale = float(np.nanmedian(np.abs(q_valid))) if q_valid.size else 0.0
+    q_mad = float(np.nanmedian(np.abs(q_valid - np.nanmedian(q_valid)))) if q_valid.size else 0.0
+    jump_threshold = max(0.10 * q_scale, 6.0 * q_mad, 1e-12)
+    incoming: dict[int, tuple[float, bool, bool]] = {}
+    for offset, current_pos in enumerate(valid_positions):
+        if len(valid_positions) == 1:
+            incoming[current_pos] = (float("nan"), False, False)
+            continue
+        previous_pos = valid_positions[offset - 1]
+        previous_index = int(order[previous_pos])
+        current_index = int(order[current_pos])
+        angle_gap = float(np.mod(sorted_angles[current_pos] - sorted_angles[previous_pos], 2.0 * np.pi))
+        if current_pos <= previous_pos:
+            angle_gap = float(
+                np.mod(
+                    sorted_angles[current_pos] + 2.0 * np.pi - sorted_angles[previous_pos],
+                    2.0 * np.pi,
+                )
+            )
+        between_positions = (current_pos - previous_pos - 1) % n_points
+        if current_pos <= previous_pos:
+            between_positions = n_points - previous_pos - 1 + current_pos
+        missing = any(not valid[int(order[(previous_pos + step) % n_points])] for step in range(1, between_positions + 1))
+        local_q_step = float(abs(points[current_index].q - points[previous_index].q))
+        angle_gap_flag = bool(np.isfinite(expected_step) and angle_gap > 1.75 * expected_step)
+        jump_flag = bool(np.isfinite(local_q_step) and local_q_step > jump_threshold)
+        incoming[current_pos] = (local_q_step, bool(missing or angle_gap_flag), jump_flag)
+
+    trajectory_id = 0
+    for offset, current_pos in enumerate(valid_positions):
+        index = int(order[current_pos])
+        local_q_step, gap_flag, jump_flag = incoming[current_pos]
+        point = points[index]
+        point.local_q_step = local_q_step
+        point.continuity_score = 0.0 if gap_flag or jump_flag else 1.0
+        point.trajectory_id = trajectory_id
+        extra_flags = []
+        if gap_flag:
+            extra_flags.append("continuity_gap")
+        if jump_flag:
+            extra_flags.append("continuity_jump")
+        if extra_flags:
+            point.flags = tuple(dict.fromkeys(tuple(point.flags) + tuple(extra_flags)))
+            point.metadata["flags"] = point.flags
+        if offset > 0 and (gap_flag or jump_flag):
+            trajectory_id += 1
+            point.trajectory_id = trajectory_id
+    for index, point in enumerate(points):
+        if not valid[index]:
+            point.continuity_score = 0.0
+            point.trajectory_id = None
+            point.local_q_step = float("nan")
+
+    valid_count = int(np.count_nonzero(valid))
+    continuity_values = np.asarray(
+        [points[int(order[pos])].continuity_score for pos in valid_positions],
+        dtype=float,
+    )
+    continuity_fraction = float(np.mean(continuity_values > 0.0))
+    continuity_score = float(np.mean(continuity_values))
+    diagnostics = []
+    if any("continuity_gap" in point.flags for point in points):
+        diagnostics.append("continuity_gap")
+    if any("continuity_jump" in point.flags for point in points):
+        diagnostics.append("continuity_jump")
+    return float(valid_count / n_points), continuity_fraction, continuity_score, tuple(diagnostics)
 
 
 def measure_radial_ridges(
@@ -1344,6 +1841,7 @@ def measure_radial_ridges(
     if ridge_method not in {"radial_peak", "surface_curvature", "curvature"}:
         raise ValueError("ridge_method must be 'radial_peak' or 'surface_curvature'")
     curvature_mode = ridge_method in {"surface_curvature", "curvature"}
+    automatic_angles = angles is None
     if angles is None:
         # Lobe locations are annotations, not a substitute for a densely
         # sampled trajectory.  A four-point-only track cannot constrain the
@@ -1351,6 +1849,12 @@ def measure_radial_ridges(
         angles = np.linspace(-np.pi, np.pi, int(n_angles), endpoint=False).tolist()
     angle_array = np.asarray(angles, dtype=float).ravel()
     q_unit = _q_unit(qmap)
+    continuity_mode = bool(
+        not curvature_mode
+        and automatic_angles
+        and len(angle_array) >= 12
+        and _q_to_nm_inverse_scale(q_unit) is not None
+    )
     if not angle_array.size:
         return RidgeTrack(
             points=[],
@@ -1374,18 +1878,10 @@ def measure_radial_ridges(
             curvature_percentile=curvature_percentile,
             normal_step=curvature_normal_step,
         )
-    points: list[RidgePoint] = []
-    for angle in angle_array:
-        if curvature_mode:
-            assert curvature_field is not None
-            point = _curvature_point_for_sector(
-                curvature_field,
-                float(angle),
-                float(sector_width),
-                float(snr_threshold),
-            )
-        else:
-            radial = measure_radial_profile(
+    points: list[RidgePoint]
+    if continuity_mode:
+        profiles = [
+            measure_radial_profile(
                 frame,
                 qmap,
                 float(angle),
@@ -1395,17 +1891,58 @@ def measure_radial_ridges(
                 sector_width=sector_width,
                 mask=mask,
             )
-            point = _radial_peak(radial, snr_threshold=snr_threshold)
-        if lobe_metrics:
+            for angle in angle_array
+        ]
+        noise_floor = _radial_noise_floor(
+            frame,
+            qmap,
+            q_window,
+            q_range=q_range,
+            mask=mask,
+        )
+        points = _continuous_radial_points(profiles, noise_floor=noise_floor)
+    else:
+        points = []
+        for angle in angle_array:
+            if curvature_mode:
+                assert curvature_field is not None
+                point = _curvature_point_for_sector(
+                    curvature_field,
+                    float(angle),
+                    float(sector_width),
+                    float(snr_threshold),
+                )
+            else:
+                radial = measure_radial_profile(
+                    frame,
+                    qmap,
+                    float(angle),
+                    q_window,
+                    q_range=q_range,
+                    n_bins=n_bins,
+                    sector_width=sector_width,
+                    mask=mask,
+                )
+                point = _radial_peak(radial, snr_threshold=snr_threshold)
+            points.append(point)
+
+    if lobe_metrics:
+        for angle, point in zip(angle_array, points):
             distances = [_wrap_distance(float(angle), lobe.angle) for lobe in lobe_metrics]
             nearest = int(np.argmin(distances))
             nearest_lobe = lobe_metrics[nearest]
             point.azimuthal_fwhm = float(nearest_lobe.fwhm)  # type: ignore[misc]
-        points.append(point)
     q_values = np.asarray([point.q for point in points], dtype=float)
     valid = np.asarray([point.valid for point in points], dtype=bool)
     coverage = np.asarray([point.coverage for point in points], dtype=float)
+    valid_fraction, continuity_fraction, continuity_score, continuity_flags = _annotate_ridge_continuity(
+        points,
+        angle_array,
+    )
     track_flags = APPARENT_FLAGS + (("detector_pixel_principal_curvature",) if curvature_mode else tuple())
+    if continuity_mode:
+        track_flags += ("radial_continuity_tracking",)
+    track_flags += continuity_flags
     track_flags = _flags_with_q_unit(track_flags, q_unit)
     return RidgeTrack(
         points=points,
@@ -1415,6 +1952,9 @@ def measure_radial_ridges(
         coverage=coverage,
         flags=track_flags,
         q_unit=q_unit,
+        valid_fraction=valid_fraction,
+        continuity_fraction=continuity_fraction,
+        continuity_score=continuity_score,
     )
 
 
@@ -1497,7 +2037,7 @@ def _ridge_components(points: Any) -> np.ndarray | None:
 
     source = _ridge_source(points)
     if isinstance(source, Mapping):
-        value = _get_field(source, ("component", "components", "labels", "branch"))
+        value = _get_field(source, ("component", "components", "labels", "branch", "branch_id"))
         if value is None:
             return None
         array = np.asarray(value)
@@ -1513,10 +2053,10 @@ def _ridge_components(points: Any) -> np.ndarray | None:
     values: list[Any] = []
     found = False
     for point in sequence:
-        component = _get_field(point, ("component", "branch", "label"))
+        component = _get_field(point, ("component", "branch", "label", "branch_id"))
         if component is None:
             metadata = _get_field(point, ("metadata",), {})
-            component = _get_field(metadata, ("component", "branch", "label"))
+            component = _get_field(metadata, ("component", "branch", "label", "branch_id"))
         if component is None:
             values.append(np.nan)
         else:
@@ -1706,6 +2246,7 @@ def fit_symmetric_double_ellipse(
     labels: Any = None,
     weights: Any = None,
     max_nfev: int | None = None,
+    multistart: int = 7,
     reference_axis_deg: float = 0.0,
     q_unit: str | None = None,
 ) -> DoubleEllipseFit:
@@ -1769,18 +2310,39 @@ def fit_symmetric_double_ellipse(
     canonical_parameters = _initial_to_canonical(source_parameters)
     if residual_kind is not None:
         residual = residual_kind
+    label_options = [inferred_labels]
+    if labels is None and inferred_labels is not None:
+        # Lobe-derived branch IDs are identities, not signed physical labels.
+        # Try the one allowed global swap so a negative generator/model theta
+        # is represented by the same canonical +|theta|/-|theta| pair.
+        label_options.append(1 - inferred_labels)
     try:
-        canonical_result = _fit_canonical_symmetric_ellipses(
-            xy,
-            parameters=canonical_parameters,
-            residual=residual,
-            loss=robust_loss,
-            f_scale=f_scale,
-            labels=inferred_labels,
-            weights=point_weights,
-            max_nfev=max_nfev,
-            config=config,
-            reference_axis_deg=reference_axis_deg,
+        labelled_results = [
+            (
+                option,
+                _fit_canonical_symmetric_ellipses(
+                    xy,
+                    parameters=canonical_parameters,
+                    residual=residual,
+                    loss=robust_loss,
+                    f_scale=f_scale,
+                    labels=option,
+                    weights=point_weights,
+                    max_nfev=max_nfev,
+                    multistart=multistart,
+                    config=config,
+                    reference_axis_deg=reference_axis_deg,
+                ),
+            )
+            for option in label_options
+        ]
+        inferred_labels, canonical_result = min(
+            labelled_results,
+            key=lambda item: (
+                not bool(item[1].success),
+                not bool(np.isfinite(item[1].cost)),
+                float(item[1].cost) if np.isfinite(item[1].cost) else float("inf"),
+            ),
         )
     except Exception as exc:
         # Invalid editable configurations should be visible to a caller, but
@@ -1917,7 +2479,67 @@ def fit_symmetric_double_ellipse(
         q_unit=unit,
         Ln_from_minor_axis_nm=Ln_minor,
         Lz_from_draw_axis_nm=Lz,
+        branch_assignment=getattr(canonical_result, "branch_assignment", None),
+        candidate_solutions=tuple(getattr(canonical_result, "candidate_solutions", ()) or ()),
+        selected_start_index=int(getattr(canonical_result, "selected_start_index", 0)),
+        multistart_count=int(getattr(canonical_result, "multistart_count", 1)),
     )
+
+
+def _write_fit_branch_ids(ridge: RidgeTrack, fit: Any) -> None:
+    """Copy an optional fit assignment onto the actual measured points."""
+
+    assignment = _get_field(fit, ("branch_assignment", "branch_assignments"), None)
+    if assignment is None:
+        return
+    if isinstance(assignment, Mapping):
+        assignment = _get_field(assignment, ("point_branch", "labels", "branch_id", "values"), None)
+    if assignment is None:
+        return
+    values = np.asarray(assignment).ravel()
+    valid_indices = np.flatnonzero(ridge.valid)
+    if values.size == len(ridge.points):
+        target_indices = np.arange(len(ridge.points), dtype=int)
+    elif values.size == valid_indices.size:
+        target_indices = valid_indices
+    else:
+        return
+    for index, value in zip(target_indices, values):
+        if value is None:
+            continue
+        try:
+            branch_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if branch_id not in (0, 1):
+            continue
+        point = ridge.points[int(index)]
+        point.branch_id = branch_id
+        point.metadata["branch_id"] = branch_id
+
+
+def _assign_symmetric_lobe_branches(
+    ridge: RidgeTrack,
+    lobes: Sequence[LobeMetrics],
+) -> None:
+    """Assign model branch identity from an observed symmetric lobe fit."""
+
+    refined = [lobe for lobe in lobes if lobe.refinement == "symmetric_cauchy"]
+    if len(refined) < 2:
+        return
+    acute = np.asarray(
+        [abs((float(lobe.angle) + np.pi / 2.0) % np.pi - np.pi / 2.0) for lobe in refined],
+        dtype=float,
+    )
+    phi = float(np.median(acute))
+    centres = np.angle(
+        np.exp(1j * np.asarray((phi, -phi, np.pi + phi, np.pi - phi), dtype=float))
+    )
+    branch_ids = (0, 1, 0, 1)
+    for point in ridge.points:
+        nearest = int(np.argmin(_wrap_distance(centres, point.angle)))
+        point.branch_id = int(branch_ids[nearest])
+        point.metadata["branch_id"] = point.branch_id
 
 
 fit_symmetric_ellipses = fit_symmetric_double_ellipse
@@ -1939,12 +2561,13 @@ def measure_observables(
     curvature_sigma: float = 2.0,
     curvature_percentile: float = 25.0,
     curvature_normal_step: float = 1.0,
+    p4_quality_thresholds: Mapping[str, Any] | None = None,
 ) -> ObservableSet:
     """Run the standard angular, lobe, ridge, and ellipse measurement chain."""
 
     q_unit = _q_unit(qmap)
     angular = measure_angular_spectrum(frame, qmap, q_window, n_bins=n_angular_bins, mask=mask)
-    lobes = measure_four_lobe_peaks(angular)
+    lobes = measure_four_lobe_peaks(angular, symmetric_refine=True)
     ridge = measure_radial_ridges(
         frame,
         qmap,
@@ -1958,6 +2581,7 @@ def measure_observables(
         curvature_percentile=curvature_percentile,
         curvature_normal_step=curvature_normal_step,
     )
+    _assign_symmetric_lobe_branches(ridge, lobes)
     ellipse = (
         fit_symmetric_double_ellipse(
             ridge,
@@ -1967,6 +2591,15 @@ def measure_observables(
         if fit_ellipse
         else None
     )
+    if ellipse is not None:
+        _write_fit_branch_ids(ridge, ellipse)
+        from .p4_quality import evaluate_p4_ellipse_quality
+
+        ellipse.quality = evaluate_p4_ellipse_quality(
+            ridge,
+            ellipse,
+            thresholds=p4_quality_thresholds,
+        )
     phi_app_deg, phi_app_std_deg = apparent_lamellar_tilt(lobes, draw_axis_deg=draw_axis_deg)
     return ObservableSet(
         angular=angular,

@@ -1029,6 +1029,7 @@ def measure_observables(
         curvature_sigma=options["curvature_sigma"],
         curvature_percentile=options["curvature_percentile"],
         curvature_normal_step=options["curvature_normal_step"],
+        p4_quality_thresholds=_config_value(config, "p4_quality_thresholds", None),
     )
     # Do not infer alpha/phi from the fitted ellipse rotation.  The papers'
     # microscopic tilts are not identifiable from this apparent trajectory.
@@ -1279,9 +1280,14 @@ def _public_ellipse_fit(
         )
     )
     success = bool(_ellipse_value(fit, "success", False))
-    status = _ellipse_value(fit, "status", None)
-    if status is None:
-        status = "ok" if success else "failed"
+    solver_status = _ellipse_value(fit, "status", None)
+    if solver_status is None:
+        solver_status = "ok" if success else "failed"
+    quality = _as_mapping(_ellipse_value(fit, "quality", None))
+    quality_status = str(
+        quality.get("status", quality.get("engineering_status", "")) or ""
+    ).upper()
+    status = str(solver_status)
     residuals = np.asarray(_ellipse_value(fit, "residuals", np.asarray([])), dtype=float)
     stderr = _ellipse_value(fit, "stderr", {}) or {}
     condition = _as_float(
@@ -1289,6 +1295,9 @@ def _public_ellipse_fit(
     )
     return {
         "status": str(status),
+        "solver_status": str(solver_status),
+        "quality_status": quality_status or None,
+        "quality": quality,
         "success": success,
         "message": str(_ellipse_value(fit, "message", "")),
         "n_points": int(_ellipse_value(fit, "n_points", coverage.get("n_points", n_points))),
@@ -1313,6 +1322,19 @@ def _public_ellipse_fit(
         "stderr": dict(stderr),
         "coverage": coverage,
         "condition": condition,
+        "bound_flags": _jsonable(_ellipse_value(fit, "bound_flags", {}) or {}),
+        "bound_status": _jsonable(_ellipse_value(fit, "bound_status", {}) or {}),
+        "branch_counts": _jsonable(_ellipse_value(fit, "branch_counts", (0, 0))),
+        "branch_assignment": _jsonable(
+            _ellipse_value(fit, "branch_assignment", np.asarray([]))
+        ),
+        "candidate_solutions": _jsonable(
+            _ellipse_value(fit, "candidate_solutions", ()) or ()
+        ),
+        "selected_start_index": int(
+            _ellipse_value(fit, "selected_start_index", 0) or 0
+        ),
+        "multistart_count": int(_ellipse_value(fit, "multistart_count", 1) or 1),
         "flags": public_flags,
     }
 

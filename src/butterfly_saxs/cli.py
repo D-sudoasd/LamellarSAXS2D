@@ -203,6 +203,26 @@ def build_parser() -> argparse.ArgumentParser:
     p3_parser.add_argument("--thresholds", required=True, help="阈值 JSON（draft 或 frozen）")
     p3_parser.add_argument("-o", "--output", help="可选门禁报告 JSON")
     p3_parser.add_argument("--force", action="store_true", help="允许覆盖已有门禁报告")
+
+    p4_parser = sub.add_parser(
+        "p4-evaluate", help="运行 P4 ridge/lobe/双椭圆工程证据（不冒充科学验收）"
+    )
+    p4_parser.add_argument("--t1-manifest", required=True, help="T1 truth_manifest.json")
+    p4_parser.add_argument("--t2-manifest", required=True, help="T2 truth_manifest.json")
+    p4_parser.add_argument("--thresholds", required=True, help="draft/frozen 阈值 JSON")
+    p4_parser.add_argument("-o", "--output", required=True, help="新的 P4 证据输出目录")
+    p4_parser.add_argument("--r0-package", help="可选 R0 原始数据包根目录")
+    p4_parser.add_argument("--r0-manifest", help="可选固定 8 帧 annotation_manifest.csv")
+    p4_parser.add_argument("--poni", help="R0 使用的 PONI 文件")
+    p4_parser.add_argument("--mask", help="R0 使用的外部 mask")
+    p4_parser.add_argument(
+        "--ridge-method",
+        choices=("radial_peak", "surface_curvature"),
+        default="radial_peak",
+    )
+    p4_parser.add_argument(
+        "--skip-sensitivity", action="store_true", help="跳过单个 T1 方法敏感性对照"
+    )
     return parser
 
 
@@ -557,6 +577,34 @@ def _handle_p3_status(args: argparse.Namespace) -> int:
     return int(report["exit_code"])
 
 
+def _handle_p4_evaluate(args: argparse.Namespace) -> int:
+    from .p4_validation import run_p4_engineering
+
+    report = run_p4_engineering(
+        t1_manifest=args.t1_manifest,
+        t2_manifest=args.t2_manifest,
+        thresholds=args.thresholds,
+        output=args.output,
+        r0_package=args.r0_package,
+        r0_manifest=args.r0_manifest,
+        poni=args.poni,
+        mask=args.mask,
+        ridge_method=args.ridge_method,
+        run_sensitivity=not args.skip_sensitivity,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
+    )
+    _print_json(
+        {
+            "stage": report["stage"],
+            "engineering_status": report["engineering_status"],
+            "scientific_status": report["scientific_status"],
+            "p4_go_no_go": report["p4_go_no_go"],
+            "outputs": report["outputs"],
+        }
+    )
+    return 0 if report["p4_go_no_go"] == "GO" else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -583,6 +631,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _handle_annotation_pack(args)
         if args.command == "p3-status":
             return _handle_p3_status(args)
+        if args.command == "p4-evaluate":
+            return _handle_p4_evaluate(args)
         parser.error(f"未知命令：{args.command}")
     except (PipelineError, ProjectConfigError, FileExistsError, OSError, ValueError) as exc:
         print(f"错误：{exc}", file=sys.stderr)
