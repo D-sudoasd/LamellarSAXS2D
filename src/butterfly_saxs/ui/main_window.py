@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from datetime import datetime, timezone
 import inspect
 import json
 import math
@@ -344,6 +345,27 @@ def _result_has_failure(result: Any) -> bool:
     )
 
 
+def _new_fit_session() -> dict[str, Any]:
+    """Return the small, JSON-friendly manual-review session state."""
+
+    return {
+        "manual_status": "unreviewed",
+        "reviewed_by": "",
+        "reviewed_at": None,
+        "review_notes": "",
+        "optimize_before": None,
+        "optimize_after": None,
+        "accepted_parameters": None,
+        "snapshots": [],
+    }
+
+
+def _utc_timestamp() -> str:
+    """Return an explicit UTC timestamp for human-review audit fields."""
+
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 def _sequence(value: Any) -> list[Any]:
     """Convert optional NumPy/iterable profile fields without truth testing arrays."""
 
@@ -420,6 +442,9 @@ if QT_AVAILABLE:
             self._project_path: Path | None = None
             self._config_path: str | None = None
             self._last_result: Any = None
+            self._last_result_signature: str | None = None
+            self._last_result_kind: str | None = None
+            self._last_evidence_paths: dict[str, Path] = {}
             self._last_error: str | None = None
             self._fit_ridge_points: Any = []
             self._observed_fit_ellipses: list[Any] = []
@@ -430,6 +455,11 @@ if QT_AVAILABLE:
             self._evolution_rows: list[Mapping[str, Any]] = []
             self.evolution_y_key = "rmse"
             self.batch_frames: list[Any] = []
+            self._fit_session: dict[str, Any] = _new_fit_session()
+            # Project loading and programmatic restoration update several
+            # widgets in sequence.  The flag keeps those internal updates
+            # from being interpreted as a new manual review action.
+            self._fit_session_restore_active = False
 
             source_parameters = parameters
             if source_parameters is None:
@@ -484,6 +514,13 @@ if QT_AVAILABLE:
             self.clear_mask_action.setObjectName("clearMaskAction")
             self.clear_mask_action.triggered.connect(self.clear_external_mask)
             file_menu.addAction(self.clear_mask_action)
+            self.export_evidence_action = QtGui.QAction("Export evidence…", self)
+            self.export_evidence_action.setObjectName("exportEvidenceAction")
+            self.export_evidence_action.setToolTip(
+                "导出当前 Preview/Optimize 的四图、参数、审核记录与 provenance；不会自动判定 scientific PASS"
+            )
+            self.export_evidence_action.triggered.connect(self.export_manual_evidence)
+            file_menu.addAction(self.export_evidence_action)
             file_menu.addSeparator()
             close_action = QtGui.QAction("Close", self)
             close_action.triggered.connect(self.close)
@@ -497,6 +534,7 @@ if QT_AVAILABLE:
             self.file_toolbar.addAction(self.open_poni_action)
             self.file_toolbar.addAction(self.open_mask_action)
             self.file_toolbar.addAction(self.clear_mask_action)
+            self.file_toolbar.addAction(self.export_evidence_action)
 
         def _build_central_pages(self) -> None:
             self.pages = QtWidgets.QTabWidget(self)
@@ -642,6 +680,63 @@ if QT_AVAILABLE:
             roi_layout.addWidget(self.apply_roi_button, 4, 0, 1, 2)
             roi_layout.addWidget(self.clear_roi_button, 4, 2, 1, 2)
             layout.addWidget(roi_box)
+
+            session_box = QtWidgets.QGroupBox("Fit session", panel)
+            session_form = QtWidgets.QFormLayout(session_box)
+            self.manual_status_label = QtWidgets.QLabel("unreviewed", session_box)
+            self.manual_status_label.setObjectName("manualStatusLabel")
+            session_form.addRow("Manual status", self.manual_status_label)
+            self.reviewer_edit = QtWidgets.QLineEdit(session_box)
+            self.reviewer_edit.setObjectName("reviewerEdit")
+            self.reviewer_edit.setPlaceholderText("required for Accept/Reject")
+            session_form.addRow("Reviewer", self.reviewer_edit)
+            self.review_notes_edit = QtWidgets.QLineEdit(session_box)
+            self.review_notes_edit.setObjectName("reviewNotesEdit")
+            self.review_notes_edit.setPlaceholderText("optional review note")
+            session_form.addRow("Review notes", self.review_notes_edit)
+
+            review_buttons = QtWidgets.QHBoxLayout()
+            self.accept_current_button = QtWidgets.QPushButton("Accept current", session_box)
+            self.accept_current_button.setObjectName("acceptCurrentButton")
+            self.accept_current_button.setToolTip(
+                "显式接受当前 Preview/Optimize 结果；仅代表人工会话审核，不是 scientific PASS"
+            )
+            self.accept_current_button.clicked.connect(self.accept_current)
+            review_buttons.addWidget(self.accept_current_button)
+            self.reject_current_button = QtWidgets.QPushButton("Reject current", session_box)
+            self.reject_current_button.setObjectName("rejectCurrentButton")
+            self.reject_current_button.setToolTip("显式拒绝当前 Preview/Optimize 结果并保留审计记录")
+            self.reject_current_button.clicked.connect(self.reject_current)
+            review_buttons.addWidget(self.reject_current_button)
+            self.restore_before_optimize_button = QtWidgets.QPushButton("Restore before optimize", session_box)
+            self.restore_before_optimize_button.setObjectName("restoreBeforeOptimizeButton")
+            self.restore_before_optimize_button.setToolTip("恢复最近一次 Optimize 启动前的完整参数表")
+            self.restore_before_optimize_button.clicked.connect(self.restore_before_optimize)
+            review_buttons.addWidget(self.restore_before_optimize_button)
+            session_form.addRow(review_buttons)
+
+            self.snapshot_note_edit = QtWidgets.QLineEdit(session_box)
+            self.snapshot_note_edit.setObjectName("snapshotNoteEdit")
+            self.snapshot_note_edit.setPlaceholderText("required snapshot note")
+            snapshot_save_row = QtWidgets.QHBoxLayout()
+            snapshot_save_row.addWidget(self.snapshot_note_edit, 1)
+            self.save_snapshot_button = QtWidgets.QPushButton("Save snapshot", session_box)
+            self.save_snapshot_button.setObjectName("saveSnapshotButton")
+            self.save_snapshot_button.clicked.connect(lambda _checked=False: self.save_snapshot())
+            snapshot_save_row.addWidget(self.save_snapshot_button)
+            session_form.addRow("Snapshot note", snapshot_save_row)
+
+            self.snapshot_combo = QtWidgets.QComboBox(session_box)
+            self.snapshot_combo.setObjectName("snapshotCombo")
+            self.restore_snapshot_button = QtWidgets.QPushButton("Restore snapshot", session_box)
+            self.restore_snapshot_button.setObjectName("restoreSnapshotButton")
+            self.restore_snapshot_button.clicked.connect(lambda _checked=False: self.restore_snapshot())
+            snapshot_restore_row = QtWidgets.QHBoxLayout()
+            snapshot_restore_row.addWidget(self.snapshot_combo, 1)
+            snapshot_restore_row.addWidget(self.restore_snapshot_button)
+            session_form.addRow("Saved snapshots", snapshot_restore_row)
+            layout.addWidget(session_box)
+            self._sync_fit_session_controls()
             self._update_roi_controls()
             self.parameters_dock.setWidget(panel)
             self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.parameters_dock)
@@ -915,6 +1010,7 @@ if QT_AVAILABLE:
             setter = getattr(self.engine, "set_parameters", None)
             if callable(setter):
                 setter(self.parameter_model.parameter_dict())
+            self._mark_manual_unreviewed()
 
         def set_parameter(self, name: str, value: Any) -> bool:
             return self.parameter_model.set_parameter(name, value)
@@ -966,6 +1062,14 @@ if QT_AVAILABLE:
 
             if not isinstance(settings, Mapping):
                 return
+            # This public/config seam can run while a worker is active.  Make
+            # that older result stale just like a direct widget edit does.
+            if hasattr(self, "_debounce_timer"):
+                self._invalidate_pending_work(clear_fit=False)
+            else:
+                # During __init__ the first settings commit precedes timer
+                # construction, while the generation guard already exists.
+                self._generation.next()
             merged = dict(self._analysis_settings)
             nested = settings.get("measurement", settings.get("analysis_settings"))
             if isinstance(nested, Mapping):
@@ -1012,6 +1116,7 @@ if QT_AVAILABLE:
                     setter(self.analysis_settings)
                 except Exception:
                     pass
+            self._mark_manual_unreviewed()
             if trigger_preview:
                 self._on_analysis_changed()
 
@@ -1034,6 +1139,8 @@ if QT_AVAILABLE:
                 self._observed_fit_ellipses = []
                 self._model_ellipses = []
                 self._last_result = None
+                self._last_result_signature = None
+                self._last_result_kind = None
                 self._last_error = None
                 self.last_metrics = {}
 
@@ -1056,15 +1163,24 @@ if QT_AVAILABLE:
             self._external_mask = None
             return True
 
+        def _active_q_unit(self, result: Any = None) -> str:
+            """Read the calibrated q unit from result or qmap metadata."""
+
+            candidates = [
+                _read(result, ("q_unit", "unit"), None),
+                _read(self._qmap, ("q_unit", "unit"), None),
+                _read(_read(self._qmap, ("metadata",), {}), ("q_unit", "unit"), None),
+            ]
+            for candidate in candidates:
+                unit = str(candidate or "").strip()
+                if unit and unit.lower() != "unknown":
+                    return unit
+            return "unknown"
+
         def _refresh_q_parameter_units(self, q_unit: Any = None) -> None:
             """Apply the active physical q unit to q-valued table rows."""
 
-            if q_unit is None:
-                q_unit = _read(self._qmap, ("q_unit", "unit"), None)
-                metadata = _read(self._qmap, ("metadata",), {})
-                if q_unit is None:
-                    q_unit = _read(metadata, ("q_unit", "unit"), None)
-            unit = str(q_unit or "").strip()
+            unit = self._active_q_unit({"q_unit": q_unit}) if q_unit is not None else self._active_q_unit()
             if not unit or unit.lower() in {"unknown", "pixel", "pixels", "pixel-q", "pixel_q"}:
                 return
             q_names = {"a", "b", "q_center", "q_major", "q_minor", "radial_sigma", "radial_gamma", "radial_fwhm", "background_width"}
@@ -1077,6 +1193,512 @@ if QT_AVAILABLE:
                 if data_changed is not None and hasattr(data_changed, "emit") and callable(index):
                     data_changed.emit(index(row_index, 6), index(row_index, 6), [QtCore.Qt.ItemDataRole.DisplayRole])
 
+        @property
+        def fit_session(self) -> dict[str, Any]:
+            """Return a detached copy of the manual fit-review session."""
+
+            return deepcopy(self._fit_session)
+
+        def _fit_state_signature(self) -> str:
+            """Return the small deterministic identity of the current fit inputs."""
+
+            state = {
+                "parameters": self.parameter_model.parameter_dict(),
+                "analysis": self.analysis_settings,
+                "input": {
+                    "path": self._source_path,
+                    "frame": self._frame,
+                    "dataset": self._dataset,
+                },
+                "poni": self._poni_path,
+                "mask": {
+                    "path": self._mask_path,
+                    "frame": self._mask_frame,
+                    "dataset": self._mask_dataset,
+                },
+                "rois": self._roi_specs,
+            }
+            return json.dumps(
+                _jsonable(state),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+
+        def _result_has_fit_images(self, result: Any) -> bool:
+            """Return whether one result can support visual human review."""
+
+            if result is None or _result_has_failure(result):
+                return False
+            observed = _result_value(result, ("observed", "data", "image"), self._observed)
+            model = _result_value(
+                result,
+                ("model", "predicted", "fit", "intensity", "simulation"),
+                result if not isinstance(result, Mapping) else None,
+            )
+            if observed is None or model is None:
+                return False
+            if _np is None:
+                return True
+            try:
+                observed_array = _np.asarray(observed)
+                model_array = _np.asarray(model)
+            except (TypeError, ValueError):
+                return False
+            return (
+                observed_array.ndim == 2
+                and observed_array.size > 0
+                and model_array.shape == observed_array.shape
+            )
+
+        def _current_result_is_reviewable(self) -> bool:
+            """Require a successful current result, not a stale displayed image."""
+
+            return (
+                self._last_result_signature is not None
+                and self._last_result_signature == self._fit_state_signature()
+                and self._result_has_fit_images(self._last_result)
+            )
+
+        def _capture_fit_context(
+            self,
+            parameters: Mapping[str, Any] | None = None,
+            *,
+            include_arrays: bool = True,
+        ) -> dict[str, Any]:
+            """Capture the current fit context before a background request.
+
+            Optimize receives detached detector/q/mask arrays when available;
+            project persistence later removes those arrays and keeps only the
+            reproducible file selectors and analysis settings.
+            """
+
+            if parameters is None:
+                parameters = self.parameter_model.parameter_dict()
+            input_context: dict[str, Any] = {
+                "path": self._source_path,
+                "frame": self._frame,
+                "dataset": self._dataset,
+            }
+            mask_context: dict[str, Any] = {
+                "path": self._mask_path,
+                "frame": self._mask_frame,
+                "dataset": self._mask_dataset,
+            }
+            qmap_context: dict[str, Any] = {}
+            if include_arrays:
+                input_context["data"] = deepcopy(self._observed)
+                mask_context["file"] = deepcopy(self._file_mask)
+                mask_context["external"] = deepcopy(self._external_mask)
+                qmap_context = {
+                    "qx": deepcopy(self._qx),
+                    "qy": deepcopy(self._qy),
+                    "value": deepcopy(self._qmap),
+                }
+            return {
+                "parameters": deepcopy(parameters),
+                "input": input_context,
+                "frame": self._frame,
+                "dataset": self._dataset,
+                "poni": deepcopy(self._poni_path),
+                "mask": mask_context,
+                "analysis": deepcopy(self.analysis_settings),
+                "roi": {
+                    "exclusion": deepcopy(self._exclusion_roi),
+                    "specs": deepcopy(self._roi_specs),
+                },
+                "qmap": qmap_context,
+            }
+
+        @staticmethod
+        def _fit_context_for_project(context: Any) -> Any:
+            """Remove detector-sized arrays from a persisted fit context."""
+
+            if not isinstance(context, Mapping):
+                return None
+            clean = deepcopy(dict(context))
+            input_context = clean.get("input")
+            if isinstance(input_context, Mapping):
+                input_context = dict(input_context)
+                input_context.pop("data", None)
+                clean["input"] = input_context
+            mask_context = clean.get("mask")
+            if isinstance(mask_context, Mapping):
+                mask_context = dict(mask_context)
+                for key in ("file", "external", "data", "array"):
+                    mask_context.pop(key, None)
+                clean["mask"] = mask_context
+            clean.pop("qmap", None)
+            return _jsonable(clean)
+
+        @staticmethod
+        def _fit_result_summary(result: Any) -> dict[str, Any]:
+            """Keep review-relevant result metadata without detector images."""
+
+            if not isinstance(result, Mapping):
+                return {}
+            summary: dict[str, Any] = {}
+            for key in ("status", "solver_status", "quality_status", "flags", "q_unit"):
+                value = result.get(key)
+                if value is not None:
+                    summary[key] = deepcopy(value)
+            metrics = _read(result, ("metrics", "statistics", "summary"), None)
+            if isinstance(metrics, Mapping):
+                def metadata_value(value: Any) -> Any:
+                    if _np is not None and isinstance(value, _np.ndarray):
+                        return None
+                    if isinstance(value, Mapping):
+                        return {str(key): metadata_value(item) for key, item in value.items()}
+                    if isinstance(value, (list, tuple)):
+                        return [metadata_value(item) for item in value]
+                    return deepcopy(value)
+
+                summary["metrics"] = {
+                    str(key): metadata_value(value)
+                    for key, value in metrics.items()
+                }
+            return _jsonable(summary)
+
+        def _normalise_fit_session(self, source: Any) -> dict[str, Any]:
+            """Load a schema-1/2 session while treating absent fields as empty."""
+
+            session = _new_fit_session()
+            if not isinstance(source, Mapping):
+                return session
+            status = str(source.get("manual_status", "unreviewed") or "unreviewed").lower()
+            session["manual_status"] = status if status in {"unreviewed", "accepted", "rejected"} else "unreviewed"
+            session["reviewed_by"] = str(source.get("reviewed_by", source.get("reviewer", "")) or "")
+            session["reviewed_at"] = source.get("reviewed_at")
+            session["review_notes"] = str(source.get("review_notes", "") or "")
+            for key in ("optimize_before", "optimize_after"):
+                value = source.get(key)
+                session[key] = deepcopy(value) if isinstance(value, Mapping) else None
+            accepted = source.get("accepted_parameters")
+            session["accepted_parameters"] = deepcopy(accepted) if isinstance(accepted, Mapping) else None
+            snapshots = source.get("snapshots", [])
+            if isinstance(snapshots, Iterable) and not isinstance(snapshots, (str, bytes, Mapping)):
+                for snapshot in snapshots:
+                    if not isinstance(snapshot, Mapping):
+                        continue
+                    parameters = snapshot.get("parameters")
+                    if not isinstance(parameters, Mapping):
+                        continue
+                    item = {
+                        "order": len(session["snapshots"]) + 1,
+                        "note": str(snapshot.get("note", "") or ""),
+                        "created_at": snapshot.get("created_at"),
+                        "parameters": deepcopy(parameters),
+                    }
+                    if isinstance(snapshot.get("context"), Mapping):
+                        item["context"] = deepcopy(snapshot["context"])
+                    session["snapshots"].append(item)
+            return session
+
+        def _sync_fit_session_controls(self) -> None:
+            """Refresh the compact right-dock controls from session state."""
+
+            if not hasattr(self, "manual_status_label"):
+                return
+            status = str(self._fit_session.get("manual_status", "unreviewed"))
+            self.manual_status_label.setText(status)
+            self.reviewer_edit.setText(str(self._fit_session.get("reviewed_by", "") or ""))
+            self.review_notes_edit.setText(str(self._fit_session.get("review_notes", "") or ""))
+            selected = self.snapshot_combo.currentData() if self.snapshot_combo.count() else None
+            self.snapshot_combo.blockSignals(True)
+            self.snapshot_combo.clear()
+            snapshots = self._fit_session.get("snapshots", [])
+            if isinstance(snapshots, list):
+                for index, snapshot in enumerate(snapshots):
+                    if not isinstance(snapshot, Mapping):
+                        continue
+                    note = str(snapshot.get("note", "") or "")
+                    label = f"{index + 1}: {note or '(no note)'}"
+                    self.snapshot_combo.addItem(label, index)
+            if self.snapshot_combo.count():
+                if isinstance(selected, int) and 0 <= selected < self.snapshot_combo.count():
+                    self.snapshot_combo.setCurrentIndex(selected)
+                else:
+                    self.snapshot_combo.setCurrentIndex(self.snapshot_combo.count() - 1)
+            self.snapshot_combo.blockSignals(False)
+            self.restore_snapshot_button.setEnabled(bool(self.snapshot_combo.count()))
+            self.restore_before_optimize_button.setEnabled(
+                isinstance(self._fit_session.get("optimize_before"), Mapping)
+            )
+            reviewable = self._current_result_is_reviewable()
+            self.accept_current_button.setEnabled(reviewable)
+            self.reject_current_button.setEnabled(reviewable)
+            if hasattr(self, "export_evidence_action"):
+                self.export_evidence_action.setEnabled(reviewable)
+
+        def _mark_manual_unreviewed(self, *, clear_candidate: bool = True) -> None:
+            """Invalidate a previous human decision after a state edit."""
+
+            if self._fit_session_restore_active:
+                return
+            self._fit_session["manual_status"] = "unreviewed"
+            self._fit_session["reviewed_by"] = ""
+            self._fit_session["reviewed_at"] = None
+            self._fit_session["review_notes"] = ""
+            self._fit_session["accepted_parameters"] = None
+            self._last_result_signature = None
+            if clear_candidate:
+                self._fit_session["optimize_after"] = None
+            self._sync_fit_session_controls()
+
+        def _review_candidate(self, status: str) -> bool:
+            """Apply an explicit Accept/Reject decision to the current fit."""
+
+            reviewer = self.reviewer_edit.text().strip()
+            if not reviewer:
+                self._set_status("Reviewer is required for Accept/Reject", flags="review_required")
+                return False
+            if not self._current_result_is_reviewable():
+                self._set_status(
+                    "Run Preview or Optimize for the current settings before review",
+                    flags="review_required",
+                )
+                return False
+            self._fit_session["manual_status"] = status
+            self._fit_session["reviewed_by"] = reviewer
+            self._fit_session["reviewed_at"] = _utc_timestamp()
+            self._fit_session["review_notes"] = self.review_notes_edit.text().strip()
+            self._fit_session["accepted_parameters"] = (
+                deepcopy(self.parameter_model.parameter_dict()) if status == "accepted" else None
+            )
+            self._sync_fit_session_controls()
+            self._set_status(
+                "Manual fit accepted" if status == "accepted" else "Manual fit rejected",
+                flags=f"manual_{status}",
+            )
+            return True
+
+        def accept_current(self) -> bool:
+            """Explicitly accept the current Preview/Optimize result."""
+
+            return self._review_candidate("accepted")
+
+        def reject_current(self) -> bool:
+            """Explicitly reject the current Preview/Optimize result."""
+
+            return self._review_candidate("rejected")
+
+        def _manual_evidence_result(self) -> dict[str, Any]:
+            """Build the exporter payload from the committed UI result."""
+
+            if isinstance(self._last_result, Mapping):
+                payload = dict(self._last_result)
+            elif self._last_result is not None:
+                payload = {"model": self._last_result}
+            else:
+                raise ValueError("No Preview/Optimize result is available")
+            observed = _result_value(payload, ("observed", "data", "image"), self._observed)
+            model = _result_value(
+                payload,
+                ("model", "predicted", "fit", "intensity", "simulation"),
+                None,
+            )
+            residual = _result_value(payload, ("residual", "difference", "resid"), None)
+            if residual is None and observed is not None and model is not None and _np is not None:
+                observed_array = _np.asarray(observed, dtype=float)
+                model_array = _np.asarray(model, dtype=float)
+                if observed_array.shape == model_array.shape:
+                    residual = observed_array - model_array
+            payload["observed"] = observed
+            payload["model"] = model
+            payload["residual"] = residual
+            # The visible parameter table is authoritative for manual export.
+            payload["parameters"] = deepcopy(self.parameter_model.parameter_dict())
+            payload.setdefault("qx", self._qx)
+            payload.setdefault("qy", self._qy)
+            payload["q_unit"] = self._active_q_unit(payload)
+            payload.setdefault("valid_mask", _read(self._qmap, ("valid_mask", "valid"), None))
+            payload.setdefault("external_mask", self._external_mask)
+            payload.setdefault("ridge_points", self._fit_ridge_points)
+            payload.setdefault("ellipses", self._observed_fit_ellipses)
+            return payload
+
+        def _manual_evidence_context(self) -> dict[str, Any]:
+            """Return arrays/selectors needed by the seven-file exporter."""
+
+            return {
+                "source": self._source_path,
+                "frame": self._frame,
+                "dataset": self._dataset,
+                "poni": self._poni_path,
+                "mask_path": self._mask_path,
+                "roi": deepcopy(self._roi_specs),
+                "analysis": deepcopy(self.analysis_settings),
+                "result_kind": self._last_result_kind,
+                "qmap": self._qmap,
+                "qx": self._qx,
+                "qy": self._qy,
+                "q_unit": self._active_q_unit(self._last_result),
+                "valid_mask": _read(self._qmap, ("valid_mask", "valid"), None),
+                "external_mask": self._external_mask,
+                "current_model_ellipses": deepcopy(self._model_ellipses),
+            }
+
+        def export_manual_evidence(
+            self,
+            path: str | Path | bool | None = None,
+            *,
+            force: bool = False,
+        ) -> bool:
+            """Export the current fit as exactly seven auditable files."""
+
+            if not self._current_result_is_reviewable():
+                self._set_status(
+                    "Run Preview or Optimize after the latest edit before export",
+                    flags="evidence_stale",
+                )
+                return False
+            status = str(self._fit_session.get("manual_status", "unreviewed"))
+            if status in {"accepted", "rejected"} and (
+                self.reviewer_edit.text().strip() != str(self._fit_session.get("reviewed_by", "") or "")
+                or self.review_notes_edit.text().strip()
+                != str(self._fit_session.get("review_notes", "") or "")
+            ):
+                self._set_status(
+                    "Review fields changed; press Accept current or Reject current again",
+                    flags="review_required",
+                )
+                return False
+            if isinstance(path, bool) or path is None:
+                chosen = QtWidgets.QFileDialog.getExistingDirectory(
+                    self,
+                    "Select an empty folder for manual-fit evidence",
+                    "",
+                )
+                if not chosen:
+                    return False
+                path = chosen
+            try:
+                from ..manual_evidence import export_manual_fit
+
+                written = export_manual_fit(
+                    self._manual_evidence_result(),
+                    Path(path),
+                    context=self._manual_evidence_context(),
+                    review={
+                        "manual_status": status,
+                        "reviewed_by": self._fit_session.get("reviewed_by"),
+                        "reviewed_at": self._fit_session.get("reviewed_at"),
+                        "review_notes": self._fit_session.get("review_notes", ""),
+                    },
+                    force=bool(force),
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                self._set_status(f"Evidence export failed: {exc}", flags="evidence_error")
+                return False
+            self._last_evidence_paths = dict(written)
+            self._set_status(f"Exported 7 evidence files to {Path(path)}", flags="evidence_exported")
+            return True
+
+        export_evidence = export_manual_evidence
+
+        def restore_before_optimize(self, *_: Any) -> bool:
+            """Restore the most recent Optimize-before parameter table."""
+
+            before = self._fit_session.get("optimize_before")
+            parameters = before.get("parameters") if isinstance(before, Mapping) else None
+            if not isinstance(parameters, Mapping):
+                self._set_status("No Optimize-before snapshot is available", flags="snapshot_missing")
+                return False
+            self._invalidate_pending_work(clear_fit=True)
+            self._fit_session_restore_active = True
+            try:
+                self.parameter_model.set_rows(deepcopy(parameters))
+                setter = getattr(self.engine, "set_parameters", None)
+                if callable(setter):
+                    setter(self.parameter_model.parameter_dict())
+            finally:
+                self._fit_session_restore_active = False
+            self._fit_session["manual_status"] = "unreviewed"
+            self._fit_session["reviewed_by"] = ""
+            self._fit_session["reviewed_at"] = None
+            self._fit_session["review_notes"] = ""
+            self._fit_session["accepted_parameters"] = None
+            self._fit_session["optimize_after"] = None
+            self._sync_fit_session_controls()
+            self._refresh_model_overlay()
+            self._set_status("Restored parameters before Optimize", flags="snapshot_restored")
+            return True
+
+        def save_snapshot(self, note: str | None = None) -> bool:
+            """Append a detached, ordered parameter snapshot with a note."""
+
+            if isinstance(note, bool) or note is None:
+                note = self.snapshot_note_edit.text()
+            note = str(note).strip()
+            if not note:
+                self._set_status("Snapshot note is required", flags="snapshot_note_required")
+                return False
+            snapshots = self._fit_session.setdefault("snapshots", [])
+            snapshot = {
+                "order": len(snapshots) + 1,
+                "note": note,
+                "created_at": _utc_timestamp(),
+                "parameters": deepcopy(self.parameter_model.parameter_dict()),
+                "context": self._capture_fit_context(parameters={}, include_arrays=False),
+            }
+            snapshots.append(snapshot)
+            self._sync_fit_session_controls()
+            self.snapshot_combo.setCurrentIndex(self.snapshot_combo.count() - 1)
+            self.snapshot_note_edit.clear()
+            self._set_status(f"Saved snapshot {snapshot['order']}: {note}")
+            return True
+
+        def restore_snapshot(self, index: int | None = None, *_: Any) -> bool:
+            """Restore one saved snapshot and clear views from the old fit."""
+
+            if isinstance(index, bool):
+                index = None
+            snapshots = self._fit_session.get("snapshots", [])
+            if not isinstance(snapshots, list) or not snapshots:
+                self._set_status("No saved snapshot is available", flags="snapshot_missing")
+                return False
+            if index is None:
+                selected = self.snapshot_combo.currentData()
+                index = int(selected) if selected is not None else self.snapshot_combo.currentIndex()
+            try:
+                snapshot = snapshots[int(index)]
+            except (IndexError, TypeError, ValueError):
+                self._set_status("Selected snapshot is invalid", flags="snapshot_invalid")
+                return False
+            parameters = snapshot.get("parameters") if isinstance(snapshot, Mapping) else None
+            if not isinstance(parameters, Mapping):
+                self._set_status("Selected snapshot has no parameter table", flags="snapshot_invalid")
+                return False
+            self._invalidate_pending_work(clear_fit=True)
+            self._fit_session_restore_active = True
+            try:
+                self.parameter_model.set_rows(deepcopy(parameters))
+                setter = getattr(self.engine, "set_parameters", None)
+                if callable(setter):
+                    setter(self.parameter_model.parameter_dict())
+            finally:
+                self._fit_session_restore_active = False
+            self._fit_session["manual_status"] = "unreviewed"
+            self._fit_session["reviewed_by"] = ""
+            self._fit_session["reviewed_at"] = None
+            self._fit_session["review_notes"] = ""
+            self._fit_session["accepted_parameters"] = None
+            self._fit_session["optimize_after"] = None
+            self._sync_fit_session_controls()
+            self.snapshot_combo.setCurrentIndex(int(index))
+            self._refresh_model_overlay()
+            note = str(snapshot.get("note", "") or "")
+            self._set_status(f"Restored snapshot {int(index) + 1}: {note}", flags="snapshot_restored")
+            return True
+
+        # Descriptive aliases keep the small public API discoverable for
+        # scripts while the button-facing names remain concise.
+        accept_current_result = accept_current
+        reject_current_result = reject_current
+        restore_before_fit = restore_before_optimize
+        save_parameter_snapshot = save_snapshot
+        restore_parameter_snapshot = restore_snapshot
+
         def set_observed_data(
             self,
             data: Any,
@@ -1087,6 +1709,7 @@ if QT_AVAILABLE:
             metadata: Mapping[str, Any] | None = None,
         ) -> None:
             self._invalidate_pending_work(clear_fit=True)
+            self._mark_manual_unreviewed()
             mask_cleared_for_shape = self._clear_incompatible_external_mask(data)
             self._observed = data
             self._qx, self._qy = qx, qy
@@ -1115,7 +1738,7 @@ if QT_AVAILABLE:
                 data,
                 qx=self._qx,
                 qy=self._qy,
-                q_unit=str(_read(self._qmap, ("q_unit", "unit"), "unknown") or "unknown"),
+                q_unit=self._active_q_unit(),
                 valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                 external_mask=self._external_mask,
             )
@@ -1135,6 +1758,7 @@ if QT_AVAILABLE:
                 self._set_status("Current engine does not support PONI", flags="error")
                 return False
             self._invalidate_pending_work(clear_fit=True)
+            self._mark_manual_unreviewed()
             try:
                 qmap = setter(path)
                 self._poni_path = str(path) if isinstance(path, (str, Path)) else "in-memory"
@@ -1148,7 +1772,7 @@ if QT_AVAILABLE:
                             self._observed,
                             qx=self._qx,
                             qy=self._qy,
-                            q_unit=str(_read(self._qmap, ("q_unit", "unit"), "unknown") or "unknown"),
+                            q_unit=self._active_q_unit(),
                             valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                             external_mask=self._external_mask,
                         )
@@ -1297,7 +1921,7 @@ if QT_AVAILABLE:
                     self._observed,
                     qx=self._qx,
                     qy=self._qy,
-                    q_unit=str(_read(self._qmap, ("q_unit", "unit"), "unknown") or "unknown"),
+                    q_unit=self._active_q_unit(),
                     valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                     external_mask=self._external_mask,
                 )
@@ -1337,6 +1961,7 @@ if QT_AVAILABLE:
                     # Selecting a mask is still an input-state change before
                     # an image is loaded, so older worker results must expire.
                     self._invalidate_pending_work(clear_fit=True)
+                self._mark_manual_unreviewed()
                 self._set_status(f"Mask loaded: {Path(path).name}")
                 return True
             except Exception as exc:
@@ -1347,6 +1972,7 @@ if QT_AVAILABLE:
 
         def clear_external_mask(self) -> bool:
             self._invalidate_pending_work(clear_fit=True)
+            self._mark_manual_unreviewed()
             self._mask_path = None
             self._file_mask = None
             if self._observed is not None and self._roi_specs:
@@ -1357,7 +1983,7 @@ if QT_AVAILABLE:
                     self._observed,
                     qx=self._qx,
                     qy=self._qy,
-                    q_unit=str(_read(self._qmap, ("q_unit", "unit"), "unknown") or "unknown"),
+                    q_unit=self._active_q_unit(),
                     valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                     external_mask=None,
                 )
@@ -1441,6 +2067,7 @@ if QT_AVAILABLE:
                 self._exclusion_roi = values
                 spec = {"type": "rectangle", "x0": x0, "x1": x1, "y0": y0, "y1": y1}
             self._roi_specs = [spec]
+            self._mark_manual_unreviewed()
             if self._observed is None:
                 # Keep the existing API (ROI is pending until an image exists),
                 # but invalidate any worker that belongs to the old input state.
@@ -1475,6 +2102,7 @@ if QT_AVAILABLE:
 
         def clear_exclusion_roi(self) -> bool:
             self._invalidate_pending_work(clear_fit=True)
+            self._mark_manual_unreviewed()
             self._exclusion_roi = None
             self._roi_specs = []
             self.views.set_roi(None)
@@ -1486,7 +2114,7 @@ if QT_AVAILABLE:
                     self._observed,
                     qx=self._qx,
                     qy=self._qy,
-                    q_unit=str(_read(self._qmap, ("q_unit", "unit"), "unknown") or "unknown"),
+                    q_unit=self._active_q_unit(),
                     valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
                     external_mask=None,
                 )
@@ -1535,6 +2163,7 @@ if QT_AVAILABLE:
                     pass
             self._set_busy(False, "edited")
             self._set_status("Parameters changed")
+            self._mark_manual_unreviewed()
             self._refresh_model_overlay()
             if self.auto_preview:
                 self._debounce_timer.start(self.debounce_ms)
@@ -1544,6 +2173,7 @@ if QT_AVAILABLE:
                 self._validate_analysis_controls()
             except ValueError as exc:
                 self._generation.next()
+                self._mark_manual_unreviewed()
                 self._set_busy(False, "edited")
                 self._set_status(f"Analysis settings invalid: {exc}", flags="invalid_analysis")
                 return
@@ -1560,6 +2190,7 @@ if QT_AVAILABLE:
                     pass
             self._set_busy(False, "edited")
             self._set_status("Analysis settings changed")
+            self._mark_manual_unreviewed()
             self._refresh_model_overlay()
             if self.auto_preview:
                 self._debounce_timer.start(self.debounce_ms)
@@ -1596,11 +2227,33 @@ if QT_AVAILABLE:
                 self._validate_analysis_controls()
             except ValueError as exc:
                 generation = self._generation.next()
+                if kind in {"preview", "optimize"}:
+                    self._mark_manual_unreviewed()
                 self._set_busy(False, "edited")
                 self._set_status(f"Analysis settings invalid: {exc}", flags="invalid_analysis")
                 return generation
             generation = self._generation.next()
-            request_payload = self._payload() if payload is None else payload
+            if kind in {"preview", "optimize"}:
+                # Once a new request starts, an older displayed result is no
+                # longer eligible for review/export even if its image remains
+                # visible until the new worker finishes.
+                self._mark_manual_unreviewed()
+            if kind == "optimize":
+                # Freeze every editable field and the complete current input
+                # context before handing work to QThreadPool.  The worker must
+                # never observe a later table edit or a changed mask/ROI.
+                parameter_snapshot = deepcopy(self.parameter_model.parameter_dict())
+                self._fit_session["optimize_before"] = self._capture_fit_context(
+                    parameters=parameter_snapshot,
+                    include_arrays=True,
+                )
+                self._fit_session["optimize_after"] = None
+                self._sync_fit_session_controls()
+                request_payload = self._payload() if payload is None else payload
+                request_payload = deepcopy(request_payload)
+            else:
+                parameter_snapshot = self.parameter_model.parameter_dict()
+                request_payload = self._payload() if payload is None else payload
             worker = AnalysisWorker(
                 _engine_job(self.engine),
                 generation=generation,
@@ -1608,7 +2261,7 @@ if QT_AVAILABLE:
                 # Keep the complete editable state (bounds, vary, ties, unit,
                 # stderr) in the worker request.  ``_engine_job`` supplies the
                 # scalar compatibility view to legacy injected engines.
-                parameters=self.parameter_model.parameter_dict(),
+                parameters=parameter_snapshot,
                 payload=request_payload,
             )
             worker.signals.finished.connect(self._on_worker_finished)
@@ -1637,6 +2290,8 @@ if QT_AVAILABLE:
             # QThreadPool cannot interrupt arbitrary user code.  Advancing the
             # generation is sufficient to make every late result harmless.
             self._generation.next()
+            self._last_result_signature = None
+            self._sync_fit_session_controls()
             self._set_busy(False, "cancelled")
             self._set_status("Cancelled; late results ignored")
 
@@ -1644,6 +2299,8 @@ if QT_AVAILABLE:
             """Advance the generation gate while preserving the current view."""
 
             self._generation.next()
+            self._last_result_signature = None
+            self._sync_fit_session_controls()
             self._set_busy(False, "ignored")
             self._set_status("Late result ignored")
 
@@ -1653,7 +2310,6 @@ if QT_AVAILABLE:
             self._workers.pop(generation, None)
             if not self._generation.is_current(generation):
                 return
-            self._last_result = result
             self._last_error = None
             if kind == "batch":
                 records = _result_value(result, ("records", "results", "evolution"), [])
@@ -1661,9 +2317,29 @@ if QT_AVAILABLE:
                     self.plot_evolution(records)
                     self._update_batch_rows(records)
             else:
+                self._last_result = result
+                self._last_result_kind = kind
                 self._apply_result(result)
+                self._last_result_signature = (
+                    self._fit_state_signature()
+                    if self._result_has_fit_images(result) and not _result_has_failure(result)
+                    else None
+                )
                 if kind == "optimize":
                     self._auto_scale_initial = False
+                    if _result_has_failure(result):
+                        self._fit_session["optimize_after"] = None
+                    else:
+                        self._fit_session["optimize_after"] = self._capture_fit_context(
+                            parameters=self.parameter_model.parameter_dict(),
+                            include_arrays=True,
+                        )
+                        self._fit_session["optimize_after"]["result_summary"] = self._fit_result_summary(result)
+                    # An optimization result is a candidate only.  It is
+                    # deliberately left unreviewed until the user presses
+                    # Accept current or Reject current.
+                    self._fit_session["manual_status"] = "unreviewed"
+                self._sync_fit_session_controls()
             self._set_busy(False, kind, result_ok=not _result_has_failure(result))
 
         def _on_worker_error(self, generation: int, kind: str, error: Exception) -> None:
@@ -1671,6 +2347,11 @@ if QT_AVAILABLE:
             if not self._generation.is_current(generation):
                 return
             self._last_error = str(error)
+            self._last_result_signature = None
+            if kind == "optimize":
+                self._fit_session["optimize_after"] = None
+                self._fit_session["manual_status"] = "unreviewed"
+            self._sync_fit_session_controls()
             self._set_busy(False, kind)
             self._set_status(f"{kind} failed: {error}", flags="error")
 
@@ -1701,7 +2382,7 @@ if QT_AVAILABLE:
                 self.views.residual.clear_image()
             result_qx = _result_value(result, ("qx", "qx_nm_inv"), self._qx)
             result_qy = _result_value(result, ("qy", "qy_nm_inv"), self._qy)
-            result_q_unit = str(_read(result, ("q_unit",), _read(self._qmap, ("q_unit", "unit"), "unknown")) or "unknown")
+            result_q_unit = self._active_q_unit(result)
             self._refresh_q_parameter_units(result_q_unit)
             result_valid_mask = _result_value(result, ("valid_mask",), _read(self._qmap, ("valid_mask", "valid"), None))
             result_external_mask = _result_value(result, ("mask", "external_mask"), self._external_mask)
@@ -1941,9 +2622,35 @@ if QT_AVAILABLE:
 
         # ----- project persistence ---------------------------------------------
 
+        def _fit_session_for_project(self) -> dict[str, Any]:
+            """Return fit-session JSON without detector-sized in-memory data."""
+
+            persisted = _new_fit_session()
+            for key in ("manual_status", "reviewed_by", "reviewed_at", "review_notes"):
+                persisted[key] = deepcopy(self._fit_session.get(key, persisted[key]))
+            for key in ("optimize_before", "optimize_after"):
+                persisted[key] = self._fit_context_for_project(self._fit_session.get(key))
+            accepted = self._fit_session.get("accepted_parameters")
+            persisted["accepted_parameters"] = deepcopy(accepted) if isinstance(accepted, Mapping) else None
+            snapshots = self._fit_session.get("snapshots", [])
+            if isinstance(snapshots, list):
+                for index, snapshot in enumerate(snapshots):
+                    if not isinstance(snapshot, Mapping) or not isinstance(snapshot.get("parameters"), Mapping):
+                        continue
+                    item = {
+                        "order": index + 1,
+                        "note": str(snapshot.get("note", "") or ""),
+                        "created_at": snapshot.get("created_at"),
+                        "parameters": deepcopy(snapshot["parameters"]),
+                    }
+                    if isinstance(snapshot.get("context"), Mapping):
+                        item["context"] = self._fit_context_for_project(snapshot["context"])
+                    persisted["snapshots"].append(item)
+            return _jsonable(persisted)
+
         def project_to_dict(self) -> dict[str, Any]:
             return {
-                "schema_version": 1,
+                "schema_version": 2,
                 "parameters": self.parameter_model.parameter_dict(),
                 "analysis": _jsonable(self.analysis_settings),
                 "input": self._source_path,
@@ -1955,6 +2662,7 @@ if QT_AVAILABLE:
                 "mask_dataset": self._mask_dataset,
                 "roi_exclusion": _jsonable(self._exclusion_roi),
                 "rois": list(self._roi_specs),
+                "fit_session": self._fit_session_for_project(),
                 "batch": {
                     "mode": self.batch_mode_combo.currentData(),
                     "frames": _jsonable(list(self.batch_frames)),
@@ -2088,6 +2796,12 @@ if QT_AVAILABLE:
                 setter = getattr(self.engine, "set_parameters", None)
                 if callable(setter):
                     setter(self.parameter_model.parameter_dict())
+                self._fit_session_restore_active = True
+                try:
+                    self._fit_session = self._normalise_fit_session(data.get("fit_session"))
+                finally:
+                    self._fit_session_restore_active = False
+                self._sync_fit_session_controls()
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
                 self._set_status(f"Load failed: {exc}", flags="error")
                 return False
