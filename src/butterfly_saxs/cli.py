@@ -45,7 +45,11 @@ def _config(value: str | None) -> ProjectConfig | None:
 
 
 def _print_json(value: Any) -> None:
-    print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
+    # Console encodings on Windows are often GBK/CP936, which cannot encode
+    # every scientific unit symbol (for example ``Å``).  Escaping non-ASCII
+    # characters keeps stdout valid JSON on every terminal; exported files
+    # remain human-readable UTF-8 through their dedicated writers.
+    print(json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False))
 
 
 def _write_synthetic(array: np.ndarray, qmap: dict[str, Any], output: str | os.PathLike[str], *, force: bool) -> Path:

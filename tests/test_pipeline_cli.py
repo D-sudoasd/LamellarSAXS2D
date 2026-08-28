@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
 
-from butterfly_saxs.cli import build_parser, main
+from butterfly_saxs.cli import _print_json, build_parser, main
 from butterfly_saxs.intensity import default_intensity_parameters, double_ellipse_intensity
 from butterfly_saxs.pipeline import (
     PipelineError,
@@ -32,6 +34,20 @@ def test_cli_help_has_public_vertical_slice() -> None:
     with pytest.raises(SystemExit) as error:
         main(["--help"])
     assert error.value.code == 0
+
+
+def test_cli_json_stdout_is_safe_for_windows_gbk(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp936", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    _print_json({"q_unit": "Å^-1", "message": "拟合完成"})
+    stream.flush()
+
+    assert json.loads(raw.getvalue().decode("cp936")) == {
+        "q_unit": "Å^-1",
+        "message": "拟合完成",
+    }
 
 
 def test_cli_synthetic_writes_array(tmp_path: Path) -> None:
