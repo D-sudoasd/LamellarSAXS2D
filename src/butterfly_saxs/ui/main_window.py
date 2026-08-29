@@ -478,6 +478,12 @@ if QT_AVAILABLE:
             self._last_result: Any = None
             self._last_result_signature: str | None = None
             self._last_result_kind: str | None = None
+            self._last_result_input_records: dict[str, Any] | None = None
+            self._pending_input_records: dict[int, dict[str, Any]] = {}
+            self._loaded_input_records: dict[str, dict[str, Any]] = {
+                role: {"path": None, "exists": False}
+                for role in ("source", "poni", "mask")
+            }
             self._last_evidence_paths: dict[str, Path] = {}
             self._last_error: str | None = None
             self._fit_ridge_points: Any = []
@@ -1692,6 +1698,7 @@ if QT_AVAILABLE:
             """Make every older worker result stale before changing input state."""
 
             self._generation.next()
+            self._pending_input_records.clear()
             self._debounce_timer.stop()
             self._set_busy(False)
             if clear_fit:
@@ -1702,6 +1709,7 @@ if QT_AVAILABLE:
                 self._last_result = None
                 self._last_result_signature = None
                 self._last_result_kind = None
+                self._last_result_input_records = None
                 self._last_error = None
                 self.last_metrics = {}
 
@@ -1722,7 +1730,17 @@ if QT_AVAILABLE:
             self._mask_path = None
             self._file_mask = None
             self._external_mask = None
+            self._capture_loaded_input_record("mask", None)
             return True
+
+        def _capture_loaded_input_record(self, role: str, value: Any) -> None:
+            """Remember the exact file bytes used to build the in-memory state."""
+
+            from ..manual_evidence import capture_input_records
+
+            self._loaded_input_records[role] = capture_input_records(
+                **{role: value}
+            )[role]
 
         def _active_q_unit(self, result: Any = None) -> str:
             """Read the calibrated q unit from result or qmap metadata."""
@@ -1785,6 +1803,7 @@ if QT_AVAILABLE:
                     "dataset": self._mask_dataset,
                 },
                 "rois": self._roi_specs,
+                "input_records": self._loaded_input_records,
             }
             return json.dumps(
                 _jsonable(state),
@@ -2019,6 +2038,7 @@ if QT_AVAILABLE:
             self._fit_session["review_notes"] = ""
             self._fit_session["accepted_parameters"] = None
             self._last_result_signature = None
+            self._last_result_input_records = None
             if clear_candidate:
                 self._fit_session["optimize_after"] = None
             self._sync_fit_session_controls()
@@ -2114,6 +2134,7 @@ if QT_AVAILABLE:
                 "valid_mask": _read(self._qmap, ("valid_mask", "valid"), None),
                 "external_mask": self._external_mask,
                 "current_model_ellipses": deepcopy(self._model_ellipses),
+                "fit_input_records": deepcopy(self._last_result_input_records),
             }
 
         def export_manual_evidence(
@@ -2302,9 +2323,15 @@ if QT_AVAILABLE:
             qy: Any = None,
             qmap: Any = None,
             metadata: Mapping[str, Any] | None = None,
+            _preserve_file_context: bool = False,
         ) -> None:
             self._invalidate_pending_work(clear_fit=True)
             self._mark_manual_unreviewed()
+            if not _preserve_file_context:
+                self._source_path = None
+                self._frame = None
+                self._dataset = None
+                self._capture_loaded_input_record("source", None)
             mask_cleared_for_shape = self._clear_incompatible_external_mask(data)
             self._observed = data
             self._qx, self._qy = qx, qy
@@ -2357,6 +2384,10 @@ if QT_AVAILABLE:
             try:
                 qmap = setter(path)
                 self._poni_path = str(path) if isinstance(path, (str, Path)) else "in-memory"
+                self._capture_loaded_input_record(
+                    "poni",
+                    path if isinstance(path, (str, Path)) else None,
+                )
                 if qmap is not None:
                     self._qmap = qmap
                     self._qx = _read(qmap, ("qx", "qx_nm_inv"), self._qx)
@@ -2442,6 +2473,7 @@ if QT_AVAILABLE:
                 if not isinstance(state, Mapping):
                     raise TypeError("image loader must return a mapping state")
                 self._source_path = str(path)
+                self._capture_loaded_input_record("source", path)
                 self._frame = frame
                 self._dataset = dataset
                 self._mask_frame = selected_mask_frame
@@ -2453,13 +2485,20 @@ if QT_AVAILABLE:
                     self._mask_path = None
                     self._file_mask = None
                     self._external_mask = None
+                    self._capture_loaded_input_record("mask", None)
                 self._poni_path = state.get("poni", self._poni_path)
+                if poni is not None:
+                    self._capture_loaded_input_record(
+                        "poni",
+                        poni if isinstance(poni, (str, Path)) else None,
+                    )
                 self.set_observed_data(
                     state.get("observed", state.get("data")),
                     qx=state.get("qx"),
                     qy=state.get("qy"),
                     qmap=state.get("qmap"),
                     metadata=state.get("metadata"),
+                    _preserve_file_context=True,
                 )
                 if external_mask is not None:
                     if isinstance(external_mask, (str, Path)):
@@ -2470,6 +2509,7 @@ if QT_AVAILABLE:
                         )
                     else:
                         self._file_mask = _np.asarray(external_mask, dtype=bool) if _np is not None else external_mask
+                        self._capture_loaded_input_record("mask", None)
                     self._recompute_external_mask(update_widgets=False)
                 self._set_status("status.image_loaded", name=Path(path).name)
                 return True
@@ -2500,6 +2540,7 @@ if QT_AVAILABLE:
                 if tuple(_np.asarray(array).shape) != expected:
                     raise ValueError(f"mask shape {getattr(array, 'shape', None)!r} does not match {expected!r}")
             self._mask_path = str(path)
+            self._capture_loaded_input_record("mask", path)
             self._file_mask = array
             self._mask_frame = selected_frame
             self._mask_dataset = selected_dataset
@@ -2585,6 +2626,7 @@ if QT_AVAILABLE:
             self._mark_manual_unreviewed()
             self._mask_path = None
             self._file_mask = None
+            self._capture_loaded_input_record("mask", None)
             if self._observed is not None and self._roi_specs:
                 return self._recompute_external_mask(update_widgets=False)
             self._external_mask = None
@@ -2841,6 +2883,7 @@ if QT_AVAILABLE:
                 self._validate_analysis_controls()
             except ValueError as exc:
                 generation = self._generation.next()
+                self._pending_input_records.clear()
                 if kind in {"preview", "optimize"}:
                     self._mark_manual_unreviewed()
                 self._set_busy(False, "edited")
@@ -2851,11 +2894,15 @@ if QT_AVAILABLE:
                 )
                 return generation
             generation = self._generation.next()
+            self._pending_input_records.clear()
             if kind in {"preview", "optimize"}:
                 # Once a new request starts, an older displayed result is no
                 # longer eligible for review/export even if its image remains
                 # visible until the new worker finishes.
                 self._mark_manual_unreviewed()
+                self._pending_input_records[generation] = deepcopy(
+                    self._loaded_input_records
+                )
             if kind == "optimize":
                 # Freeze every editable field and the complete current input
                 # context before handing work to QThreadPool.  The worker must
@@ -2908,7 +2955,9 @@ if QT_AVAILABLE:
             # QThreadPool cannot interrupt arbitrary user code.  Advancing the
             # generation is sufficient to make every late result harmless.
             self._generation.next()
+            self._pending_input_records.clear()
             self._last_result_signature = None
+            self._last_result_input_records = None
             self._sync_fit_session_controls()
             self._set_busy(False, "cancelled")
             self._set_status("status.cancelled_late")
@@ -2917,7 +2966,9 @@ if QT_AVAILABLE:
             """Advance the generation gate while preserving the current view."""
 
             self._generation.next()
+            self._pending_input_records.clear()
             self._last_result_signature = None
+            self._last_result_input_records = None
             self._sync_fit_session_controls()
             self._set_busy(False, "ignored")
             self._set_status("status.late_ignored")
@@ -2926,6 +2977,7 @@ if QT_AVAILABLE:
 
         def _on_worker_finished(self, generation: int, kind: str, result: Any) -> None:
             self._workers.pop(generation, None)
+            input_records = self._pending_input_records.pop(generation, None)
             if not self._generation.is_current(generation):
                 return
             self._last_error = None
@@ -2943,6 +2995,14 @@ if QT_AVAILABLE:
                     if self._result_has_fit_images(result) and not _result_has_failure(result)
                     else None
                 )
+                if self._last_result_signature is None:
+                    self._last_result_input_records = None
+                else:
+                    self._last_result_input_records = deepcopy(
+                        input_records
+                        if input_records is not None
+                        else self._loaded_input_records
+                    )
                 if kind == "optimize":
                     self._auto_scale_initial = False
                     if _result_has_failure(result):
@@ -2962,10 +3022,12 @@ if QT_AVAILABLE:
 
         def _on_worker_error(self, generation: int, kind: str, error: Exception) -> None:
             self._workers.pop(generation, None)
+            self._pending_input_records.pop(generation, None)
             if not self._generation.is_current(generation):
                 return
             self._last_error = str(error)
             self._last_result_signature = None
+            self._last_result_input_records = None
             if kind == "optimize":
                 self._fit_session["optimize_after"] = None
                 self._fit_session["manual_status"] = "unreviewed"

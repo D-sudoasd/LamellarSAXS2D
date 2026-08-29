@@ -30,7 +30,13 @@ from .intensity import (
 from .io import LoadedImage, load_image as read_image
 from .observables import measure_observables
 from .parameters import ParameterSet, ParameterSpec
-from .validation import AnalysisDomain, build_analysis_domain, normalise_q_arrays
+from .validation import (
+    AnalysisDomain,
+    AnalysisDomainError,
+    build_analysis_domain,
+    normalise_q_arrays,
+    validate_q_coordinates,
+)
 
 
 SERVICE_FLAGS = (
@@ -161,15 +167,20 @@ def _normalise_service_qmap(qmap: Any, shape: tuple[int, int]) -> Any:
 
     if not isinstance(qmap, Mapping):
         return qmap
-    qx = _read(qmap, ("qx", "qx_nm_inv"), None)
-    qy = _read(qmap, ("qy", "qy_nm_inv"), None)
-    if qx is None or qy is None:
+    qx = _read(qmap, ("qx", "qx_nm_inv", "q_x"), None)
+    qy = _read(qmap, ("qy", "qy_nm_inv", "q_y"), None)
+    radial = _read(qmap, ("q", "q_nm_inv", "radius", "q_abs", "q_map"), None)
+    if (qx is None) != (qy is None):
+        raise ValueError("qmap must provide qx and qy together")
+    if qx is None:
+        if radial is not None:
+            raise ValueError("2D analysis cannot use q alone; qmap must provide qx and qy")
         return qmap
     qx_array = np.asarray(qx, dtype=float)
     qy_array = np.asarray(qy, dtype=float)
     if qx_array.shape != shape or qy_array.shape != shape:
         raise ValueError(f"qmap shape must match image shape {shape!r}")
-    q = _read(qmap, ("q", "q_nm_inv"), None)
+    q = radial
     q_array = np.hypot(qx_array, qy_array) if q is None else np.asarray(q, dtype=float)
     if q_array.shape != shape:
         raise ValueError(f"qmap q shape must match image shape {shape!r}")
@@ -179,6 +190,10 @@ def _normalise_service_qmap(qmap: Any, shape: tuple[int, int]) -> Any:
         q_array,
         _q_unit(qmap),
     )
+    try:
+        validate_q_coordinates(qx_array, qy_array, q_array)
+    except AnalysisDomainError as exc:
+        raise ValueError(f"qmap coordinates are inconsistent: {exc}") from exc
     if qmap.get("q_unit") == "nm^-1" and "q_conversion_factor_to_nm_inv" in qmap:
         unit_info["source_q_unit"] = qmap.get("source_q_unit")
         unit_info["q_conversion_factor_to_nm_inv"] = qmap.get(
@@ -1170,16 +1185,31 @@ class ButterflyAnalysisService:
     def set_observed(self, data: Any, *, qx: Any = None, qy: Any = None, qmap: Any = None, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
         array = np.asarray(data)
         supplied_valid = _read(qmap, ("valid_mask", "valid"), None) if qmap is not None else None
-        self._loaded = LoadedImage(array, metadata=dict(metadata or {}), valid_mask=supplied_valid)
         if qmap is not None:
-            self._qmap = _normalise_service_qmap(qmap, array.shape)
-        elif qx is not None and qy is not None:
+            candidate_qmap = _normalise_service_qmap(qmap, array.shape)
+        elif (qx is None) != (qy is None):
+            raise ValueError("qx and qy must be provided together")
+        elif qx is not None:
             qx_array, qy_array = np.asarray(qx, dtype=float), np.asarray(qy, dtype=float)
-            self._qmap = {"qx": qx_array, "qy": qy_array, "q": np.hypot(qx_array, qy_array), "q_unit": "provided"}
+            candidate_qmap = _normalise_service_qmap(
+                {
+                    "qx": qx_array,
+                    "qy": qy_array,
+                    "q": np.hypot(qx_array, qy_array),
+                    "q_unit": "provided",
+                },
+                array.shape,
+            )
         elif self._poni is not None:
-            self._qmap = build_geometry(array.shape, self._poni)
+            candidate_qmap = build_geometry(array.shape, self._poni)
         else:
-            self._qmap = self._fallback_qmap(array.shape)
+            candidate_qmap = self._fallback_qmap(array.shape)
+        self._loaded = LoadedImage(
+            array,
+            metadata=dict(metadata or {}),
+            valid_mask=supplied_valid,
+        )
+        self._qmap = candidate_qmap
         return self.current_payload()
 
     def _payload_from_loaded(self, loaded: LoadedImage | None, qmap: Any) -> dict[str, Any]:

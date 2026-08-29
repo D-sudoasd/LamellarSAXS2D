@@ -8,7 +8,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from butterfly_saxs.manual_evidence import OUTPUT_NAMES, PARAMETER_COLUMNS, export_manual_fit
+from butterfly_saxs.manual_evidence import (
+    OUTPUT_NAMES,
+    PARAMETER_COLUMNS,
+    capture_input_records,
+    export_manual_fit,
+)
 
 
 def _result(tmp_path: Path) -> tuple[dict, dict]:
@@ -50,6 +55,11 @@ def _result(tmp_path: Path) -> tuple[dict, dict]:
         "mask_path": mask,
         "roi": {"type": "ellipse", "cx": 0.0, "cy": 0.0},
         "current_model_ellipses": [{"cx": 0.0, "cy": 0.0, "a": 0.42, "axis_ratio": 0.7, "theta_deg": 22.0}],
+        "fit_input_records": capture_input_records(
+            source=source,
+            poni=poni,
+            mask=mask,
+        ),
     }
     return result, context
 
@@ -77,6 +87,8 @@ def test_manual_evidence_writes_exactly_seven_nonempty_files_and_strict_json(tmp
     assert provenance["inputs"]["source"]["sha256"] == hashlib.sha256(b"source frame").hexdigest()
     assert provenance["inputs"]["poni"]["exists"] is True
     assert provenance["inputs"]["mask"]["exists"] is True
+    assert provenance["fit_time_inputs"] == provenance["inputs"]
+    assert provenance["input_binding_verified"] is True
 
     with (output / "parameters.csv").open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -154,3 +166,24 @@ def test_shape_and_mask_validation_happens_before_writing(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="没有有效像素"):
         export_manual_fit(result, tmp_path / "empty-domain", context=context)
     assert not (tmp_path / "empty-domain").exists()
+
+
+def test_manual_evidence_rejects_a_source_replaced_after_fit(tmp_path: Path) -> None:
+    result, context = _result(tmp_path)
+    source = Path(context["source"])
+    source.write_bytes(b"replacement frame with different bytes")
+    output = tmp_path / "replaced-source"
+
+    with pytest.raises(ValueError, match="source 输入在拟合后已变化"):
+        export_manual_fit(result, output, context=context)
+    assert not output.exists()
+
+
+def test_manual_evidence_fails_closed_when_file_hashes_were_not_captured(tmp_path: Path) -> None:
+    result, context = _result(tmp_path)
+    context.pop("fit_input_records")
+    output = tmp_path / "missing-fit-hashes"
+
+    with pytest.raises(ValueError, match="缺少拟合时输入哈希"):
+        export_manual_fit(result, output, context=context)
+    assert not output.exists()

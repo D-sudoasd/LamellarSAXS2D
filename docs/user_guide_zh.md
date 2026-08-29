@@ -146,7 +146,7 @@ chi_max_deg = -170
 .\.venv-project\Scripts\python.exe -m butterfly_saxs project project.toml --force
 ```
 
-`project` 会按 `inputs.files` 顺序/自然排序逐帧分析，并将单帧 JSON/NPZ 写入 `output.directory`。`--force` 只应在确认目标输出可覆盖时使用。若要获取批处理的统一 CSV/JSONL/NPZ 汇总，使用下一节的 `batch` 命令。
+`project` 会按 manifest（若配置）或 `inputs.files` 的自然顺序逐帧分析，并将单帧 JSON/NPZ 写入 `output.directory`。单帧读取、拟合或质量门失败不会中止其余帧；stdout 会报告 `n_success`/`n_failed`，任一帧失败时进程退出码为 `1`，项目配置或命令错误为 `2`。`--force` 只应在确认目标输出可覆盖时使用。若要获取批处理的统一 CSV/JSONL/NPZ 汇总，使用下一节的 `batch` 命令。
 
 ## 4. beamstop、streak 与 overlap mask
 
@@ -184,7 +184,7 @@ UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY
 5. `Preview` 根据当前参数显示 observed/model/residual/overlay；Overlay 中青色虚线双椭圆来自右侧当前模型参数，橙色实线椭圆来自观测 ridge 的独立拟合，两者不得混作同一证据。`Optimize` 在后台精修可变参数；`Auto Preview` 控制参数改变后的自动预览。状态栏显示 RMSE、ndata、flags、coverage。
 6. 在 `Fit session` 中填写 `Snapshot note` 后点击 `Save snapshot`，可保存多个带顺序和备注的完整参数表；`Restore snapshot` 精确恢复所选参数。每次 Optimize 前软件还会自动保存一次完整状态，`Restore before optimize` 可撤销本次自动精修。取消任务或忽略延迟返回的结果后，旧 worker 不会覆盖当前参数。
 7. 最新一次 Preview 或 Optimize 成功后，填写 `Reviewer`，再点 `Accept current` 或 `Reject current`。修改参数、分析范围、输入、PONI、mask 或 ROI 后，状态会立即回到 `unreviewed`，必须重新 Preview 才能审核或导出。`accepted` 只表示该审核者接受当前人工拟合会话，不表示软件或 P3 科学门给出 PASS。
-8. `Project → Export evidence…`（中文界面为“项目 → 导出拟合证据…”）选择输出目录，固定生成 `observed.png`、`model.png`、`residual.png`、`overlay.png`、`parameters.csv`、`fit_session.json` 和 `provenance.json`。输入是当前屏幕对应的最新 Preview/Optimize、参数表和审核状态；输出默认不覆盖已有同名文件。成功标准是状态栏显示已将 7 个证据文件导出到目标路径，七个文件均非空，`parameters.csv` 与当前参数表一致，两个 JSON 中 q 单位、输入路径/hash 和 `manual_status` 可复核。未审核结果也可以导出，但必须保持 `unreviewed`。
+8. `Project → Export evidence…`（中文界面为“项目 → 导出拟合证据…”）选择输出目录，固定生成 `observed.png`、`model.png`、`residual.png`、`overlay.png`、`parameters.csv`、`fit_session.json` 和 `provenance.json`。输入是当前屏幕对应的最新 Preview/Optimize、参数表和审核状态；输出默认不覆盖已有同名文件。UI 在载入 source/PONI/mask 时记录其 SHA-256，并把该快照绑定到本次 Preview/Optimize；导出前会重新计算当前文件哈希，任一文件被替换、删除或缺少拟合时哈希都会拒绝导出。成功标准是状态栏显示已将 7 个证据文件导出到目标路径，七个文件均非空，`parameters.csv` 与当前参数表一致，两个 JSON 中 q 单位、输入路径/hash、`input_binding_verified=true` 和 `manual_status` 可复核。未审核结果也可以导出，但必须保持 `unreviewed`。
 9. `Project → Save project…` 保存 schema 2 JSON 项目。它保存当前输入、PONI、mask、ROI、参数规格、人工审核状态、Optimize 前后摘要、参数快照、batch 帧列表和 batch 设置；不会把探测器尺寸的 observed/model/residual/qmap 数组塞进项目 JSON。重新打开后会恢复可复现输入与会话状态，再点击 Preview 重建四视图。相对路径按该 JSON 所在目录解析；CLI 的 TOML 仍是另一种项目格式，不要把二者当作同一 schema。
 
 参数 `Vary=false` 是当前帧的固定参数；`Expr` 是受限、可审计的表达式绑定，绑定量不进入自由优化向量。固定参数的 stderr 不是零，见科学文档。

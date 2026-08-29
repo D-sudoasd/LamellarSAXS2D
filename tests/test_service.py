@@ -73,6 +73,28 @@ def test_service_converts_explicit_angstrom_inverse_qmap_to_nm_inverse() -> None
     assert np.allclose(payload["qmap"]["q"], 1.0)
 
 
+def test_service_rejects_q_only_partial_and_inconsistent_coordinates() -> None:
+    image = np.ones((6, 7), dtype=float)
+    original = np.zeros_like(image)
+    qx = np.zeros_like(image)
+    qy = np.ones_like(image)
+    service = ButterflyAnalysisService()
+    service.set_observed(original)
+
+    with pytest.raises(ValueError, match="cannot use q alone"):
+        service.set_observed(image, qmap={"q": np.ones_like(image)})
+
+    with pytest.raises(ValueError, match="provided together"):
+        service.set_observed(image, qx=qx)
+
+    with pytest.raises(ValueError, match="coordinates are inconsistent"):
+        service.set_observed(
+            image,
+            qmap={"qx": qx, "qy": qy, "q": np.full_like(image, 2.0)},
+        )
+    np.testing.assert_array_equal(service.observed, original)
+
+
 def test_service_converts_direct_payload_angstrom_qmap_to_nm_inverse() -> None:
     image = np.ones((3, 4), dtype=float)
     qx = np.full(image.shape, 0.1)

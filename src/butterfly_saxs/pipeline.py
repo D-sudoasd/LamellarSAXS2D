@@ -23,8 +23,15 @@ import re
 
 import numpy as np
 
+from .batch import BatchRunResult, FrameRef, run_batch as run_batch_frames
 from .project import ProjectConfig, load_project
-from .validation import AnalysisDomain, build_analysis_domain, normalise_q_arrays
+from .validation import (
+    AnalysisDomain,
+    AnalysisDomainError,
+    build_analysis_domain,
+    normalise_q_arrays,
+    validate_q_coordinates,
+)
 
 
 class PipelineError(RuntimeError):
@@ -263,11 +270,22 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
         return array
 
     def normalise_mapping(result: dict[str, Any]) -> dict[str, Any]:
-        qx = result.get("qx", result.get("qx_nm_inv"))
-        qy = result.get("qy", result.get("qy_nm_inv"))
-        if qx is None or qy is None:
+        qx = result.get("qx", result.get("qx_nm_inv", result.get("q_x")))
+        qy = result.get("qy", result.get("qy_nm_inv", result.get("q_y")))
+        radial = result.get(
+            "q",
+            result.get(
+                "q_nm_inv",
+                result.get("radius", result.get("q_abs", result.get("q_map"))),
+            ),
+        )
+        if (qx is None) != (qy is None):
+            raise PipelineError("qmap 必须同时提供 qx 和 qy")
+        if qx is None:
+            if radial is not None:
+                raise PipelineError("二维分析不能仅使用 q/radius；qmap 必须提供 qx 和 qy")
             return result
-        q = result.get("q", result.get("q_nm_inv", result.get("radius")))
+        q = radial
         if q is None:
             q = np.hypot(np.asarray(qx, dtype=float), np.asarray(qy, dtype=float))
         metadata = result.get("metadata")
@@ -285,6 +303,10 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
             q,
             source_unit,
         )
+        try:
+            validate_q_coordinates(qx_array, qy_array, q_array)
+        except AnalysisDomainError as exc:
+            raise PipelineError(f"qmap 坐标不一致：{exc}") from exc
         if (
             result.get("q_unit") == "nm^-1"
             and "q_conversion_factor_to_nm_inv" in result
@@ -332,9 +354,9 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
         return normalise_mapping(result)
     attrs: dict[str, Any] = {}
     aliases = {
-        "qx": ("qx", "qx_nm_inv"),
-        "qy": ("qy", "qy_nm_inv"),
-        "q": ("q", "q_nm_inv", "radius"),
+        "qx": ("qx", "qx_nm_inv", "q_x"),
+        "qy": ("qy", "qy_nm_inv", "q_y"),
+        "q": ("q", "q_nm_inv", "radius", "q_abs", "q_map"),
         "theta": ("theta", "chi_rad", "angle"),
         "chi": ("chi", "chi_rad"),
         "mask": ("mask", "bad_mask", "invalid_mask"),
@@ -379,17 +401,7 @@ def _qmap_arrays(qmap: Any, shape: tuple[int, int]) -> tuple[np.ndarray, np.ndar
     qx = qmap.get("qx", qmap.get("qx_nm_inv"))
     qy = qmap.get("qy", qmap.get("qy_nm_inv"))
     if qx is None or qy is None:
-        q = qmap.get("q", qmap.get("q_nm_inv", qmap.get("radius")))
-        if q is None:
-            raise PipelineError("qmap 缺少 qx/qy（或 q/radius）数组")
-        q = np.asarray(q, dtype=float)
-        if q.shape != shape:
-            raise PipelineError(f"qmap 与图像形状不一致：{q.shape} != {shape}")
-        y, x = np.indices(shape, dtype=float)
-        cx = float(np.nanmean(x))
-        cy = float(np.nanmean(y))
-        qx = q * (x - cx) / np.maximum(np.hypot(x - cx, y - cy), 1e-12)
-        qy = q * (y - cy) / np.maximum(np.hypot(x - cx, y - cy), 1e-12)
+        raise PipelineError("二维分析的 qmap 必须同时提供 qx 和 qy")
     qx = np.asarray(qx, dtype=float)
     qy = np.asarray(qy, dtype=float)
     if qx.shape != shape or qy.shape != shape:
@@ -2041,8 +2053,8 @@ def run_project(
     project: ProjectConfig | str | os.PathLike[str],
     *,
     force: bool = False,
-) -> list[PipelineResult]:
-    """Run a project TOML file, resolving relative paths beside the file."""
+) -> BatchRunResult:
+    """Run a project TOML with per-frame failure and quality isolation."""
 
     if isinstance(project, (str, os.PathLike)):
         project_path = Path(project)
@@ -2054,13 +2066,61 @@ def run_project(
         config = ProjectConfig.from_mapping(config)
     if not config.input_paths:
         raise PipelineError("项目配置没有 inputs.files/input_paths")
-    return batch_analyze(
-        config.input_paths,
-        poni=config.poni_path,
-        config=config,
-        output_dir=config.output_dir,
-        full2d=config.full2d,
-        force=force,
+
+    values = _expand_inputs(config.input_paths)
+    if not values:
+        raise PipelineError("项目输入通配符没有匹配任何文件")
+    analysis = config.analysis
+    mode = str(analysis.get("batch_mode", analysis.get("mode", "independent")))
+    manifest = analysis.get("manifest")
+    checkpoint = analysis.get("checkpoint")
+    resume = bool(analysis.get("resume", False))
+    destination = Path(config.output_dir)
+    project_config = config
+    batch_config = ProjectConfig(
+        input_paths=project_config.input_paths,
+        poni_path=project_config.poni_path,
+        output_dir=project_config.output_dir,
+        q_unit=project_config.q_unit,
+        full2d=project_config.full2d,
+        analysis={
+            key: value
+            for key, value in project_config.analysis.items()
+            if key not in {"batch_mode", "mode", "manifest", "checkpoint", "resume"}
+        },
+        export=project_config.export,
+        metadata=project_config.metadata,
+    )
+
+    def analyze_for_project(
+        frame_ref: FrameRef,
+        initial_parameters: Any = None,
+        config: Any = None,
+    ) -> PipelineResult:
+        active_config = config if config is not None else batch_config
+        result = analyze_frame(
+            frame_ref.path,
+            poni=project_config.poni_path,
+            config=active_config,
+            full2d=project_config.full2d,
+            initial_parameters=initial_parameters,
+            frame=frame_ref.frame_selector,
+            dataset=frame_ref.dataset_id or None,
+        )
+        result.output_paths = [
+            os.fspath(path)
+            for path in export_result(result, destination, force=force)
+        ]
+        return result
+
+    return run_batch_frames(
+        values,
+        analyze_for_project,
+        mode=mode,
+        config=batch_config,
+        manifest=manifest,
+        checkpoint=checkpoint,
+        resume=resume,
     )
 
 

@@ -609,6 +609,32 @@ def test_editable_model_ellipses_are_separate_and_follow_parameters(qtbot) -> No
     window.close()
 
 
+def test_project_load_rejects_reversed_roi_instead_of_applying_empty_mask(qtbot, tmp_path) -> None:
+    image_path = tmp_path / "frame.npy"
+    np.save(image_path, np.ones((8, 9), dtype=np.float32))
+    project_path = tmp_path / "invalid-roi.json"
+    project_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "input": str(image_path),
+                "parameters": {},
+                "analysis": {},
+                "rois": [
+                    {"type": "rectangle", "x0": 6, "x1": 2, "y0": 1, "y1": 5}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    window = MainWindow(auto_preview=False)
+    qtbot.addWidget(window)
+    assert not window.load_project(project_path)
+    assert "could not apply project ROIs" in window.status_message.text()
+    window.close()
+
+
 def test_poni_refreshes_physical_q_units_and_partial_failure_clears_images(qtbot) -> None:
     engine = _PoniEngine()
     engine.parameters.update({
@@ -876,6 +902,35 @@ def test_preview_can_be_reviewed_and_exported_but_parameter_edit_blocks_stale_re
     assert not window.export_manual_evidence(tmp_path / "stale-evidence")
     assert not (tmp_path / "stale-evidence").exists()
     assert "evidence_stale" in window.flags_label.text()
+    window.close()
+
+
+def test_manual_evidence_rejects_source_replaced_after_preview(qtbot, tmp_path) -> None:
+    image_path = tmp_path / "frame.npy"
+    observed = np.arange(20, dtype=float).reshape(4, 5) + 1.0
+    np.save(image_path, observed)
+    window = MainWindow(auto_preview=False)
+    qtbot.addWidget(window)
+    assert window.open_image(image_path)
+
+    generation = window._generation.next()
+    window._on_worker_finished(
+        generation,
+        "preview",
+        {
+            "observed": observed,
+            "model": observed * 0.9,
+            "residual": observed * 0.1,
+            "parameters": window.parameter_model.parameter_dict(),
+        },
+    )
+    assert window._current_result_is_reviewable()
+
+    np.save(image_path, np.full_like(observed, 99.0))
+    evidence_dir = tmp_path / "replaced-input-evidence"
+    assert not window.export_manual_evidence(evidence_dir)
+    assert not evidence_dir.exists()
+    assert "evidence_error" in window.flags_label.text()
     window.close()
 
 

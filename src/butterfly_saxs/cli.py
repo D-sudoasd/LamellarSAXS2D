@@ -624,9 +624,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "gui":
             return _handle_gui(args)
         if args.command == "project":
-            results = run_project(args.config, force=args.force)
-            _print_json([result.to_mapping() for result in results])
-            return 0
+            run = run_project(args.config, force=args.force)
+            compact_records = []
+            for item in run.frame_results:
+                record = item.to_record()
+                if hasattr(item.result, "to_mapping"):
+                    record["result"] = item.result.to_mapping()
+                compact_records.append(record)
+            _print_json(
+                {
+                    "mode": run.mode,
+                    "input_hash": run.input_hash,
+                    "config_hash": run.config_hash,
+                    "frames": compact_records,
+                    "n_frames": len(run.frame_results),
+                    "n_success": len(run.successful),
+                    "n_failed": len(run.failures),
+                    "checkpoint": (
+                        str(run.checkpoint) if run.checkpoint is not None else None
+                    ),
+                }
+            )
+            return 1 if run.failures else 0
         if args.command == "preflight":
             return _handle_preflight(args)
         if args.command == "benchmark":

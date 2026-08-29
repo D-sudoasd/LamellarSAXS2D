@@ -12,6 +12,7 @@ from butterfly_saxs.cli import _print_json, build_parser, main
 from butterfly_saxs.intensity import default_intensity_parameters, double_ellipse_intensity
 from butterfly_saxs.pipeline import (
     PipelineError,
+    PipelineResult,
     _configured_external_mask,
     _loaded_frame,
     _coerce_qmap,
@@ -20,6 +21,7 @@ from butterfly_saxs.pipeline import (
     export_result,
     fit_full2d,
     inspect_frame,
+    run_project,
     synthetic_butterfly,
 )
 from butterfly_saxs.project import ProjectConfig, load_project, save_project
@@ -384,6 +386,27 @@ def test_coerce_qmap_skips_none_attributes_and_requires_exact_2d_arrays() -> Non
         _coerce_qmap({"qx": np.zeros((shape[0],)), "qy": np.zeros(shape)}, shape)
 
 
+def test_coerce_qmap_rejects_q_only_and_inconsistent_coordinates() -> None:
+    shape = (4, 5)
+    qx = np.zeros(shape)
+    qy = np.ones(shape)
+
+    with pytest.raises(PipelineError, match="不能仅使用 q/radius"):
+        _coerce_qmap({"q": np.ones(shape), "q_unit": "nm^-1"}, shape)
+
+    with pytest.raises(PipelineError, match="qmap 坐标不一致"):
+        _coerce_qmap(
+            {"qx": qx, "qy": qy, "q": np.full(shape, 2.0), "q_unit": "nm^-1"},
+            shape,
+        )
+
+    with pytest.raises(PipelineError, match="qmap 坐标不一致"):
+        _coerce_qmap(
+            {"q_x": qx, "q_y": qy, "q_abs": np.full(shape, 2.0)},
+            shape,
+        )
+
+
 def test_pipeline_combines_source_config_and_embedded_qmap_masks() -> None:
     image, qmap = synthetic_butterfly((32, 32), return_qmap=True, seed=11)
     source_valid = np.ones(image.shape, dtype=bool)
@@ -623,3 +646,125 @@ def test_cli_analyze_returns_nonzero_for_an_explicit_fit_failure(
     assert main(["analyze", "frame.npy", "--full2d"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["full2d"]["status"] == "failed"
+
+
+def test_run_project_isolates_exceptions_and_quality_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import butterfly_saxs.pipeline as pipeline_module
+
+    inputs = [tmp_path / name for name in ("frame1.npy", "frame2.npy", "frame3.npy", "frame4.npy")]
+    for path in inputs:
+        path.write_bytes(path.name.encode("ascii"))
+    checkpoint = tmp_path / "checkpoint.json"
+    calls: list[tuple[str, object]] = []
+
+    def fake_analyze(source, *, initial_parameters=None, **kwargs):
+        del kwargs
+        path = Path(source)
+        calls.append((path.name, initial_parameters))
+        if path.name == "frame2.npy":
+            raise OSError("simulated read failure")
+        success = path.name != "frame3.npy"
+        return PipelineResult(
+            image=np.ones((2, 2), dtype=float),
+            qmap={"qx": np.zeros((2, 2)), "qy": np.zeros((2, 2)), "q": np.zeros((2, 2))},
+            observables={},
+            ridges=[],
+            ellipse_fit={
+                "status": "ok" if success else "failed",
+                "success": success,
+                "parameters": {"a": 1.25},
+            },
+            metadata={"path": str(path)},
+        )
+
+    monkeypatch.setattr(pipeline_module, "analyze_frame", fake_analyze)
+    run = run_project(
+        ProjectConfig(
+            inputs=inputs,
+            output=tmp_path / "results",
+            analysis={"batch_mode": "warm_start", "checkpoint": str(checkpoint)},
+        )
+    )
+
+    assert [item.status for item in run.frame_results] == ["ok", "failed", "failed", "ok"]
+    assert [name for name, _ in calls] == [path.name for path in inputs]
+    assert calls[1][1] == {"a": 1.25}
+    assert calls[2][1] == {"a": 1.25}
+    assert calls[3][1] == {"a": 1.25}
+    assert "OSError: simulated read failure" in (run.frame_results[1].error or "")
+    assert "ellipse_fit" in (run.frame_results[2].error or "")
+    assert checkpoint.exists()
+    assert (tmp_path / "results" / "frame1.json").exists()
+    assert (tmp_path / "results" / "frame3.json").exists()
+    assert (tmp_path / "results" / "frame4.npz").exists()
+
+
+def test_run_project_resume_toggle_does_not_change_scientific_config_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import butterfly_saxs.pipeline as pipeline_module
+
+    source = tmp_path / "frame.npy"
+    source.write_bytes(b"stable frame")
+    checkpoint = tmp_path / "checkpoint.json"
+    output = tmp_path / "results"
+    calls = 0
+
+    def fake_analyze(path, **kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        return PipelineResult(
+            image=np.ones((2, 2), dtype=float),
+            qmap={"qx": np.zeros((2, 2)), "qy": np.zeros((2, 2)), "q": np.zeros((2, 2))},
+            observables={},
+            ridges=[],
+            ellipse_fit={"status": "ok", "success": True, "parameters": {"a": 1.0}},
+            metadata={"path": str(path)},
+        )
+
+    monkeypatch.setattr(pipeline_module, "analyze_frame", fake_analyze)
+
+    def project(*, resume: bool) -> ProjectConfig:
+        return ProjectConfig(
+            inputs=[source],
+            output=output,
+            analysis={
+                "batch_mode": "independent",
+                "checkpoint": str(checkpoint),
+                "resume": resume,
+            },
+        )
+
+    first = run_project(project(resume=False))
+    resumed = run_project(project(resume=True))
+
+    assert calls == 1
+    assert first.config_hash == resumed.config_hash
+    assert resumed.frame_results[0].resumed is True
+
+
+def test_cli_project_reports_counts_and_returns_nonzero_for_partial_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import butterfly_saxs.cli as cli_module
+    from butterfly_saxs.batch import BatchRunResult, FrameFitResult
+
+    run = BatchRunResult(
+        [
+            FrameFitResult("good.npy", result={"status": "ok"}),
+            FrameFitResult("bad.npy", status="failed", error="simulated failure"),
+        ],
+        mode="independent",
+        input_hash="input-hash",
+        config_hash="config-hash",
+    )
+    monkeypatch.setattr(cli_module, "run_project", lambda *args, **kwargs: run)
+
+    assert main(["project", "project.toml"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["n_frames"] == 2
+    assert report["n_success"] == 1
+    assert report["n_failed"] == 1

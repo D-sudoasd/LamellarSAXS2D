@@ -116,6 +116,53 @@ def normalise_q_arrays(
     }
 
 
+def validate_q_coordinates(
+    qx: Any,
+    qy: Any,
+    q: Any,
+    *,
+    rtol: float = 1e-7,
+    atol: float = 1e-12,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Validate the reciprocal-space identity ``q = hypot(qx, qy)``.
+
+    A radial magnitude alone cannot determine a direction in a two-dimensional
+    detector plane.  Callers must therefore supply all three arrays (or derive
+    ``q`` from ``qx`` and ``qy`` before calling this function).
+    """
+
+    qx_array = np.asarray(qx, dtype=float)
+    qy_array = np.asarray(qy, dtype=float)
+    q_array = np.asarray(q, dtype=float)
+    if qx_array.shape != qy_array.shape or qx_array.shape != q_array.shape:
+        raise AnalysisDomainError(
+            "qx, qy, and q must have identical shapes; "
+            f"got {qx_array.shape}, {qy_array.shape}, and {q_array.shape}"
+        )
+
+    expected = np.hypot(qx_array, qy_array)
+    expected_finite = np.isfinite(expected)
+    supplied_finite = np.isfinite(q_array)
+    if not np.array_equal(expected_finite, supplied_finite):
+        raise AnalysisDomainError(
+            "q finite-value domain is inconsistent with hypot(qx, qy)"
+        )
+    if np.any(expected_finite) and not np.allclose(
+        q_array[expected_finite],
+        expected[expected_finite],
+        rtol=rtol,
+        atol=atol,
+    ):
+        max_difference = float(
+            np.max(np.abs(q_array[expected_finite] - expected[expected_finite]))
+        )
+        raise AnalysisDomainError(
+            "q is inconsistent with hypot(qx, qy); "
+            f"maximum absolute difference is {max_difference:.6g}"
+        )
+    return qx_array, qy_array, q_array
+
+
 def _validate_finite_json(value: Any, path: str = "result") -> None:
     if isinstance(value, str) and value.strip().casefold() in {
         "nan",
@@ -624,5 +671,6 @@ __all__ = [
     "ResultSchemaError",
     "build_analysis_domain",
     "normalise_q_arrays",
+    "validate_q_coordinates",
     "validate_result_schema",
 ]

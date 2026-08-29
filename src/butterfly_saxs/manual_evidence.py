@@ -34,6 +34,7 @@ OUTPUT_NAMES = (
 )
 PARAMETER_COLUMNS = ("name", "value", "min", "max", "vary", "expr", "unit", "stderr")
 _MISSING = object()
+_INPUT_ROLES = ("source", "poni", "mask")
 
 
 def _read(value: Any, names: Sequence[str], default: Any = _MISSING) -> Any:
@@ -568,7 +569,9 @@ def _metrics(result: Any, residual: np.ndarray, valid: np.ndarray) -> dict[str, 
 def _file_record(value: Any) -> dict[str, Any]:
     if value is None or value is _MISSING or isinstance(value, (np.ndarray, list, tuple, Mapping)):
         return {"path": None, "exists": False}
-    path = Path(value).expanduser()
+    if isinstance(value, str) and value.strip().casefold() in {"in-memory", "in_memory"}:
+        return {"path": None, "exists": False}
+    path = Path(value).expanduser().resolve(strict=False)
     record: dict[str, Any] = {"path": str(path), "exists": bool(path.exists() and path.is_file())}
     if record["exists"]:
         digest = hashlib.sha256()
@@ -579,13 +582,86 @@ def _file_record(value: Any) -> dict[str, Any]:
     return record
 
 
-def _provenance(result: Any, context: Mapping[str, Any], q_unit: str) -> dict[str, Any]:
+def capture_input_records(
+    *,
+    source: Any = None,
+    poni: Any = None,
+    mask: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Capture path, existence, and SHA-256 for fit-defining files."""
+
+    return {
+        "source": _file_record(source),
+        "poni": _file_record(poni),
+        "mask": _file_record(mask),
+    }
+
+
+def _canonical_record_path(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    return str(Path(value).expanduser().resolve(strict=False)).casefold()
+
+
+def _verify_input_records(
+    expected: Any,
+    current: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    if expected is None or expected is _MISSING:
+        if any(current[role].get("path") is not None for role in _INPUT_ROLES):
+            raise ValueError("缺少拟合时输入哈希，不能为文件来源的结果导出人工证据")
+        return {role: dict(current[role]) for role in _INPUT_ROLES}
+    if not isinstance(expected, Mapping):
+        raise ValueError("fit_input_records 必须是 source/poni/mask 记录表")
+
+    verified: dict[str, dict[str, Any]] = {}
+    for role in _INPUT_ROLES:
+        record = expected.get(role)
+        if not isinstance(record, Mapping):
+            raise ValueError(f"fit_input_records 缺少 {role} 记录")
+        expected_record = dict(record)
+        current_record = dict(current[role])
+        if _canonical_record_path(expected_record.get("path")) != _canonical_record_path(
+            current_record.get("path")
+        ):
+            raise ValueError(f"{role} 输入路径与拟合时记录不一致")
+        expected_exists = bool(expected_record.get("exists", False))
+        current_exists = bool(current_record.get("exists", False))
+        if expected_exists != current_exists:
+            raise ValueError(f"{role} 输入在拟合后已变化：文件存在状态不一致")
+        if expected_exists:
+            expected_hash = expected_record.get("sha256")
+            current_hash = current_record.get("sha256")
+            if not isinstance(expected_hash, str) or not expected_hash:
+                raise ValueError(f"{role} 的拟合时记录缺少 SHA-256")
+            if expected_hash != current_hash:
+                raise ValueError(f"{role} 输入在拟合后已变化：SHA-256 不一致")
+        verified[role] = expected_record
+    return verified
+
+
+def _input_values(result: Any, context: Mapping[str, Any]) -> tuple[Any, Any, Any]:
     metadata = _first(_read(result, ("metadata", "provenance")), default={})
     if not isinstance(metadata, Mapping):
         metadata = {}
     source = _first(_read(context, ("source", "source_path", "path")), _read(result, ("source", "source_path")), _read(metadata, ("source", "path", "source_path")))
     poni = _first(_read(context, ("poni", "poni_path")), _read(result, ("poni", "poni_path")), _read(metadata, ("poni", "poni_path")))
     mask = _first(_read(context, ("mask_path", "mask_file", "mask")), _read(result, ("mask_path", "mask_file")), _read(metadata, ("mask_path", "mask_file")))
+    return source, poni, mask
+
+
+def _provenance(
+    result: Any,
+    context: Mapping[str, Any],
+    q_unit: str,
+    *,
+    current_inputs: Mapping[str, Mapping[str, Any]],
+    fit_inputs: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    metadata = _first(_read(result, ("metadata", "provenance")), default={})
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    source, poni, mask = _input_values(result, context)
     frame = _first(_read(context, ("frame", "frame_id", "index")), _read(result, ("frame", "frame_id")), _read(metadata, ("frame", "frame_id")))
     dataset = _first(_read(context, ("dataset", "dataset_id")), _read(result, ("dataset", "dataset_id")), _read(metadata, ("dataset", "dataset_id")))
     roi = _first(_read(context, ("roi", "rois", "exclusion_roi")), _read(result, ("roi", "rois", "exclusion_roi")), _read(metadata, ("roi", "rois")))
@@ -606,7 +682,9 @@ def _provenance(result: Any, context: Mapping[str, Any], q_unit: str) -> dict[st
         "mask": _json_safe(mask),
         "roi": _json_safe(roi),
         "q_unit": q_unit,
-        "inputs": {"source": _file_record(source), "poni": _file_record(poni), "mask": _file_record(mask)},
+        "inputs": _json_safe(current_inputs),
+        "fit_time_inputs": _json_safe(fit_inputs),
+        "input_binding_verified": True,
         "output_files": list(OUTPUT_NAMES),
     }
 
@@ -646,6 +724,14 @@ def export_manual_fit(
         raise FileExistsError("输出已存在，未覆盖：" + "、".join(str(path) for path in existing) + "（需要 force=True）")
 
     review_payload = _normalise_review(review)
+    source, poni, mask = _input_values(result_mapping, context_mapping)
+    current_inputs = capture_input_records(source=source, poni=poni, mask=mask)
+    expected_inputs = _first(
+        _read(context_mapping, ("fit_input_records", "input_records")),
+        _read(result_mapping, ("fit_input_records", "input_records")),
+        default=None,
+    )
+    fit_inputs = _verify_input_records(expected_inputs, current_inputs)
     observed, model, residual, qx, q_unit, valid, qy = _extract_arrays(result, context_mapping)
     rows = _parameter_rows(result, context_mapping)
     ridges = _result_ridges(result)
@@ -691,7 +777,15 @@ def export_manual_fit(
     }
     files["parameters.csv"] = _csv_bytes(rows)
     files["fit_session.json"] = _strict_json_bytes(session)
-    files["provenance.json"] = _strict_json_bytes(_provenance(result_mapping, context_mapping, q_unit))
+    files["provenance.json"] = _strict_json_bytes(
+        _provenance(
+            result_mapping,
+            context_mapping,
+            q_unit,
+            current_inputs=current_inputs,
+            fit_inputs=fit_inputs,
+        )
+    )
 
     output.mkdir(parents=True, exist_ok=True)
     for name in OUTPUT_NAMES:
@@ -699,4 +793,9 @@ def export_manual_fit(
     return targets
 
 
-__all__ = ["OUTPUT_NAMES", "PARAMETER_COLUMNS", "export_manual_fit"]
+__all__ = [
+    "OUTPUT_NAMES",
+    "PARAMETER_COLUMNS",
+    "capture_input_records",
+    "export_manual_fit",
+]
