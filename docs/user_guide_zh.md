@@ -171,6 +171,8 @@ chi_max_deg = -170
 
 首次启动默认显示中文。顶栏 `语言 / Language` 菜单可选择 `中文` 或 `English`，切换后窗口、按钮、页签、提示、状态栏、表头、测量图标签和 Fit session 会立即更新，无需重启。选择通过应用级 `QSettings` 的 `ui/language` 键全局记忆，不进入 schema 2 项目 JSON。参数键、q 单位、flags、`manual_status=unreviewed/accepted/rejected`、文件路径和 evidence provenance 始终保持机器可读原值，仅显示文字变化。
 
+中文界面采用“普通操作和说明使用中文、科研标签和工作流名称使用英文”的约定。项目菜单、打开/保存、取消/应用/清除、人工审核、状态和报错仍显示中文；参数、算法、视图、坐标轴、科研表头及工作流名称直接使用英文，不再显示 `English + 中文括注`。例如页签和视图显示为 `Refinement`、`Measurements / Profiles`、`Batch`、`Evolution`、`Observed`、`Model`、`Residual` 和 `Overlay`，右侧分析区显示 `Analysis / Measurement`、`q min`、`draw axis (deg)`、`ridge method`、`curvature sigma` 等标准英文标签。中文 tooltip 继续用中文解释用途和科学边界，但 `ridge`、`lobe`、`detector mask`、`manifest`、`checkpoint` 等稳定术语保持英文且不再追加中文括注。测量表中的布尔结果显示为 `True` 或 `False`，底层布尔值不变；原始 `method`、`flags`、未知状态码和结果字段不翻译。
+
 界面中的参数、分析设置、ROI、审核、批处理、演化选项、按钮、菜单和工具栏动作均提供中英文悬停说明。把鼠标停在输入框、表单标签、参数表表头或单元格上，可查看其作用、单位或特殊取值；下拉菜单中的每个选项也有独立说明。内置经验模型参数会同时提示科学解释边界，例如 `theta_deg` 是表观 q 空间椭圆轴倾角，不能直接作为唯一结构角或材料机理证明；`Stderr` 是可用时的局部拟合标准误，不等于完整实验不确定度。外部引擎注入的未知参数只会明确显示“由当前模型定义”和已声明单位，不会按名称猜测材料学含义。切换语言只重绘这些说明，不改变参数、选中项、任务状态或项目 JSON。
 
 UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY/NPZ/HDF5/CSV/TXT，后者可通过 CLI/API 或注入服务使用。典型顺序：
@@ -179,15 +181,15 @@ UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY
 2. `Project → Select PONI…` 载入几何；`Project → Select external mask…` 载入外部无效像素 mask。
 3. 在右侧参数表编辑 `Value`、`Min`、`Max`、`Vary`、`Expr`、`Unit`。角度的公共 UI 字段使用 degree 标注；内部求解器可用弧度，但不要把 degree 与 radian 混填。
 4. 在 `Exclusion ROI (pixel)` 选择 `Rectangle` 或 `Ellipse`，填写边界/中心与半径，点击 `Apply`；`Clear` 清除 UI 排除区。
-5. `Preview` 根据当前参数显示 observed/model/residual/overlay；Overlay 中青色虚线双椭圆来自右侧当前模型参数，橙色实线椭圆来自观测 ridge 的独立拟合，两者不得混作同一证据。`Optimize` 在后台精修可变参数；`Auto preview` 控制参数改变后的自动预览。状态栏显示 RMSE、ndata、flags、coverage。
-6. 在 `Fit session` 中填写 `Snapshot note` 后点击 `Save snapshot`，可保存多个带顺序和备注的完整参数表；`Restore snapshot` 精确恢复所选参数。每次 Optimize 前软件还会自动保存一次完整状态，`Restore before optimize` 可撤销本次自动精修。取消任务或忽略迟到结果后，旧 worker 不会覆盖当前参数。
+5. `Preview` 根据当前参数显示 observed/model/residual/overlay；Overlay 中青色虚线双椭圆来自右侧当前模型参数，橙色实线椭圆来自观测 ridge 的独立拟合，两者不得混作同一证据。`Optimize` 在后台精修可变参数；`Auto Preview` 控制参数改变后的自动预览。状态栏显示 RMSE、ndata、flags、coverage。
+6. 在 `Fit session` 中填写 `Snapshot note` 后点击 `Save snapshot`，可保存多个带顺序和备注的完整参数表；`Restore snapshot` 精确恢复所选参数。每次 Optimize 前软件还会自动保存一次完整状态，`Restore before optimize` 可撤销本次自动精修。取消任务或忽略延迟返回的结果后，旧 worker 不会覆盖当前参数。
 7. 最新一次 Preview 或 Optimize 成功后，填写 `Reviewer`，再点 `Accept current` 或 `Reject current`。修改参数、分析范围、输入、PONI、mask 或 ROI 后，状态会立即回到 `unreviewed`，必须重新 Preview 才能审核或导出。`accepted` 只表示该审核者接受当前人工拟合会话，不表示软件或 P3 科学门给出 PASS。
-8. `Project → Export evidence…`（中文界面为“项目 → 导出证据…”）选择输出目录，固定生成 `observed.png`、`model.png`、`residual.png`、`overlay.png`、`parameters.csv`、`fit_session.json` 和 `provenance.json`。输入是当前屏幕对应的最新 Preview/Optimize、参数表和审核状态；输出默认不覆盖已有同名文件。成功标准是状态栏显示导出 7 个证据文件，七个文件均非空，`parameters.csv` 与当前参数表一致，两个 JSON 中 q 单位、输入路径/hash 和 `manual_status` 可复核。未审核结果也可以导出，但必须保持 `unreviewed`。
+8. `Project → Export evidence…`（中文界面为“项目 → 导出拟合证据…”）选择输出目录，固定生成 `observed.png`、`model.png`、`residual.png`、`overlay.png`、`parameters.csv`、`fit_session.json` 和 `provenance.json`。输入是当前屏幕对应的最新 Preview/Optimize、参数表和审核状态；输出默认不覆盖已有同名文件。成功标准是状态栏显示已将 7 个证据文件导出到目标路径，七个文件均非空，`parameters.csv` 与当前参数表一致，两个 JSON 中 q 单位、输入路径/hash 和 `manual_status` 可复核。未审核结果也可以导出，但必须保持 `unreviewed`。
 9. `Project → Save project…` 保存 schema 2 JSON 项目。它保存当前输入、PONI、mask、ROI、参数规格、人工审核状态、Optimize 前后摘要、参数快照、batch 帧列表和 batch 设置；不会把探测器尺寸的 observed/model/residual/qmap 数组塞进项目 JSON。重新打开后会恢复可复现输入与会话状态，再点击 Preview 重建四视图。相对路径按该 JSON 所在目录解析；CLI 的 TOML 仍是另一种项目格式，不要把二者当作同一 schema。
 
 参数 `Vary=false` 是当前帧的固定参数；`Expr` 是受限、可审计的表达式绑定，绑定量不进入自由优化向量。固定参数的 stderr 不是零，见科学文档。
 
-载入物理 PONI 后，`a`、`b`、径向宽度和背景宽度等 q 参数的 Unit 会刷新为当前 q 单位。`q min/q max` 只接受有限数值或自动范围标记（中文为 `自动`，英文为 `Auto`），非法文本以及 `q min >= q max` 会在任务启动前报错。Preview/Optimize 若失败或没有返回新 model/residual，界面会清空旧图并显示失败状态，避免把上一轮结果误认为本轮结果。
+载入物理 PONI 后，`a`、`b`、径向宽度和背景宽度等 q 参数的 Unit 会刷新为当前 q 单位。`q min/q max` 只接受有限数值或自动范围标记；中英文界面都显示 `Auto`，解析时仍兼容既有的 `自动` 文本。非法文本以及 `q min >= q max` 会在任务启动前报错。Preview/Optimize 若失败或没有返回新 model/residual，界面会清空旧图并显示失败状态，避免把上一轮结果误认为本轮结果。
 
 ## 6. 批处理、warm start 与恢复
 

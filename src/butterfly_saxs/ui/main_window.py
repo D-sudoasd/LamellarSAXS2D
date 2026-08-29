@@ -1297,6 +1297,27 @@ if QT_AVAILABLE:
                 values["kind"] = self._tr(str(kind_key))
             self.status_message.setText(self._tr(self._status_key, **values))
 
+        def _boolean_table_item(self, value: Any) -> QtWidgets.QTableWidgetItem:
+            """Create a localized boolean item while retaining its raw value."""
+
+            raw_value = bool(value)
+            key = "boolean.true" if raw_value else "boolean.false"
+            item = QtWidgets.QTableWidgetItem(self._tr(key))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, raw_value)
+            return item
+
+        def _retranslate_measurement_booleans(self) -> None:
+            for table in (self.ridge_table, self.lobe_table, self.ellipse_table):
+                for row in range(table.rowCount()):
+                    for column in range(table.columnCount()):
+                        item = table.item(row, column)
+                        if item is None:
+                            continue
+                        raw_value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+                        if isinstance(raw_value, bool):
+                            key = "boolean.true" if raw_value else "boolean.false"
+                            item.setText(self._tr(key))
+
         def _retranslate_ui(self) -> None:
             """Refresh every user-facing label while preserving widget data."""
 
@@ -1506,6 +1527,7 @@ if QT_AVAILABLE:
                 item = self.ellipse_table.item(row, 0)
                 if item is not None:
                     item.setText(self._tr(key))
+            self._retranslate_measurement_booleans()
 
             self.parameter_model.set_language(self._language)
             self.views.set_language(self._language)
@@ -3134,14 +3156,20 @@ if QT_AVAILABLE:
                 if raw_angle is None:
                     raw_angle = _read(point, ("angle", "azimuth", "phi"), None)
                     raw_angle = math.degrees(float(raw_angle)) if raw_angle is not None else None
+                accepted = bool(_read(point, ("accepted", "valid"), True))
                 values = (
                     _format_metric(raw_angle),
                     _format_metric(_read(point, ("q", "q_star", "q_position"), None)),
-                    str(bool(_read(point, ("accepted", "valid"), True))),
+                    accepted,
                     str(_read(point, ("method",), "observed")),
                 )
                 for column, value in enumerate(values):
-                    self.ridge_table.setItem(row_index, column, QtWidgets.QTableWidgetItem(value))
+                    item = (
+                        self._boolean_table_item(value)
+                        if column == 2
+                        else QtWidgets.QTableWidgetItem(str(value))
+                    )
+                    self.ridge_table.setItem(row_index, column, item)
 
             self.lobe_table.setRowCount(len(lobes))
             for row_index, lobe in enumerate(lobes):
@@ -3149,6 +3177,7 @@ if QT_AVAILABLE:
                 if angle is None:
                     raw_angle = _read(lobe, ("angle", "azimuth"), None)
                     angle = math.degrees(float(raw_angle)) if raw_angle is not None else None
+                valid = bool(_read(lobe, ("valid", "accepted"), True))
                 values = (
                     _format_metric(angle),
                     _format_metric(_read(lobe, ("intensity",), None)),
@@ -3156,35 +3185,45 @@ if QT_AVAILABLE:
                     _format_metric(_read(lobe, ("snr",), None)),
                     _format_metric(_read(lobe, ("fwhm_deg",), None)),
                     _format_metric(_read(lobe, ("coverage",), None)),
-                    str(bool(_read(lobe, ("valid", "accepted"), True))),
+                    valid,
                     ", ".join(str(item) for item in _sequence(_read(lobe, ("flags",), ()))),
                 )
                 for column, value in enumerate(values):
-                    self.lobe_table.setItem(row_index, column, QtWidgets.QTableWidgetItem(value))
+                    item = (
+                        self._boolean_table_item(value)
+                        if column == 6
+                        else QtWidgets.QTableWidgetItem(str(value))
+                    )
+                    self.lobe_table.setItem(row_index, column, item)
 
             ellipse_rows = (
-                (self._tr("ellipse.a"), _read(ellipse, ("a",), None)),
-                (self._tr("ellipse.b"), _read(ellipse, ("b",), None)),
-                (self._tr("ellipse.axis_ratio"), _read(ellipse, ("axis_ratio", "axes_ratio"), None)),
-                (self._tr("ellipse.ellipticity"), _read(ellipse, ("ellipticity", "eccentricity"), None)),
+                ("ellipse.a", _read(ellipse, ("a",), None)),
+                ("ellipse.b", _read(ellipse, ("b",), None)),
+                ("ellipse.axis_ratio", _read(ellipse, ("axis_ratio", "axes_ratio"), None)),
+                ("ellipse.ellipticity", _read(ellipse, ("ellipticity", "eccentricity"), None)),
                 # Keep ellipse theta semantically separate from lobe-derived
                 # phi/alpha/psi; no relabelling is performed here.
-                (self._tr("ellipse.theta"), _read(ellipse, ("theta_deg", "angle_deg"), None)),
-                (self._tr("ellipse.ln"), _read(ellipse, ("Ln_from_minor_axis_nm",), None)),
-                (self._tr("ellipse.lz"), _read(ellipse, ("Lz_from_draw_axis_nm",), None)),
-                (self._tr("ellipse.rmse"), _read(ellipse, ("rmse", "residual_rms"), None)),
-                (self._tr("ellipse.rss"), _read(ellipse, ("rss",), None)),
-                (self._tr("ellipse.n_points"), _read(ellipse, ("n_points", "n_data"), None)),
-                (self._tr("ellipse.quality"), _read(ellipse, ("success",), None)),
-                (self._tr("ellipse.flags"), ", ".join(str(item) for item in _sequence(_read(ellipse, ("flags",), ())))),
-                (self._tr("ellipse.phi_app"), _read(observables, ("phi_app_deg",), None)),
-                (self._tr("ellipse.alpha_candidate"), _read(observables, ("alpha_candidate_deg",), None)),
-                (self._tr("ellipse.psi_candidate"), _read(observables, ("psi_candidate_deg",), None)),
+                ("ellipse.theta", _read(ellipse, ("theta_deg", "angle_deg"), None)),
+                ("ellipse.ln", _read(ellipse, ("Ln_from_minor_axis_nm",), None)),
+                ("ellipse.lz", _read(ellipse, ("Lz_from_draw_axis_nm",), None)),
+                ("ellipse.rmse", _read(ellipse, ("rmse", "residual_rms"), None)),
+                ("ellipse.rss", _read(ellipse, ("rss",), None)),
+                ("ellipse.n_points", _read(ellipse, ("n_points", "n_data"), None)),
+                ("ellipse.quality", _read(ellipse, ("success",), None)),
+                ("ellipse.flags", ", ".join(str(item) for item in _sequence(_read(ellipse, ("flags",), ())))),
+                ("ellipse.phi_app", _read(observables, ("phi_app_deg",), None)),
+                ("ellipse.alpha_candidate", _read(observables, ("alpha_candidate_deg",), None)),
+                ("ellipse.psi_candidate", _read(observables, ("psi_candidate_deg",), None)),
             )
             self.ellipse_table.setRowCount(len(ellipse_rows) if ellipse is not None or observables is not None else 0)
-            for row_index, (name, value) in enumerate(ellipse_rows if ellipse is not None or observables is not None else ()):
-                self.ellipse_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(str(name)))
-                self.ellipse_table.setItem(row_index, 1, QtWidgets.QTableWidgetItem(_format_metric(value)))
+            for row_index, (key, value) in enumerate(ellipse_rows if ellipse is not None or observables is not None else ()):
+                self.ellipse_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(self._tr(key)))
+                value_item = (
+                    self._boolean_table_item(value)
+                    if key == "ellipse.quality" and value is not None
+                    else QtWidgets.QTableWidgetItem(_format_metric(value))
+                )
+                self.ellipse_table.setItem(row_index, 1, value_item)
 
         def _update_metrics(self, result: Any, observed: Any, residual: Any) -> None:
             metrics = _result_value(result, ("metrics", "statistics", "summary"), {})
