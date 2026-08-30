@@ -69,7 +69,7 @@ jobs:
       - name: Test
         run: python -m pytest -q --basetemp "${{ runner.temp }}/pytest" -p no:cacheprovider
 
-      - name: CLI smoke
+      - name: CLI and environment smoke
         run: |
           python -m butterfly_saxs --help
           bsaxs preflight --help
@@ -77,6 +77,14 @@ jobs:
           bsaxs annotation-pack --help
           bsaxs p3-status --help
           bsaxs synthetic --shape 16x16
+          bsaxs-doctor --json --require-ui
+
+      - name: Windows desktop-launcher smoke
+        if: runner.os == 'Windows'
+        run: >-
+          python -c "import subprocess, sys;
+          sys.exit(subprocess.call(
+          ['cmd', '/d', '/c', r'启动_LamellarSAXS2D.cmd', '--check']))"
 
   wheel-smoke:
     name: wheel smoke
@@ -106,3 +114,4 @@ jobs:
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pip check
           "$RUNNER_TEMP/wheel-venv/bin/python" -m butterfly_saxs --help
           "$RUNNER_TEMP/wheel-venv/bin/bsaxs" synthetic --shape 16x16
+          "$RUNNER_TEMP/wheel-venv/bin/bsaxs-doctor" --json

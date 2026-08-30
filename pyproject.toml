@@ -63,6 +63,8 @@ Documentation = "https://github.com/D-sudoasd/LamellarSAXS2D/tree/main/docs"
 
 [project.scripts]
 bsaxs = "butterfly_saxs.cli:main"
+bsaxs-doctor = "butterfly_saxs.doctor:main"
+bsaxs-gui = "butterfly_saxs.ui.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
