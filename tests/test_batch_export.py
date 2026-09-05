@@ -468,6 +468,32 @@ def test_export_provenance_records_versions_and_stays_strict_json(tmp_path: Path
     assert manifest["provenance"]["versions"] == versions
 
 
+def test_export_public_radial_lobe_row_contains_paired_angles(tmp_path: Path) -> None:
+    frame = FrameFitResult(
+        frame=FrameRef(tmp_path / "frame1.tif"),
+        result={
+            "lobe_radial_peaks": [
+                {
+                    "angle": float(np.deg2rad(35.0)),
+                    "q_star": 0.42,
+                    "q_unit": "nm^-1",
+                    "valid": True,
+                    "method": "radial_peak",
+                }
+            ],
+            "ridge_points": [],
+        },
+    )
+    outputs = export_batch([frame], tmp_path / "exports")
+
+    with outputs["lobe_measurements"].open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    radial = next(row for row in rows if row["measurement_kind"] == "radial")
+    assert float(radial["angle_rad"]) == pytest.approx(np.deg2rad(35.0))
+    assert float(radial["angle_deg"]) == pytest.approx(35.0)
+    assert radial["angle_unit"] == "rad"
+
+
 def test_npz_metadata_marks_checkpoint_omissions_incomplete(tmp_path: Path) -> None:
     frame = FrameFitResult(
         frame=FrameRef(tmp_path / "frame1.tif"),

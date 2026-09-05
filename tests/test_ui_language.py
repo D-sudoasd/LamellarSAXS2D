@@ -40,12 +40,16 @@ def test_translation_catalogs_match_and_language_validation_is_strict() -> None:
         validate_language("fr")
 
 
-def test_chinese_scientific_term_contract() -> None:
-    canonical_english_keys = {
+def test_chinese_ui_term_contract_preserves_machine_names() -> None:
+    public_ui_keys = {
         "tab.refinement",
         "tab.measurements",
         "tab.batch",
         "tab.evolution",
+        "tab.controls.analysis",
+        "tab.controls.geometry",
+        "tab.controls.roi",
+        "tab.controls.review",
         "dock.parameters",
         "button.preview",
         "button.optimize",
@@ -79,6 +83,8 @@ def test_chinese_scientific_term_contract() -> None:
         "combo.surface_curvature",
         "combo.independent",
         "combo.warm_start",
+        "combo.batch_geometry",
+        "combo.batch_full2d",
         "view.observed",
         "view.model",
         "view.residual",
@@ -126,39 +132,48 @@ def test_chinese_scientific_term_contract() -> None:
         "ellipse.rss",
         "ellipse.flags",
     }
-    assert {key: CATALOGS["zh_CN"][key] for key in canonical_english_keys} == {
-        key: CATALOGS["en"][key] for key in canonical_english_keys
+    translated = {
+        key: CATALOGS["zh_CN"][key]
+        for key in public_ui_keys
+        if CATALOGS["zh_CN"][key] != CATALOGS["en"][key]
     }
     assert {
+        "tab.refinement": "精修",
+        "tab.measurements": "测量 / 剖面",
+        "tab.batch": "批处理",
+        "tab.evolution": "演化",
+        "dock.parameters": "参数",
+        "button.preview": "预览",
+        "button.optimize": "精修",
+        "group.analysis": "分析 / 测量",
+        "view.observed": "观测",
+        "view.model": "模型",
+        "view.residual": "残差",
+        "view.overlay": "叠加",
+        "combo.batch_geometry": "几何测量",
+        "combo.batch_full2d": "Full2D 强度精修",
+    }.items() <= translated.items()
+    machine_keys = (
+        "ellipse.phi_app",
+        "ellipse.alpha_candidate",
+        "ellipse.psi_candidate",
+    )
+    assert {
         key: CATALOGS["zh_CN"][key]
-        for key in (
-            "ellipse.axis_ratio",
-            "ellipse.theta",
-            "ellipse.ln",
-            "ellipse.lz",
-            "ellipse.n_points",
-            "ellipse.quality",
-            "ellipse.phi_app",
-            "ellipse.alpha_candidate",
-            "ellipse.psi_candidate",
-        )
+        for key in machine_keys
     } == {
-        "ellipse.axis_ratio": "axis_ratio",
-        "ellipse.theta": "theta_deg",
-        "ellipse.ln": "L_N (nm)",
-        "ellipse.lz": "L_z (nm)",
-        "ellipse.n_points": "n_points",
-        "ellipse.quality": "success",
         "ellipse.phi_app": "phi_app_deg",
         "ellipse.alpha_candidate": "alpha_candidate_deg",
         "ellipse.psi_candidate": "psi_candidate_deg",
     }
     assert CATALOGS["zh_CN"]["button.cancel"] == "取消"
     assert CATALOGS["zh_CN"]["status.ready"] == "就绪"
-    assert not any(
-        re.search(r"[A-Za-z0-9]\s*（", value)
-        for value in CATALOGS["zh_CN"].values()
-    )
+    # Every locale must retain the same format placeholders even when the
+    # surrounding visible text changes language.
+    for key, english in CATALOGS["en"].items():
+        assert set(re.findall(r"{([^{}]+)}", english)) == set(
+            re.findall(r"{([^{}]+)}", CATALOGS["zh_CN"][key])
+        ), key
 
 
 def test_default_chinese_switch_and_global_persistence(qtbot, tmp_path) -> None:
@@ -171,10 +186,10 @@ def test_default_chinese_switch_and_global_persistence(qtbot, tmp_path) -> None:
     qtbot.addWidget(window)
     assert window.language == "zh_CN"
     assert window.windowTitle() == "LamellarSAXS2D · 二维精修"
-    assert window.preview_button.text() == "Preview"
-    assert window.parameter_model.headerData(0, QtCore.Qt.Orientation.Horizontal) == "Parameter"
-    assert window.views.observed.title_label.text() == "Observed"
-    assert window.fit_session_group.title() == "Fit session"
+    assert window.preview_button.text() == "预览"
+    assert window.parameter_model.headerData(0, QtCore.Qt.Orientation.Horizontal) == "参数"
+    assert window.views.observed.title_label.text() == "观测"
+    assert window.fit_session_group.title() == "拟合会话"
     assert window.manual_status_label.text() == "未审核"
     assert window.chinese_action.isChecked()
 
@@ -206,7 +221,7 @@ def test_default_chinese_switch_and_global_persistence(qtbot, tmp_path) -> None:
     fallback.close()
 
 
-def test_chinese_analysis_panel_uses_english_scientific_labels(qtbot, tmp_path) -> None:
+def test_chinese_analysis_panel_uses_localized_public_labels(qtbot, tmp_path) -> None:
     window = MainWindow(
         engine=object(),
         auto_preview=False,
@@ -223,56 +238,56 @@ def test_chinese_analysis_panel_uses_english_scientific_labels(qtbot, tmp_path) 
             window.batch_page,
             window.evolution_page,
         )
-    ] == ["Refinement", "Measurements / Profiles", "Batch", "Evolution"]
-    assert window.parameters_dock.windowTitle() == "Parameters"
-    assert window.preview_button.text() == "Preview"
-    assert window.optimize_button.text() == "Optimize"
-    assert window.auto_preview_check.text() == "Auto Preview"
-    assert window.batch_resume_check.text() == "Resume checkpoint"
+    ] == ["精修", "测量 / 剖面", "批处理", "演化"]
+    assert window.parameters_dock.windowTitle() == "参数"
+    assert window.preview_button.text() == "预览"
+    assert window.optimize_button.text() == "精修"
+    assert window.auto_preview_check.text() == "自动预览"
+    assert window.batch_resume_check.text() == "恢复 checkpoint"
     assert window.cancel_button.text() == "取消"
     assert window.apply_roi_button.text() == "应用"
     assert window.open_project_action.text() == "打开项目…"
 
     expected_labels = (
-        (window.q_min_edit, "q min"),
-        (window.q_max_edit, "q max"),
-        (window.draw_axis_deg_spin, "draw axis (deg)"),
-        (window.ridge_method_combo, "ridge method"),
-        (window.n_angular_bins_spin, "angular bins"),
-        (window.n_ridge_angles_spin, "ridge angles"),
-        (window.n_radial_bins_spin, "radial bins"),
-        (window.curvature_sigma_spin, "curvature sigma"),
-        (window.curvature_percentile_spin, "curvature percentile"),
-        (window.normal_step_spin, "normal step"),
-        (window.max_pixels_spin, "max pixels"),
+        (window.q_min_edit, "q 下限"),
+        (window.q_max_edit, "q 上限"),
+        (window.draw_axis_deg_spin, "拉伸轴参考（deg）"),
+        (window.ridge_method_combo, "Ridge 方法"),
+        (window.n_angular_bins_spin, "方位分箱数"),
+        (window.n_ridge_angles_spin, "Ridge 方位数"),
+        (window.n_radial_bins_spin, "径向分箱数"),
+        (window.curvature_sigma_spin, "曲率平滑 sigma"),
+        (window.curvature_percentile_spin, "曲率候选分位数"),
+        (window.normal_step_spin, "法向步长"),
+        (window.max_pixels_spin, "最大像素数"),
     )
-    assert window.analysis_group.title() == "Analysis / Measurement"
+    assert window.analysis_group.title() == "分析 / 测量"
     assert [
         window.analysis_form.labelForField(widget).text() for widget, _ in expected_labels
     ] == [expected for _, expected in expected_labels]
-    assert window.q_min_edit.text() == "Auto"
-    assert window.q_max_edit.text() == "Auto"
-    assert window.max_pixels_spin.specialValueText() == "0 (all)"
-    assert window.ridge_method_combo.currentText() == "Radial peak"
+    assert window.q_min_edit.text() == "自动"
+    assert window.q_max_edit.text() == "自动"
+    assert window.max_pixels_spin.specialValueText() == "0（全部）"
+    assert window.ridge_method_combo.currentText() == "径向峰"
     assert window.ridge_method_combo.currentData() == "radial_peak"
     assert "ridge（" not in window.ridge_method_combo.toolTip()
     assert "ridge 位置" in window.ridge_method_combo.toolTip()
 
-    assert window.roi_group.title() == "Exclusion ROI (pixel)"
-    assert window.roi_type_label.text() == "Type"
-    assert window.roi_type_combo.currentText() == "Rectangle"
+    assert window.roi_group.title() == "排除 ROI（像素）"
+    assert window.roi_type_label.text() == "类型"
+    assert window.roi_type_combo.currentText() == "矩形"
     assert window.roi_type_combo.currentData() == "rectangle"
-    assert window.fit_session_group.title() == "Fit session"
+    assert window.fit_session_group.title() == "拟合会话"
     assert window.fit_session_form.labelForField(window.reviewer_edit).text() == "审核人"
-    assert window.batch_form.labelForField(window.batch_mode_combo).text() == "Mode"
+    assert window.batch_form.labelForField(window.batch_mode_combo).text() == "模式"
     assert window.batch_form.labelForField(window.batch_manifest_edit).text() == "Manifest"
     assert window.batch_form.labelForField(window.batch_checkpoint_edit).text() == "Checkpoint"
-    assert window.batch_form.labelForField(window.batch_output_edit).text() == "Output"
+    assert window.batch_form.labelForField(window.batch_output_edit).text() == "输出目录"
     assert window.batch_mode_combo.currentText() == "Independent"
     assert window.batch_mode_combo.currentData() == "independent"
-    assert window.lobe_panel_label.text() == "Four-lobe measurements"
-    assert window.ridge_panel_label.text() == "Ridge q-angle / accepted"
-    assert window.ellipse_panel_label.text() == "Ellipse quantities"
+    assert window.lobe_panel_label.text() == "四 lobe 测量"
+    assert window.ridge_panel_label.text() == "Ridge q-方位角 / 接受状态"
+    assert window.ellipse_panel_label.text() == "椭圆量与质量"
     window.close()
 
 
@@ -295,8 +310,8 @@ def test_default_chinese_auto_values_can_start_preview(qtbot, tmp_path) -> None:
     qtbot.addWidget(window)
     window.set_observed_data(np.ones((3, 4), dtype=float))
 
-    assert window.q_min_edit.text() == "Auto"
-    assert window.q_max_edit.text() == "Auto"
+    assert window.q_min_edit.text() == "自动"
+    assert window.q_max_edit.text() == "自动"
     generation = window.request_preview()
     qtbot.waitUntil(lambda: generation not in window._workers, timeout=3000)
 
@@ -323,7 +338,7 @@ def test_special_value_and_batch_statuses_retranslate_without_changing_codes(
     ]
     window._update_batch_rows(records)
 
-    assert window.max_pixels_spin.specialValueText() == "0 (all)"
+    assert window.max_pixels_spin.specialValueText() == "0（全部）"
     assert [window.batch_table.item(row, 1).text() for row in range(4)] == [
         "成功",
         "失败",
@@ -407,20 +422,20 @@ def test_measurement_terms_and_booleans_retranslate_without_changing_raw_data(
     window._update_measurements(result)
 
     user_role = QtCore.Qt.ItemDataRole.UserRole
-    assert window.lobe_table.horizontalHeaderItem(4).text() == "FWHM (deg)"
+    assert window.lobe_table.horizontalHeaderItem(4).text() == "半高宽（deg）"
     assert window.ridge_table.item(0, 2).text() == "True"
     assert window.ridge_table.item(0, 2).data(user_role) is True
     assert window.ridge_table.item(0, 3).text() == "surface_curvature"
     assert window.lobe_table.item(0, 6).text() == "False"
     assert window.lobe_table.item(0, 6).data(user_role) is False
     assert window.lobe_table.item(0, 7).text() == "raw_lobe_flag"
-    assert window.ellipse_table.item(0, 0).text() == "a (major q)"
-    assert window.ellipse_table.item(2, 0).text() == "axis_ratio"
-    assert window.ellipse_table.item(4, 0).text() == "theta_deg"
-    assert window.ellipse_table.item(5, 0).text() == "L_N (nm)"
-    assert window.ellipse_table.item(6, 0).text() == "L_z (nm)"
-    assert window.ellipse_table.item(9, 0).text() == "n_points"
-    assert window.ellipse_table.item(10, 0).text() == "success"
+    assert window.ellipse_table.item(0, 0).text() == "a（q 长轴）"
+    assert window.ellipse_table.item(2, 0).text() == "轴比 b/a"
+    assert window.ellipse_table.item(4, 0).text() == "椭圆轴角（deg）"
+    assert window.ellipse_table.item(5, 0).text() == "短轴换算 Ln（nm）"
+    assert window.ellipse_table.item(6, 0).text() == "拉伸轴换算 Lz（nm）"
+    assert window.ellipse_table.item(9, 0).text() == "点数"
+    assert window.ellipse_table.item(10, 0).text() == "求解成功"
     assert window.ellipse_table.item(10, 1).text() == "False"
     assert window.ellipse_table.item(10, 1).data(user_role) is False
     assert window.ellipse_table.item(11, 1).text() == "raw_ellipse_flag"

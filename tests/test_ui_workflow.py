@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import time
+import threading
 
 import numpy as np
 import pytest
@@ -236,15 +236,21 @@ def test_image_and_mask_selectors_are_independent(qtbot, tmp_path) -> None:
         frame=1,
         dataset="image_series",
         external_mask=mask_path,
+        mask_frame=1,
+        mask_dataset="mask_series",
     )
 
     assert window._frame == 1
     assert window._dataset == "image_series"
-    assert window._mask_frame == 0
+    assert window._mask_frame == 1
     assert window._mask_dataset == "mask_series"
     assert np.asarray(window._observed)[0, 0] == pytest.approx(2.0)
-    assert bool(window._external_mask[0, 0])
-    assert not bool(window._external_mask[0, 1])
+    assert bool(window._external_mask[0, 1])
+    assert not bool(window._external_mask[0, 0])
+    assert window._loaded_input_records["source"]["frame"] == 1
+    assert window._loaded_input_records["source"]["dataset"] == "image_series"
+    assert window._loaded_input_records["mask"]["frame"] == 1
+    assert window._loaded_input_records["mask"]["dataset"] == "mask_series"
     window.close()
 
 
@@ -502,6 +508,15 @@ class _MeasurementPageEngine:
                     "n_points": 1,
                     "success": True,
                     "flags": ["apparent_geometry_only"],
+                    "symmetry": {
+                        "symmetry_status": "PASS",
+                        "reference_axis_deg": 95.0,
+                        "quadrant_counts": {"QI": 1, "QII": 1, "QIII": 1, "QIV": 1},
+                        "branch_quadrant_counts": {"0": {"QI": 1, "QIII": 1}},
+                        "paired_support": {"ellipse_a": {"fraction": 1.0}},
+                        "branch_leaks": 0,
+                        "unassigned_count": 0,
+                    },
                 },
                 "phi_app_deg": 12.0,
                 "alpha_candidate_deg": None,
@@ -546,6 +561,14 @@ def test_measurement_controls_payload_profiles_page_and_project_roundtrip(qtbot,
     assert window.lobe_table.rowCount() == 1
     assert window.ridge_table.rowCount() == 2
     assert window.ellipse_table.rowCount() > 0
+    assert window.profile_summary_label.text()
+    assert "Symmetry" in window.profile_summary_label.text()
+    assert "Samples" in window.profile_summary_label.accessibleDescription()
+    assert "Symmetry" in window.profile_summary_label.accessibleDescription()
+    if window.angular_plot is not None:
+        assert window.angular_plot.plotItem.legend is not None
+        assert window.coverage_plot.plotItem.legend is not None
+        assert window.ridge_plot.plotItem.legend is not None
     assert window.cancel_button.text() == "Cancel"
     assert window.ignore_late_result_button.text() == "Ignore late result"
 
@@ -701,9 +724,18 @@ def test_programmatic_analysis_change_rejects_an_older_worker_result(qtbot) -> N
 
 def test_optimize_pre_snapshot_is_detached_and_stale_result_cannot_change_candidate(qtbot) -> None:
     class _SlowOptimizeEngine(_StateEngine):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.saw_cancel = False
+
         def optimize(self, *, parameters, payload):
-            del parameters, payload
-            time.sleep(0.1)
+            del parameters
+            self.started.set()
+            self.release.wait(2.0)
+            cancel_event = payload.get("cancel_event") if isinstance(payload, dict) else None
+            self.saw_cancel = bool(cancel_event is not None and cancel_event.is_set())
             return {"parameters": {"theta_deg": {"value": 5.0, "unit": "degree"}}}
 
     engine = _SlowOptimizeEngine()
@@ -711,20 +743,22 @@ def test_optimize_pre_snapshot_is_detached_and_stale_result_cannot_change_candid
     qtbot.addWidget(window)
     observed = np.arange(12, dtype=float).reshape(3, 4)
     window.set_observed_data(observed)
-    generation = window.request_optimize()
+    window.request_optimize()
+    qtbot.waitUntil(engine.started.is_set, timeout=2_000)
     before = window._fit_session["optimize_before"]
 
     assert before["parameters"]["theta_deg"]["value"] == pytest.approx(10.0)
-    assert np.array_equal(before["input"]["data"], observed)
+    # The GUI snapshot retains selectors/configuration only; detector-sized
+    # arrays remain owned by the loaded frame/service and are never copied on
+    # the event thread.
+    assert "data" not in before["input"]
     observed[0, 0] = 999.0
-    assert before["input"]["data"][0, 0] != pytest.approx(999.0)
+    assert before["input"].get("path") is None or before["input"].get("path") == window._source_path
 
     window.cancel_jobs()
-    window._on_worker_finished(
-        generation,
-        "optimize",
-        {"parameters": {"theta_deg": {"value": 5.0, "unit": "degree"}}},
-    )
+    engine.release.set()
+    qtbot.waitUntil(lambda: not window._workers, timeout=2_000)
+    assert engine.saw_cancel is True
     assert window.parameters["theta_deg"] == pytest.approx(10.0)
     assert window._fit_session["optimize_after"] is None
     window.close()
@@ -749,6 +783,12 @@ def test_optimize_review_requires_explicit_reviewer_and_edit_invalidates_status(
         },
     )
 
+    after = window._fit_session["optimize_after"]
+    assert after is not None
+    assert "data" not in after["input"]
+    assert "qmap" not in after
+    assert "file" not in after["mask"]
+    assert after["result_summary"]["shape"] == [4, 5]
     assert window.fit_session["manual_status"] == "unreviewed"
     assert not window.accept_current()
     window.reviewer_edit.setText("Dr. Reviewer")

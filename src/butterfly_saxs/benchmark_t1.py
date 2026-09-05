@@ -31,6 +31,7 @@ from .intensity import double_ellipse_intensity, ellipse_polar_radius, parameter
 T1_SCHEMA_VERSION = "t1.same_model.v1"
 T1_BENCHMARK_ID = "P3.1/T1"
 T1_Q_UNIT = "nm^-1"
+T1_TRUTH_Q_WINDOW = (0.15, 1.25)
 DEFAULT_T1_SEED = 20260827
 GENERATOR_VERSION = "t1-same-model-v2"
 MODEL_SCOPE = "same_model_empirical_synthetic"
@@ -316,6 +317,7 @@ class T1Sample(Mapping[str, Any]):
     truth_background: np.ndarray
     truth_ridge_plus: np.ndarray
     truth_ridge_minus: np.ndarray
+    truth_ridge_support: np.ndarray
     mask_components: Mapping[str, np.ndarray]
     truth: dict[str, Any]
     poisson_counts: np.ndarray | None = None
@@ -350,6 +352,7 @@ class T1Sample(Mapping[str, Any]):
             "noise": self.noise,
             "truth_ridge_plus": self.truth_ridge_plus,
             "truth_ridge_minus": self.truth_ridge_minus,
+            "truth_ridge_support": self.truth_ridge_support,
         }
         for name in _ARTIFACT_NAMES:
             arrays[f"mask_{name}"] = np.asarray(
@@ -675,6 +678,17 @@ def generate_case(
     ridge_minus = np.asarray(
         ellipse_polar_radius(angle, values["a"], values["b"], -float(values["theta"])), dtype=np.float64
     )
+    # This is a declared analytic support domain for P4 truth scoring.  It is
+    # deliberately independent of measured intensity, interpolation, or peak
+    # finding: detector validity is supplied separately by ``valid_mask`` and
+    # applied by the validator.
+    truth_ridge_support = (
+        np.isfinite(ridge_plus)
+        & np.isfinite(ridge_minus)
+        & np.isfinite(q)
+        & (q >= float(T1_TRUTH_Q_WINDOW[0]))
+        & (q <= float(T1_TRUTH_Q_WINDOW[1]))
+    )
 
     if not all(np.all(np.isfinite(array)) for array in (observed, model_intensity, noise, qx, qy, q, ridge_plus, ridge_minus)):
         raise ValueError("T1 generator produced a non-finite array")
@@ -746,6 +760,11 @@ def generate_case(
             "qx_qy_q": "reciprocal-space coordinates in nm^-1, float64, finite",
             "mask": "detector polarity: True means excluded/invalid",
             "truth_ridge_plus_minus": "analytic model radial trajectories in q units",
+            "truth_ridge_support": (
+                "finite analytic plus/minus trajectories with q in "
+                f"[{T1_TRUTH_Q_WINDOW[0]}, {T1_TRUTH_Q_WINDOW[1]}] {T1_Q_UNIT}; "
+                "detector valid_mask is applied separately"
+            ),
         },
     }
 
@@ -762,6 +781,7 @@ def generate_case(
         truth_background=truth_background,
         truth_ridge_plus=ridge_plus,
         truth_ridge_minus=ridge_minus,
+        truth_ridge_support=truth_ridge_support,
         mask_components=masks,
         truth=_json_safe(truth),
         poisson_counts=poisson_counts,
@@ -1049,8 +1069,10 @@ def write_evidence_directory(
                 "category": sample.case.category,
                 "npz": files["npz"].name,
                 "npz_file": files["npz"].name,
+                "npz_sha256": _source_hash(files["npz"]),
                 "truth_json": files["truth_json"].name,
                 "truth_file": files["truth_json"].name,
+                "truth_json_sha256": _source_hash(files["truth_json"]),
                 "same_model": True,
                 "within_single_model": not sample.case.non_elliptic,
                 "scientific_scope": sample.truth["scientific_scope"],
@@ -1094,8 +1116,12 @@ def write_evidence_directory(
                 "qy",
                 "q",
                 "mask",
+                "valid_mask",
                 "truth_intensity",
                 "noise",
+                "truth_ridge_plus",
+                "truth_ridge_minus",
+                "truth_ridge_support",
                 "q_unit",
                 "generator_version",
                 "generator_hash",
@@ -1141,6 +1167,7 @@ __all__ = [
     "T1Sample",
     "T1_SCHEMA_VERSION",
     "T1_Q_UNIT",
+    "T1_TRUTH_Q_WINDOW",
     "CaseSpec",
     "default_cases",
     "default_t1_cases",

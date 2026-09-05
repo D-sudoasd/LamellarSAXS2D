@@ -39,6 +39,14 @@ def _module_hash() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 GENERATOR_HASH = _module_hash()
 
 
@@ -202,10 +210,15 @@ def _case_from_mapping(values: Mapping[str, Any]) -> CaseSpec:
     base = _resolve_case(str(raw_name))
     merged = asdict(base)
     aliases = {"name": "case_id", "id": "case_id"}
+    allowed = set(merged) | set(aliases)
+    unknown = sorted(str(key) for key in values if key not in allowed)
+    if unknown:
+        raise ValueError(
+            "unknown T2 case mapping key(s): " + ", ".join(unknown)
+        )
     for key, value in values.items():
         field_name = aliases.get(key, key)
-        if field_name in merged:
-            merged[field_name] = value
+        merged[field_name] = value
     merged["orientation_offsets_deg"] = tuple(float(v) for v in merged["orientation_offsets_deg"])
     merged["orientation_weights"] = tuple(float(v) for v in merged["orientation_weights"])
     return CaseSpec(**merged)
@@ -686,7 +699,9 @@ def write_evidence_directory(
         )
         filename = f"{_safe_filename(spec.case_id)}.npz"
         np.savez_compressed(destination / filename, **_case_npz_payload(result))
-        records.append(_manifest_record(result, filename))
+        record = _manifest_record(result, filename)
+        record["npz_sha256"] = _sha256_file(destination / filename)
+        records.append(record)
 
     manifest = {
         "schema": "t2_truth_manifest_v1",

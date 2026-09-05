@@ -27,22 +27,26 @@ def test_p4_periodic_lobe_assignment_wraps_at_180_degrees() -> None:
     assert sorted(errors) == pytest.approx([1.0, 1.0])
 
 
-def test_t1_f1_reference_uses_visible_truth_sectors_not_latent_full_ellipse() -> None:
-    sample = generate_case("noiseless_default")
-    arrays = {
-        "truth_intensity": sample.truth_intensity,
-        "valid_mask": ~sample.mask,
-        "qx": sample.qx,
-        "qy": sample.qy,
-        "q": sample.q,
-        "q_unit": sample.truth["q_unit"],
-    }
+def test_t1_f1_reference_uses_declared_truth_support_and_detector_mask() -> None:
+    full = generate_case("noiseless_default")
+    full_angles = _t1_visible_ridge_angles(full.arrays())
+    assert full_angles is not None
+    assert len(full_angles) == 72
+    assert all(np.isfinite(value) for value in full_angles)
 
-    angles = _t1_visible_ridge_angles(arrays)
+    masked = generate_case("missing_sector")
+    masked_angles = _t1_visible_ridge_angles(masked.arrays())
+    assert masked_angles is not None
+    assert 0 < len(masked_angles) < 72
+    assert len(masked_angles) < len(full_angles)
 
-    assert angles is not None
-    assert 0 < len(angles) < 72
-    assert all(np.isfinite(value) for value in angles)
+
+def test_t1_truth_visibility_is_independent_of_intensity_values() -> None:
+    sample = generate_case("missing_sector")
+    arrays = sample.arrays()
+    arrays["truth_intensity"] = np.full(sample.shape, 1e9, dtype=float)
+    arrays["intensity"] = np.zeros(sample.shape, dtype=float)
+    assert _t1_visible_ridge_angles(arrays) == _t1_visible_ridge_angles(sample.arrays())
 
 
 def test_t1_detector_error_uses_axis_specific_q_spacing() -> None:

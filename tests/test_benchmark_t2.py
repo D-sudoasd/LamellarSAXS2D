@@ -130,6 +130,11 @@ def test_evidence_manifest_is_finite_and_no_overwrite(tmp_path: Path) -> None:
     assert manifest["generator_hash"] == benchmark_t2.GENERATOR_HASH
     assert manifest["cases"][0]["seed"] == 99
     assert manifest["cases"][1]["seed"] == 100
+    for record in manifest["cases"]:
+        artifact = output_dir / record["npz_file"]
+        assert record["npz_sha256"] == __import__("hashlib").sha256(
+            artifact.read_bytes()
+        ).hexdigest()
     assert "intensity_noisy" not in json.dumps(manifest)
 
     keep = output_dir / "unrelated.txt"

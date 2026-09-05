@@ -22,7 +22,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
 from .benchmark_t1 import DEFAULT_CASE_NAMES as T1_DEFAULT_CASE_NAMES
-from .observables import ellipse_radius, measure_radial_ridges
+from .observables import ellipse_radius
 from .pipeline import analyze_frame
 
 
@@ -132,9 +132,17 @@ def _assigned_periodic_errors(
     return [float(cost[row, column]) for row, column in zip(rows, columns)]
 
 
-def _case_arrays(path: Path) -> dict[str, np.ndarray | str]:
+def _case_arrays(
+    path: Path,
+    *,
+    require_t1_truth: bool = False,
+) -> dict[str, np.ndarray | str]:
     with np.load(path, allow_pickle=False) as archive:
-        required = ("intensity", "qx", "qy", "q", "valid_mask", "q_unit")
+        required = ["intensity", "qx", "qy", "q", "valid_mask", "q_unit"]
+        if require_t1_truth:
+            required.extend(
+                ("truth_ridge_plus", "truth_ridge_minus", "truth_ridge_support")
+            )
         missing = [name for name in required if name not in archive.files]
         if missing:
             raise ValueError(f"P4 case {path} is missing arrays: {missing}")
@@ -148,6 +156,26 @@ def _case_arrays(path: Path) -> dict[str, np.ndarray | str]:
             **(
                 {"truth_intensity": np.asarray(archive["truth_intensity"], dtype=float)}
                 if "truth_intensity" in archive.files
+                else {}
+            ),
+            **(
+                {
+                    "truth_ridge_plus": np.asarray(
+                        archive["truth_ridge_plus"], dtype=float
+                    ),
+                    "truth_ridge_minus": np.asarray(
+                        archive["truth_ridge_minus"], dtype=float
+                    ),
+                    "truth_ridge_support": np.asarray(
+                        archive["truth_ridge_support"], dtype=bool
+                    ),
+                }
+                if {
+                    "truth_ridge_plus",
+                    "truth_ridge_minus",
+                    "truth_ridge_support",
+                }
+                <= set(archive.files)
                 else {}
             ),
             **(
@@ -194,25 +222,49 @@ def _ridge_rows(result: Any) -> list[dict[str, Any]]:
 
 
 def _t1_visible_ridge_angles(arrays: Mapping[str, Any]) -> set[float] | None:
-    truth_intensity = arrays.get("truth_intensity")
-    if truth_intensity is None:
+    plus = arrays.get("truth_ridge_plus")
+    minus = arrays.get("truth_ridge_minus")
+    support = arrays.get("truth_ridge_support")
+    qx = arrays.get("qx")
+    qy = arrays.get("qy")
+    valid_mask = arrays.get("valid_mask")
+    if any(value is None for value in (plus, minus, support, qx, qy, valid_mask)):
         return None
-    qmap = {
-        "qx": arrays["qx"],
-        "qy": arrays["qy"],
-        "q": arrays["q"],
-        "q_unit": arrays["q_unit"],
-    }
-    track = measure_radial_ridges(
-        {"data": truth_intensity, "valid_mask": arrays["valid_mask"]},
-        qmap,
-        (0.15, 1.25),
-        n_angles=72,
-        n_bins=128,
+    plus_array = np.asarray(plus, dtype=float)
+    minus_array = np.asarray(minus, dtype=float)
+    support_array = np.asarray(support, dtype=bool)
+    valid_array = np.asarray(valid_mask, dtype=bool)
+    qx_array = np.asarray(qx, dtype=float)
+    qy_array = np.asarray(qy, dtype=float)
+    if not (
+        plus_array.shape
+        == minus_array.shape
+        == support_array.shape
+        == valid_array.shape
+        == qx_array.shape
+        == qy_array.shape
+    ):
+        return None
+    # Independent truth support: the generator declares where the analytic
+    # plus/minus trajectories are defined.  Only detector validity is applied
+    # here; no radial interpolation, peak finding, or measured intensity is
+    # consulted.  The 72 sector centers match the P4 analysis contract
+    # (-180 degrees inclusive, five-degree spacing).
+    visible = (
+        support_array
+        & valid_array
+        & np.isfinite(plus_array)
+        & np.isfinite(minus_array)
+        & np.isfinite(qx_array)
+        & np.isfinite(qy_array)
     )
+    angle = np.mod(np.arctan2(qy_array, qx_array), 2.0 * np.pi)
+    sector = np.floor(angle / (2.0 * np.pi) * 72.0).astype(np.int64)
+    sector = np.clip(sector, 0, 71)
+    visible_sectors = np.unique(sector[visible]) if np.any(visible) else np.asarray([], dtype=int)
     return {
-        round(float(np.degrees(angle)), 6)
-        for angle in track.angles[track.valid]
+        round(float(-180.0 + 5.0 * index), 6)
+        for index in visible_sectors.tolist()
     }
 
 
@@ -303,7 +355,9 @@ def _t1_metrics(
         "ridge_precision_at_1px": float(precision),
         "ridge_recall_at_1px": float(recall),
         "truth_visible_ridge_count": int(denominator),
-        "truth_visibility_method": "same_sampling_noiseless_truth_continuity_track",
+        "truth_visibility_method": (
+            "independent_analytic_truth_ridge_plus_minus_with_declared_support_and_valid_mask"
+        ),
         "lobe_periodic_angle_error_deg": max(lobe_errors) if lobe_errors else None,
         "valid_lobe_count": len(measured_lobes),
         "truth_lobe_count": len(truth_lobes),
@@ -479,7 +533,7 @@ def _run_t1(
         npz_path = manifest_path.parent / str(entry.get("npz_file", entry.get("npz")))
         truth_path = manifest_path.parent / str(entry.get("truth_json", entry.get("truth_file")))
         truth = _read_json(truth_path)
-        arrays = _case_arrays(npz_path)
+        arrays = _case_arrays(npz_path, require_t1_truth=True)
         result = _analyze_case(arrays, q_window=(0.15, 1.25), ridge_method=ridge_method)
         metrics = _t1_metrics(result, truth, arrays)
         quality_status = _quality_status(result.ellipse_fit.get("quality_status")) or "UNKNOWN"

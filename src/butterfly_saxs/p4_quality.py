@@ -31,6 +31,13 @@ DEFAULT_ENGINEERING_THRESHOLDS: dict[str, float] = {
     "condition_warn": 1.0e8,
     "condition_fail": 1.0e12,
     "near_circular_axis_ratio": 0.98,
+    # These diagnostics are deliberately conservative.  They expose when a
+    # thin ellipse is being extrapolated from wing arcs; they do not turn a
+    # finite optimizer result into a physical acceptance claim.
+    "short_arc_span_fail_deg": 90.0,
+    "short_arc_span_warn_deg": 180.0,
+    "flat_axis_ratio_warn": 0.10,
+    "major_axis_extrapolation_fraction": 0.05,
 }
 
 
@@ -202,6 +209,45 @@ def evaluate_p4_ellipse_quality(
     if q_unit is None:
         q_unit = _read(ellipse, "q_unit", "unknown")
 
+    # Estimate how much of the fitted major-axis extent is directly observed.
+    # This is a support diagnostic only.  A large fitted ``a`` can be a valid
+    # empirical continuation of a wing, but it is not identified by data that
+    # never reach that extent.
+    observed_major_extent: float | None = None
+    observed_radius_max: float | None = None
+    fit_a = _finite(_read(ellipse, "a", _read(values, "a", None)))
+    fit_theta = _finite(_read(ellipse, "theta", _read(values, "theta", None)))
+    fit_cx = _finite(_read(ellipse, "cx", _read(values, "cx", None)))
+    fit_cy = _finite(_read(ellipse, "cy", _read(values, "cy", None)))
+    reference_axis_deg = _finite(_read(ellipse, "reference_axis_deg", 0.0)) or 0.0
+    if fit_a is not None and fit_a > 0.0 and fit_theta is not None and fit_cx is not None and fit_cy is not None:
+        qx_values: list[float] = []
+        qy_values: list[float] = []
+        for point in valid_rows:
+            x = _finite(_read(point, "qx", _read(point, "x", None)))
+            y = _finite(_read(point, "qy", _read(point, "y", None)))
+            if x is None or y is None:
+                q_value = _finite(_read(point, "q", _read(point, "q_star", None)))
+                angle_value = _finite(_read(point, "angle", _read(point, "azimuth", None)))
+                if q_value is None or angle_value is None:
+                    continue
+                x = q_value * float(np.cos(angle_value))
+                y = q_value * float(np.sin(angle_value))
+            qx_values.append(float(x))
+            qy_values.append(float(y))
+        if qx_values:
+            qx_array = np.asarray(qx_values, dtype=float)
+            qy_array = np.asarray(qy_values, dtype=float)
+            laboratory_theta = np.deg2rad(reference_axis_deg) + fit_theta
+            longitudinal = (
+                np.cos(laboratory_theta) * (qx_array - fit_cx)
+                + np.sin(laboratory_theta) * (qy_array - fit_cy)
+            )
+            observed_major_extent = float(np.max(np.abs(longitudinal)) / fit_a)
+            observed_radius_max = float(
+                np.max(np.hypot(qx_array - fit_cx, qy_array - fit_cy))
+            )
+
     checks: list[dict[str, Any]] = []
 
     def add(name: str, status: str, value: Any, limit: Any, message: str) -> None:
@@ -317,6 +363,48 @@ def evaluate_p4_ellipse_quality(
         "both fitted branches have observed support" if both_branches else "one fitted branch has no observed support",
     )
 
+    symmetry = _read(ellipse, "symmetry", {}) or {}
+    if isinstance(symmetry, Mapping) and symmetry:
+        branch_leaks = _read(symmetry, "branch_leaks", {}) or {}
+        selected_leaks = int(_finite(_read(branch_leaks, "selected", 0)) or 0)
+        paired_support = _read(symmetry, "paired_support", {}) or {}
+        paired_values = paired_support.values() if isinstance(paired_support, Mapping) else ()
+        missing_opposite = int(
+            sum(
+                int(_finite(_read(value, "missing_opposite_count", 0)) or 0)
+                for value in paired_values
+                if isinstance(value, Mapping)
+            )
+        )
+        unassigned = int(_finite(_read(symmetry, "unassigned_count", 0)) or 0)
+        symmetry_status = str(_read(symmetry, "symmetry_status", "WARN"))
+        if selected_leaks:
+            symmetry_check_status = "FAIL"
+            symmetry_message = "observed points leak across the fixed opposite-quadrant branch pairing"
+        elif missing_opposite:
+            symmetry_check_status = "WARN"
+            symmetry_message = "one or more opposite quadrants lack an observed counterpart"
+        elif symmetry_status not in {"PASS"} or unassigned:
+            symmetry_check_status = "WARN"
+            symmetry_message = "symmetry pairing is observationally incomplete or center-unverified"
+        else:
+            symmetry_check_status = "PASS"
+            symmetry_message = "observed quadrant pairing is consistent"
+        add(
+            "symmetry_quadrant_pairing",
+            symmetry_check_status,
+            {
+                "status": symmetry_status,
+                "quadrant_counts": _read(symmetry, "quadrant_counts", {}),
+                "branch_quadrant_counts": _read(symmetry, "branch_quadrant_counts", {}),
+                "paired_support": paired_support,
+                "branch_leaks": branch_leaks,
+                "unassigned_count": unassigned,
+            },
+            {"missing_opposite_count": 0, "branch_leaks": 0},
+            symmetry_message,
+        )
+
     if coverage is None:
         coverage_status = "FAIL"
         coverage_message = "angular coverage is unavailable"
@@ -370,6 +458,18 @@ def evaluate_p4_ellipse_quality(
         [],
         "critical parameter reached a bound" if critical_bound_names else "critical parameters are away from bounds",
     )
+    add(
+        "bound_saturation",
+        "FAIL" if critical_bound_names else "PASS",
+        {
+            "critical_bound_names": critical_bound_names,
+            # Retain this explicit name for UI/export consumers while making
+            # the compatibility relationship with the older check clear.
+            "alias_of": "critical_parameter_bounds",
+        },
+        {"critical_parameters": ("a", "axis_ratio", "theta")},
+        "fit is saturated at a critical parameter bound" if critical_bound_names else "critical fit parameters are not bound-saturated",
+    )
 
     if residual_width_ratio is None:
         residual_status = "WARN"
@@ -398,6 +498,110 @@ def evaluate_p4_ellipse_quality(
         },
         {"axis_ratio_warn_at_or_above": limits["near_circular_axis_ratio"]},
         "ellipse is nearly circular; theta is not reliably identifiable" if near_circular else "axis ratio supports an orientation estimate",
+    )
+
+    coverage_span = _finite(_read(_read(ellipse, "coverage", None), "angular_span", None))
+    if coverage_span is None and coverage is not None:
+        coverage_span = float(coverage * 2.0 * np.pi)
+    span_deg = float(np.degrees(coverage_span)) if coverage_span is not None else None
+    if span_deg is None:
+        add(
+            "short_arc",
+            "WARN",
+            None,
+            {
+                "fail_below_deg": limits["short_arc_span_fail_deg"],
+                "warn_below_deg": limits["short_arc_span_warn_deg"],
+            },
+            "fitted angular span is unavailable",
+        )
+    elif span_deg < limits["short_arc_span_fail_deg"]:
+        add(
+            "short_arc",
+            "FAIL",
+            span_deg,
+            {
+                "fail_below_deg": limits["short_arc_span_fail_deg"],
+                "warn_below_deg": limits["short_arc_span_warn_deg"],
+            },
+            "ellipse is fitted from a short angular arc",
+        )
+    elif span_deg < limits["short_arc_span_warn_deg"]:
+        add(
+            "short_arc",
+            "WARN",
+            span_deg,
+            {
+                "fail_below_deg": limits["short_arc_span_fail_deg"],
+                "warn_below_deg": limits["short_arc_span_warn_deg"],
+            },
+            "ellipse angular support is limited",
+        )
+    else:
+        add(
+            "short_arc",
+            "PASS",
+            span_deg,
+            {
+                "fail_below_deg": limits["short_arc_span_fail_deg"],
+                "warn_below_deg": limits["short_arc_span_warn_deg"],
+            },
+            "ellipse angular support spans a broad arc",
+        )
+
+    if observed_major_extent is None:
+        add(
+            "major_axis_extrapolated",
+            "WARN" if axis_ratio is not None and axis_ratio <= limits["flat_axis_ratio_warn"] else "PASS",
+            None,
+            {"minimum_direct_extent_fraction": 1.0 - limits["major_axis_extrapolation_fraction"]},
+            (
+                "direct major-axis extent is unavailable for a flat ellipse"
+                if axis_ratio is not None and axis_ratio <= limits["flat_axis_ratio_warn"]
+                else "direct major-axis extent is unavailable"
+            ),
+        )
+    elif observed_major_extent < 1.0 - limits["major_axis_extrapolation_fraction"]:
+        add(
+            "major_axis_extrapolated",
+            "WARN",
+            observed_major_extent,
+            {"minimum_direct_extent_fraction": 1.0 - limits["major_axis_extrapolation_fraction"]},
+            "fitted major axis extends beyond the observed ridge support",
+        )
+    else:
+        add(
+            "major_axis_extrapolated",
+            "PASS",
+            observed_major_extent,
+            {"minimum_direct_extent_fraction": 1.0 - limits["major_axis_extrapolation_fraction"]},
+            "fitted major axis is directly supported by observed ridge extent",
+        )
+
+    flat_nonidentifiable = bool(
+        axis_ratio is not None
+        and axis_ratio <= limits["flat_axis_ratio_warn"]
+        and (
+            observed_major_extent is None
+            or observed_major_extent < 1.0 - limits["major_axis_extrapolation_fraction"]
+            or (span_deg is not None and span_deg < limits["short_arc_span_warn_deg"])
+        )
+    )
+    add(
+        "flat_ellipse_nonidentifiable",
+        "WARN" if flat_nonidentifiable else "PASS",
+        {
+            "axis_ratio": axis_ratio,
+            "direct_major_extent_fraction": observed_major_extent,
+            "angular_span_deg": span_deg,
+        },
+        {
+            "axis_ratio_warn_below": limits["flat_axis_ratio_warn"],
+            "minimum_direct_extent_fraction": 1.0 - limits["major_axis_extrapolation_fraction"],
+        },
+        "thin ellipse parameters are weakly identified by the available arc support"
+        if flat_nonidentifiable
+        else "thin-ellipse extrapolation diagnostic is not triggered",
     )
 
     if any(item["status"] == "FAIL" for item in checks):
@@ -440,6 +644,10 @@ def evaluate_p4_ellipse_quality(
             "axis_ratio": axis_ratio,
             "equivalent_theta_spread_deg": theta_spread_deg,
             "multistart_count": int(_read(ellipse, "multistart_count", 1) or 1),
+            "angular_span_deg": span_deg,
+            "direct_major_extent_fraction": observed_major_extent,
+            "observed_radius_max": observed_radius_max,
+            "symmetry": symmetry,
         },
     }
 

@@ -32,8 +32,10 @@ CBF / EDF / TIF / TIFF / NPY / NPZ / HDF5 / CSV/TXT
 
 - `io.py`：只负责读取原始数组、frame、dataset 和元数据，不做归一化或物理解释；`valid_mask=True` 为有效像素，外部 `mask=True` 为无效像素。
 - `validation.py`：定义严格结果 schema 和统一 `analysis-domain`；测量、ridge、ellipse、`full2d` 与导出共享同一最终像素集合。
+- `service.py`/`pipeline.py`：把 CLI、Qt 与批处理统一到同一 `analysis` 合同；`flat_ellipse` 的 ratio/a/b/angle/center 约束传入观测 ridge 椭圆拟合，`geometry-only` 操作不会隐式启动 full2d。
 - `preflight.py`：在拟合前只读核验 package、manifest、PONI、mask、单位、校正/不确定度状态和 SHA-256，并生成 green/yellow/red 证据。
 - `geometry.py`：只通过 PONI/pyFAI 产生 q/chi/qx/qy，不重新发明探测器旋转公式。
+- `batch.py`/`export.py`：FrameRef 的容器 selector 与序列 selector 分开；输入、PONI、mask 和不确定度文件内容参与 checkpoint 身份，`--stream` 逐帧写 NPZ 并在 resume 时保留已验证的旧数组。
 - `observables.py`：提取剖面、lobe、ridge 和直接派生量。
 - `ellipse.py`：只拟合倒易空间曲线，返回残差、协方差和可辨识性。
 - `intensity.py`：生成和拟合经验二维强度场；当前 `full2d` 是共享双椭圆、角向包络、径向线形和背景的经验模型，不是 Grubb 2016 的完整 3D 取向正演。

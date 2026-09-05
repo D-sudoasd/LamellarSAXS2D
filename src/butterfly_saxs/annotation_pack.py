@@ -24,7 +24,9 @@ from typing import Any
 import numpy as np
 
 from .batch import FrameRef, build_frame_refs
+from .csv_utils import safe_csv_cell
 from .io import load_image
+from .path_contract import PathContractError, display_path, resolve_authorized_path
 
 
 ANNOTATION_PACK_SCHEMA_VERSION = "lamellarsaxs2d.annotation_pack.v2"
@@ -135,19 +137,29 @@ def _canonical_path(path: str | os.PathLike[str] | Path) -> str:
 
 
 def _display_path(path: Path, package: Path) -> str:
-    """Return a package-relative POSIX path, including ``..`` when needed."""
+    """Return package-relative paths and absolute paths for authorized externals."""
 
+    return display_path(path, package)
+
+
+def _resolve_input_path(
+    package: Path,
+    value: str | os.PathLike[str] | Path,
+    *,
+    base_dir: Path | None = None,
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
+    label: str = "input",
+) -> Path:
     try:
-        return path.resolve(strict=False).relative_to(package).as_posix()
-    except ValueError:
-        return Path(os.path.relpath(path.resolve(strict=False), package)).as_posix()
-
-
-def _resolve_input_path(package: Path, value: str | os.PathLike[str] | Path) -> Path:
-    candidate = Path(value).expanduser()
-    if not candidate.is_absolute():
-        candidate = package / candidate
-    return candidate.resolve(strict=False)
+        return resolve_authorized_path(
+            value,
+            package_root=package,
+            base_dir=base_dir,
+            external_roots=external_roots,
+            label=label,
+        )
+    except PathContractError as exc:
+        raise AnnotationPackError(str(exc)) from exc
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -197,9 +209,18 @@ def _hash_inline(value: Any) -> str:
     return _sha256_bytes(encoded)
 
 
-def _relative_or_inline_path(value: Any, package: Path, label: str) -> str:
+def _relative_or_inline_path(
+    value: Any,
+    package: Path,
+    label: str,
+    *,
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
+) -> str:
     if isinstance(value, (str, os.PathLike, Path)):
-        return _display_path(_resolve_input_path(package, value), package)
+        return _display_path(
+            _resolve_input_path(package, value, external_roots=external_roots, label=label),
+            package,
+        )
     return label
 
 
@@ -242,13 +263,23 @@ def _manifest_rows(value: Any) -> list[Any]:
     raise AnnotationPackError("manifest 必须包含 frame 行序列")
 
 
-def _row_with_resolved_path(row: Any, base_dir: Path) -> Any:
+def _row_with_resolved_path(
+    row: Any,
+    base_dir: Path,
+    *,
+    package: Path,
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
+) -> Any:
     if isinstance(row, FrameRef):
-        path = Path(row.path).expanduser()
-        if not path.is_absolute():
-            path = base_dir / path
+        path = _resolve_input_path(
+            package,
+            row.path,
+            base_dir=base_dir,
+            external_roots=external_roots,
+            label="manifest row",
+        )
         return FrameRef(
-            path.resolve(strict=False),
+            path,
             time=row.time,
             frame_id=row.frame_id,
             metadata=row.metadata,
@@ -262,10 +293,14 @@ def _row_with_resolved_path(row: Any, base_dir: Path) -> Any:
         path_key = next((key for key in _PATH_KEYS if result.get(key) is not None), None)
         if path_key is None:
             raise AnnotationPackError(f"manifest 行缺少 path：{row!r}")
-        path = Path(result[path_key]).expanduser()
-        if not path.is_absolute():
-            path = base_dir / path
-        resolved_path = str(path.resolve(strict=False))
+        path = _resolve_input_path(
+            package,
+            result[path_key],
+            base_dir=base_dir,
+            external_roots=external_roots,
+            label="manifest row",
+        )
+        resolved_path = str(path)
         result[path_key] = resolved_path
         # ``FrameRef`` accepts path/input_path/file/filename.  Keep a
         # source_path alias usable in a manifest while giving the shared
@@ -276,10 +311,14 @@ def _row_with_resolved_path(row: Any, base_dir: Path) -> Any:
                 result[key] = None
         return result
     if isinstance(row, (str, os.PathLike, Path)):
-        path = Path(row).expanduser()
-        if not path.is_absolute():
-            path = base_dir / path
-        return {"path": str(path.resolve(strict=False))}
+        path = _resolve_input_path(
+            package,
+            row,
+            base_dir=base_dir,
+            external_roots=external_roots,
+            label="manifest row",
+        )
+        return {"path": str(path)}
     raise AnnotationPackError(f"manifest 行不是路径或 mapping：{row!r}")
 
 
@@ -289,12 +328,18 @@ def _load_manifest(
     *,
     kind: str,
     hashes: list[_InputHash],
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
 ) -> list[FrameRef]:
     if manifest is None:
         raise AnnotationPackError(f"{kind} manifest 不能为空")
     base_dir = package
     if isinstance(manifest, (str, os.PathLike, Path)):
-        source = _resolve_input_path(package, manifest)
+        source = _resolve_input_path(
+            package,
+            manifest,
+            external_roots=external_roots,
+            label=f"{kind} manifest",
+        )
         if not source.is_file():
             raise AnnotationPackError(f"{kind} manifest 不存在：{source}")
         before = _sha256_file(source)
@@ -321,7 +366,15 @@ def _load_manifest(
                 source="in-memory",
             )
         )
-    rows = [_row_with_resolved_path(row, base_dir) for row in _manifest_rows(parsed)]
+    rows = [
+        _row_with_resolved_path(
+            row,
+            base_dir,
+            package=package,
+            external_roots=external_roots,
+        )
+        for row in _manifest_rows(parsed)
+    ]
     if not rows:
         raise AnnotationPackError(f"{kind} manifest 没有 frame")
     try:
@@ -458,7 +511,12 @@ def _preflight_rows(value: Any) -> list[Mapping[str, Any]]:
     return []
 
 
-def _preflight_quality_index(value: Any, package: Path) -> dict[str, list[dict[str, Any]]]:
+def _preflight_quality_index(
+    value: Any,
+    package: Path,
+    *,
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     index: dict[str, list[dict[str, Any]]] = {}
     for row in _preflight_rows(value):
         nested = row.get("manifest_frame")
@@ -468,7 +526,15 @@ def _preflight_quality_index(value: Any, package: Path) -> dict[str, list[dict[s
             raw_path = nested.get("path")
         if raw_path is None:
             continue
-        path = _resolve_input_path(package, str(raw_path))
+        try:
+            path = _resolve_input_path(
+                package,
+                str(raw_path),
+                external_roots=external_roots,
+                label="preflight frame",
+            )
+        except AnnotationPackError:
+            continue
         frame = row.get("frame", nested.get("frame", nested.get("frame_index")))
         dataset = row.get("dataset", nested.get("dataset", nested.get("dataset_id")))
         try:
@@ -629,7 +695,9 @@ def _write_csv(path: Path, columns: Sequence[str], rows: Sequence[Mapping[str, A
         writer = csv.DictWriter(handle, fieldnames=list(columns), extrasaction="ignore")
         writer.writeheader()
         for row in rows:
-            writer.writerow({column: row.get(column, "") for column in columns})
+            writer.writerow(
+                {column: safe_csv_cell(row.get(column, "")) for column in columns}
+            )
 
 
 def _write_blind_png(path: Path, array: np.ndarray, vmin: float, vmax: float) -> None:
@@ -680,11 +748,17 @@ def _record_auxiliary_input(
     package: Path,
     kind: str,
     hashes: list[_InputHash],
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
 ) -> str | None:
     if value is None:
         return None
     if isinstance(value, (str, os.PathLike, Path)):
-        path = _resolve_input_path(package, value)
+        path = _resolve_input_path(
+            package,
+            value,
+            external_roots=external_roots,
+            label=kind,
+        )
         if not path.is_file():
             raise AnnotationPackError(f"{kind} 文件不存在：{path}")
         before = _sha256_file(path)
@@ -716,11 +790,17 @@ def _read_preflight(
     *,
     package: Path,
     hashes: list[_InputHash],
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], str | None]:
     if value is None:
         return {}, None
     if isinstance(value, (str, os.PathLike, Path)):
-        path = _resolve_input_path(package, value)
+        path = _resolve_input_path(
+            package,
+            value,
+            external_roots=external_roots,
+            label="preflight JSON",
+        )
         if not path.is_file():
             raise AnnotationPackError(f"preflight JSON 不存在：{path}")
         before = _sha256_file(path)
@@ -737,7 +817,10 @@ def _read_preflight(
                 after=after,
             )
         )
-        return _preflight_quality_index(parsed, package), _display_path(path, package)
+        return (
+            _preflight_quality_index(parsed, package, external_roots=external_roots),
+            _display_path(path, package),
+        )
     if not isinstance(value, Mapping):
         raise AnnotationPackError("preflight_json 必须是 JSON 路径或 mapping")
     digest = _hash_inline(value)
@@ -750,14 +833,27 @@ def _read_preflight(
             source="in-memory",
         )
     )
-    return _preflight_quality_index(value, package), "preflight_json:in-memory"
+    return (
+        _preflight_quality_index(value, package, external_roots=external_roots),
+        "preflight_json:in-memory",
+    )
 
 
-def _verify_input_hashes(hashes: Sequence[_InputHash], package: Path) -> None:
+def _verify_input_hashes(
+    hashes: Sequence[_InputHash],
+    package: Path,
+    *,
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
+) -> None:
     for item in hashes:
         if item.source == "in-memory":
             continue
-        path = _resolve_input_path(package, item.path)
+        path = _resolve_input_path(
+            package,
+            item.path,
+            external_roots=external_roots,
+            label="hashed input",
+        )
         item.after = _sha256_file(path)
         if item.before != item.after:
             raise AnnotationPackError(f"输入文件在生成期间发生变化：{path}")
@@ -776,6 +872,7 @@ def build_annotation_pack(
     preflight_json: Any = None,
     poni: Any = None,
     mask: Any = None,
+    external_roots: Sequence[str | os.PathLike[str] | Path] | None = None,
 ) -> dict[str, Any]:
     """Build a fixed eight-frame, human-only annotation pack.
 
@@ -803,21 +900,44 @@ def build_annotation_pack(
         raise FileExistsError(f"输出目录已存在，默认不覆盖：{output_root}")
 
     hashes: list[_InputHash] = []
-    rt_refs = _load_manifest(package_root, rt_manifest, kind="RT", hashes=hashes)
-    hold_refs = _load_manifest(package_root, hold_manifest, kind="hold", hashes=hashes)
+    rt_refs = _load_manifest(
+        package_root,
+        rt_manifest,
+        kind="RT",
+        hashes=hashes,
+        external_roots=external_roots,
+    )
+    hold_refs = _load_manifest(
+        package_root,
+        hold_manifest,
+        kind="hold",
+        hashes=hashes,
+        external_roots=external_roots,
+    )
     if not rt_refs:
         raise AnnotationPackError("RT manifest 没有可用 frame")
     if len(_unique_refs(hold_refs)) < 3:
         raise AnnotationPackError("hold manifest 至少需要首帧、中间帧和末帧三个唯一 frame")
 
     preflight_index, preflight_path = _read_preflight(
-        preflight_json, package=package_root, hashes=hashes
+        preflight_json,
+        package=package_root,
+        hashes=hashes,
+        external_roots=external_roots,
     )
     poni_path = _record_auxiliary_input(
-        poni, package=package_root, kind="poni", hashes=hashes
+        poni,
+        package=package_root,
+        kind="poni",
+        hashes=hashes,
+        external_roots=external_roots,
     )
     mask_path = _record_auxiliary_input(
-        mask, package=package_root, kind="mask", hashes=hashes
+        mask,
+        package=package_root,
+        kind="mask",
+        hashes=hashes,
+        external_roots=external_roots,
     )
 
     all_refs = _unique_refs([*rt_refs, *hold_refs])
@@ -933,7 +1053,7 @@ def build_annotation_pack(
 
     # Refuse to create a partial output if a manifest, preflight, geometry,
     # mask, or source frame changed during input preparation.
-    _verify_input_hashes(hashes, package_root)
+    _verify_input_hashes(hashes, package_root, external_roots=external_roots)
     output_root.parent.mkdir(parents=True, exist_ok=True)
     output_root.mkdir()
     payload_root = output_root / "blind_payload"
@@ -983,7 +1103,7 @@ def build_annotation_pack(
     _write_csv(payload_root / "annotator_b.csv", _ANNOTATION_COLUMNS, annotation_rows)
     _write_csv(output_root / "consensus_review.csv", _CONSENSUS_COLUMNS, consensus_rows)
 
-    _verify_input_hashes(hashes, package_root)
+    _verify_input_hashes(hashes, package_root, external_roots=external_roots)
     status = {
         "schema_version": ANNOTATION_PACK_SCHEMA_VERSION,
         "status": "awaiting_human_annotations",

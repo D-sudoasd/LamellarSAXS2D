@@ -89,13 +89,36 @@ def test_evidence_npz_truth_json_and_no_overwrite(tmp_path: Path) -> None:
         truth_path = output / record["truth_json"]
         assert npz_path.exists() and truth_path.exists()
         with np.load(npz_path) as arrays:
-            required = {"intensity", "qx", "qy", "q", "mask", "truth_intensity", "noise"}
+            required = {
+                "intensity",
+                "qx",
+                "qy",
+                "q",
+                "mask",
+                "valid_mask",
+                "truth_intensity",
+                "noise",
+                "truth_ridge_plus",
+                "truth_ridge_minus",
+                "truth_ridge_support",
+            }
             assert required <= set(arrays.files)
             assert arrays["intensity"].shape == tuple(record["shape"])
             assert arrays["mask"].dtype == bool
+            assert arrays["valid_mask"].dtype == bool
+            assert np.array_equal(arrays["valid_mask"], ~arrays["mask"])
+            assert arrays["truth_ridge_support"].dtype == bool
         truth = json.loads(truth_path.read_text(encoding="utf-8"))
         assert truth["q_unit"] == T1_Q_UNIT
         assert truth["files"]["npz"] == npz_path.name
+        assert len(record["npz_sha256"]) == 64
+        assert len(record["truth_json_sha256"]) == 64
+        assert record["npz_sha256"] == __import__("hashlib").sha256(
+            npz_path.read_bytes()
+        ).hexdigest()
+        assert record["truth_json_sha256"] == __import__("hashlib").sha256(
+            truth_path.read_bytes()
+        ).hexdigest()
         assert "NaN" not in truth_path.read_text(encoding="utf-8")
         assert "Infinity" not in truth_path.read_text(encoding="utf-8")
 

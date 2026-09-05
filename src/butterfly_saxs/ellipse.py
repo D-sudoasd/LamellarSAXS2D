@@ -15,11 +15,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 import numpy as np
-from scipy.optimize import OptimizeResult, least_squares
+from scipy.optimize import OptimizeResult, brentq, least_squares, minimize_scalar
 from scipy.spatial import ConvexHull
 
 from .models import RidgePoint
 from .parameters import ParameterSet, ParameterSpec, default_ellipse_parameters
+from .cancellation import raise_if_cancelled
 
 ResidualKind = Literal["sampson", "geometric"]
 
@@ -349,16 +350,260 @@ def ellipse_sampson_residuals(points: Any, parameters: Any, *, weights: Any = No
     return result
 
 
-def ellipse_geometric_residuals(points: Any, parameters: Any, *, weights: Any = None,
-                                 max_iter: int = 32) -> np.ndarray:
-    """Signed closest-point distance to an ellipse.
+def _closest_ellipse_distance_scalar(u: float, v: float, a: float, b: float,
+                                     *, grid_size: int = 256) -> float:
+    """Return the unsigned global distance from ``(u, v)`` to an ellipse.
 
-    The closest point is found by a vectorized Newton solve in the ellipse's
-    local coordinates.  This is stable for the ridge points used here and,
-    unlike a radial residual, remains a genuine Euclidean distance away from
-    the principal axes.
+    A Newton iteration on the stationary angle is attractive because it is
+    short and vectorizes well, but it can converge to the *farthest* or a
+    saddle stationary point for a thin ellipse.  The implementation here
+    brackets every sign-changing stationary root on a periodic grid and
+    refines each bracket with Brent's method.  It also checks the lowest grid
+    basins with a bounded scalar minimization, which covers the degenerate
+    axis cases where a stationary root is tangent to zero and therefore does
+    not change sign.  All values are scaled by ``a`` before evaluating the
+    equation; this keeps ratios such as 0.02 well-conditioned.
+
+    The scalar routine is intentionally deterministic.  ``grid_size`` is
+    modest compared with a detector image but large enough to resolve the
+    narrow minor-axis basin of the flat ellipses encountered in SAXS.
     """
 
+    a = float(a)
+    b = float(b)
+    if not (np.isfinite(u) and np.isfinite(v) and a > 0.0 and 0.0 < b <= a):
+        return float("nan")
+    # Dimensionless local coordinates avoid a^2/b^2 overflow and give the
+    # root function a consistent scale for q values in either unit system.
+    ratio = b / a
+    uu, vv = float(u / a), float(v / a)
+    if ratio >= 1.0 - 1e-14:
+        return float(a * abs(math.hypot(uu, vv) - 1.0))
+
+    n_grid = max(64, int(grid_size))
+    phi = np.linspace(-math.pi, math.pi, n_grid + 1, dtype=float)
+    sin_phi = np.sin(phi)
+    cos_phi = np.cos(phi)
+
+    def stationarity(angle: float) -> float:
+        sin_value = math.sin(angle)
+        cos_value = math.cos(angle)
+        return (
+            (1.0 - ratio * ratio) * sin_value * cos_value
+            - uu * sin_value
+            + ratio * vv * cos_value
+        )
+
+    def squared_distance(angle: float) -> float:
+        du = math.cos(angle) - uu
+        dv = ratio * math.sin(angle) - vv
+        return du * du + dv * dv
+
+    values = (
+        (1.0 - ratio * ratio) * sin_phi * cos_phi
+        - uu * sin_phi
+        + ratio * vv * cos_phi
+    )
+    candidates: list[float] = []
+    zero_tol = 2e-14 * max(1.0, abs(uu), abs(vv), ratio)
+    for index in range(n_grid):
+        left_value = float(values[index])
+        right_value = float(values[index + 1])
+        left_angle = float(phi[index])
+        right_angle = float(phi[index + 1])
+        if abs(left_value) <= zero_tol:
+            candidates.append(left_angle)
+        if left_value * right_value < 0.0:
+            try:
+                candidates.append(
+                    float(brentq(stationarity, left_angle, right_angle,
+                                 xtol=1e-14, rtol=4.0 * np.finfo(float).eps,
+                                 maxiter=100))
+                )
+            except (ValueError, RuntimeError):
+                # A grid endpoint can be numerically indistinguishable from a
+                # pole for extremely flat ratios.  The local basin checks
+                # below still provide a valid fallback in that case.
+                pass
+    if abs(float(values[-1])) <= zero_tol:
+        candidates.append(float(phi[-1]))
+
+    # Include all coarse local minima.  For an exact-axis point the nearest
+    # stationary root may touch zero without a sign change; minimizing its
+    # surrounding basin recovers the correct endpoint.  The explicit axes
+    # also make the centre case well-defined (the minor endpoint is nearest).
+    coarse = np.asarray([squared_distance(float(item)) for item in phi[:-1]], dtype=float)
+    for index in range(n_grid):
+        previous = coarse[(index - 1) % n_grid]
+        current = coarse[index]
+        following = coarse[(index + 1) % n_grid]
+        if current <= previous and current <= following:
+            left = float(phi[index] - (phi[1] - phi[0]))
+            right = float(phi[index] + (phi[1] - phi[0]))
+            try:
+                refined = minimize_scalar(
+                    squared_distance,
+                    bounds=(left, right),
+                    method="bounded",
+                    options={"xatol": 2e-14, "maxiter": 100},
+                )
+                if refined.success and np.isfinite(refined.x):
+                    candidates.append(float(refined.x))
+            except (ValueError, RuntimeError):
+                pass
+    candidates.extend((0.0, 0.5 * math.pi, math.pi, -0.5 * math.pi))
+    if not candidates:
+        return float(a * math.sqrt(float(np.min(coarse))))
+    distance_squared = min(squared_distance(float(angle)) for angle in candidates)
+    return float(a * math.sqrt(max(0.0, distance_squared)))
+
+
+def _closest_ellipse_distances(u: Any, v: Any, a: float, b: float) -> np.ndarray:
+    """Vectorized global closest distances for a non-circular ellipse.
+
+    In first-quadrant coordinates ``x=abs(u/a)`` and ``y=abs(v/a)``, the
+    Lagrange multiplier of the constrained Euclidean projection satisfies
+
+    ``(x/(1+lambda))**2 + (r*y/(r**2+lambda))**2 = 1``.
+
+    The equation is monotone on the exterior interval ``[0, inf)`` and on
+    the interior interval ``(-r**2, 0)`` whenever ``y != 0``.  Bisection on
+    those intervals is both faster and more reliable than a per-point Newton
+    solve.  Exact points on the major-axis symmetry line are handled by the
+    closed-form stationary candidates (including the minor-axis branch, which
+    is the case that defeated the former Newton routine).  Everything is
+    normalized by ``a`` before the solve, so a ratio of .02 remains well
+    scaled even when q values are large or small.
+    """
+
+    u_array, v_array = np.broadcast_arrays(
+        np.asarray(u, dtype=float),
+        np.asarray(v, dtype=float),
+    )
+    original_shape = u_array.shape
+    u_flat = u_array.ravel()
+    v_flat = v_array.ravel()
+    a = float(a)
+    b = float(b)
+    if not (a > 0.0 and 0.0 < b <= a):
+        return np.full(original_shape, np.nan, dtype=float)
+    ratio = b / a
+    x = np.abs(u_flat / a)
+    y = np.abs(v_flat / a)
+    if ratio >= 1.0 - 1e-14:
+        return (a * np.abs(np.hypot(x, y) - 1.0)).reshape(original_shape)
+
+    result = np.full(x.shape, np.nan, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not np.any(finite):
+        return result.reshape(original_shape)
+    ratio_sq = ratio * ratio
+    # A value exactly on the symmetry line has a singular multiplier at the
+    # minor axis.  Treat only numerical zero as this analytic case; a genuine
+    # off-axis point, however small, has a regular root in (-r^2, 0).
+    axis_tol = 1.0e-8 * np.maximum(1.0, x)
+    axis_case = finite & (y <= axis_tol)
+    regular = finite & ~axis_case
+
+    if np.any(axis_case):
+        axis_indices = np.flatnonzero(axis_case)
+        exact_axis = axis_indices[y[axis_indices] == 0.0]
+        near_axis = axis_indices[y[axis_indices] > 0.0]
+        if near_axis.size:
+            # The regular multiplier has two roots on either side of the
+            # -r^2 pole as y approaches zero.  The scalar global fallback is
+            # used only for this numerically tiny subset so the vectorized
+            # bisection path remains fast for detector-sized point clouds.
+            result[near_axis] = np.asarray(
+                [
+                    _closest_ellipse_distance_scalar(
+                        float(u_flat[index]),
+                        float(v_flat[index]),
+                        a,
+                        b,
+                    )
+                    for index in near_axis
+                ],
+                dtype=float,
+            )
+        if not exact_axis.size:
+            exact_axis = np.asarray([], dtype=int)
+        xx = x[exact_axis]
+        denominator = max(1.0 - ratio_sq, np.finfo(float).eps)
+        cosine = np.clip(xx / denominator, 0.0, 1.0)
+        phi = np.arccos(cosine)
+        off_axis = np.hypot(np.cos(phi) - xx, ratio * np.sin(phi))
+        off_axis_valid = xx <= denominator
+        off_axis = np.where(off_axis_valid, off_axis, np.inf)
+        major = np.abs(1.0 - xx)
+        minor = np.hypot(xx, ratio)
+        if exact_axis.size:
+            result[exact_axis] = a * np.minimum(np.minimum(off_axis, major), minor)
+
+    def constraint(multiplier: np.ndarray, xx: np.ndarray, yy: np.ndarray) -> np.ndarray:
+        first = np.divide(xx, 1.0 + multiplier)
+        second = np.divide(ratio * yy, ratio_sq + multiplier)
+        return first * first + second * second - 1.0
+
+    outside = regular & ((x * x) + (y / ratio) ** 2 >= 1.0)
+    if np.any(outside):
+        xx = x[outside]
+        yy = y[outside]
+        lower = np.zeros_like(xx)
+        upper = np.maximum(1.0, 2.0 * np.maximum(xx, ratio * yy) + 1.0)
+        for _ in range(32):
+            need_expand = constraint(upper, xx, yy) > 0.0
+            if not np.any(need_expand):
+                break
+            upper = np.where(need_expand, upper * 2.0, upper)
+        for _ in range(70):
+            middle = 0.5 * (lower + upper)
+            positive = constraint(middle, xx, yy) > 0.0
+            lower = np.where(positive, middle, lower)
+            upper = np.where(positive, upper, middle)
+        multiplier = 0.5 * (lower + upper)
+        closest_x = xx / (1.0 + multiplier)
+        closest_y = ratio_sq * yy / (ratio_sq + multiplier)
+        result[outside] = a * np.hypot(closest_x - xx, closest_y - yy)
+
+    inside = regular & ~outside
+    if np.any(inside):
+        xx = x[inside]
+        yy = y[inside]
+        # ``yy != 0`` guarantees constraint(-r²+) -> +infinity, while
+        # constraint(0) < 0 for an interior point.  The small offset keeps
+        # the denominator finite for the first bisection evaluation.
+        lower = np.full_like(xx, -ratio_sq)
+        # Keep the lower endpoint close enough to the pole that even a tiny
+        # but genuine off-axis coordinate brackets the monotone root.  Scaling
+        # this offset with r^2 is essential: an absolute 16-eps offset is too
+        # large for y~1e-14 and would leave F(lower)<0 instead of +infinity.
+        lower += 16.0 * np.finfo(float).eps * max(ratio_sq, np.finfo(float).tiny)
+        upper = np.zeros_like(xx)
+        for _ in range(80):
+            middle = 0.5 * (lower + upper)
+            positive = constraint(middle, xx, yy) > 0.0
+            lower = np.where(positive, middle, lower)
+            upper = np.where(positive, upper, middle)
+        multiplier = 0.5 * (lower + upper)
+        closest_x = xx / (1.0 + multiplier)
+        closest_y = ratio_sq * yy / (ratio_sq + multiplier)
+        result[inside] = a * np.hypot(closest_x - xx, closest_y - yy)
+
+    return result.reshape(original_shape)
+
+
+def ellipse_geometric_residuals(points: Any, parameters: Any, *, weights: Any = None,
+                                 max_iter: int = 32) -> np.ndarray:
+    """Signed true closest-point distance to an ellipse.
+
+    ``max_iter`` is retained as a compatibility argument from the former
+    Newton implementation.  The current global bracket/refinement solver does
+    not use it: unlike an unconstrained Newton step, it cannot silently select
+    a wrong stationary point for a very flat ellipse.
+    """
+
+    del max_iter
     points = _coerce_points(points)
     geometry = _geometry(parameters)
     dx = points[:, 0] - geometry.cx
@@ -367,26 +612,7 @@ def ellipse_geometric_residuals(points: Any, parameters: Any, *, weights: Any = 
     u = c * dx + s * dy
     v = -s * dx + c * dy
     a, b = geometry.a, geometry.b
-    if np.isclose(a, b, rtol=1e-12, atol=1e-15):
-        distance = np.hypot(u, v) - a
-    else:
-        # A tangent-space initial angle is close for points near the track.
-        phi = np.arctan2(v * a, u * b)
-        origin = np.hypot(u, v) <= np.finfo(float).eps
-        for _ in range(max_iter):
-            sp, cp = np.sin(phi), np.cos(phi)
-            f = (a * a - b * b) * sp * cp - u * a * sp + v * b * cp
-            df = (a * a - b * b) * (cp * cp - sp * sp) - u * a * cp - v * b * sp
-            step = np.divide(f, df, out=np.zeros_like(f), where=np.abs(df) > 1e-15)
-            phi_next = phi - step
-            phi = np.where(np.isfinite(phi_next), phi_next, phi)
-            if np.max(np.abs(step), initial=0.0) < 1e-12:
-                break
-        closest_u, closest_v = a * np.cos(phi), b * np.sin(phi)
-        distance = np.hypot(closest_u - u, closest_v - v)
-        # Newton's equation has a stationary point at the origin.  The closest
-        # boundary point to the centre is on the minor axis.
-        distance = np.where(origin, -b, distance)
+    distance = _closest_ellipse_distances(u, v, a, b)
     implicit = ellipse_implicit(points, geometry)
     result = np.copysign(distance, implicit)
     if weights is not None:
@@ -456,7 +682,11 @@ def _initial_guess(points: np.ndarray) -> tuple[float, float, float, float, floa
         scale = max(float(np.max(np.ptp(points, axis=0))), 1.0)
         a, ratio, theta = scale, 0.7, 0.0
     a = max(a, np.finfo(float).eps * 10)
-    ratio = float(np.clip(ratio, 0.05, 1.0))
+    # Real butterfly wings can be nearly line-like.  Keeping the historical
+    # 0.05 floor silently excludes the .02/.05 synthetic and beamline cases,
+    # so use a small positive numerical floor and let editable bounds decide
+    # what a caller considers physically plausible.
+    ratio = float(np.clip(ratio, 0.005, 1.0))
     # Major-axis orientation is periodic by pi; this range avoids a redundant
     # pair of equivalent solutions while retaining both signs for the pair.
     theta = (theta + math.pi / 2) % math.pi - math.pi / 2
@@ -476,6 +706,14 @@ def _make_parameter_set(points: np.ndarray, parameters: Any) -> ParameterSet:
         if name not in raw:
             raise ValueError(f"unknown ellipse parameter: {name}")
         raw[name] = spec
+    # Mapping specifications are part of the public editor contract (for
+    # example ``{"axis_ratio": {"value": .02, "min": .005}}``).  Coerce
+    # them before applying the physical parameterization below; constructing
+    # ``ParameterSpec(mapping)`` directly would treat the whole mapping as a
+    # numeric value.
+    for name, spec in tuple(raw.items()):
+        if not isinstance(spec, ParameterSpec):
+            raw[name] = ParameterSet._coerce_spec(name, spec)
     # Canonicalize bounds required by the physical parameterization.  A caller
     # can tighten these bounds, but cannot turn them into nonphysical ones.
     for name in ("a", "axis_ratio"):
@@ -697,7 +935,9 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
              *, loss: str, f_scale: float, max_nfev: int | None, model: str,
              components: int, labels: np.ndarray | None,
              reference_axis: float = 0.0,
-             residual: ResidualKind = "sampson") -> EllipseFitResult:
+             residual: ResidualKind = "sampson",
+             cancel_event: Any = None) -> EllipseFitResult:
+    raise_if_cancelled(cancel_event, f"ellipse:{model}:start")
     if f_scale <= 0 or not np.isfinite(f_scale):
         raise ValueError("f_scale must be finite and positive")
     loss = str(loss).lower()
@@ -724,6 +964,7 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
             if np.isfinite(lo) and np.isfinite(hi) and not lo < hi:
                 raise ValueError("free parameter bounds must have min < max")
         def residual_at(vector: np.ndarray) -> np.ndarray:
+            raise_if_cancelled(cancel_event, f"ellipse:{model}:residual")
             candidate = parameters.copy()
             candidate.set_free_vector(vector)
             try:
@@ -733,14 +974,34 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
                 # be tighter than scipy's direct bounds.  A finite penalty
                 # keeps least_squares on the valid side of such a boundary.
                 return np.full(points.shape[0], 1e12, dtype=float)
+        # Keep the established Sampson trajectory for ordinary ellipses (it
+        # is part of the public deterministic multistart contract), while
+        # enabling Jacobian scaling whenever a geometric fit or an explicitly
+        # flat ratio is being refined.
+        flat_parameter = parameters._parameters.get("axis_ratio")
+        flat_mode = bool(
+            flat_parameter is not None
+            and (
+                float(flat_parameter.value) < 0.05
+                or (flat_parameter.min is not None and float(flat_parameter.min) < 0.05)
+            )
+        )
+        use_jac_scale = str(residual).lower() in {"geometric", "distance", "closest"} or flat_mode
         result = least_squares(
             residual_at,
             x0,
             bounds=(lower, upper),
             loss=loss,
             f_scale=float(f_scale),
+            # q coordinates, angle (radians), and an axis ratio can differ by
+            # several orders of magnitude for the thin ellipses in real
+            # butterfly patterns.  Jacobian scaling keeps each editable
+            # parameter visible to the trust-region step without changing the
+            # reported units or the caller's bounds.
+            x_scale="jac" if use_jac_scale else 1.0,
             max_nfev=max_nfev,
         )
+        raise_if_cancelled(cancel_event, f"ellipse:{model}:complete")
         fitted = parameters.copy().set_free_vector(result.x)
         residuals = np.asarray(objective(fitted), dtype=float)
         return _make_result(
@@ -754,6 +1015,7 @@ def _run_fit(points: np.ndarray, parameters: ParameterSet, objective: Callable[[
             reference_axis=reference_axis,
             residual=residual,
         )
+    raise_if_cancelled(cancel_event, f"ellipse:{model}:residual")
     residuals = np.asarray(objective(parameters), dtype=float)
     return _make_result(
         parameters,
@@ -772,7 +1034,8 @@ def fit_ellipse(points: Any, parameters: ParameterSet | Mapping[str, Any] | None
                 params: ParameterSet | Mapping[str, Any] | None = None,
                 residual: ResidualKind = "sampson", loss: str = "soft_l1", f_scale: float = 1.0,
                 weights: Any = None, max_nfev: int | None = None, config: Any = None,
-                residual_kind: str | None = None) -> EllipseFitResult:
+                residual_kind: str | None = None,
+                cancel_event: Any = None) -> EllipseFitResult:
     """Fit one ellipse to q-space ridge points with robust least squares."""
 
     if parameters is not None and params is not None:
@@ -784,6 +1047,7 @@ def fit_ellipse(points: Any, parameters: ParameterSet | Mapping[str, Any] | None
         loss = getattr(config, "loss", loss)
         f_scale = getattr(config, "f_scale", f_scale)
         max_nfev = getattr(config, "max_nfev", max_nfev)
+        cancel_event = getattr(config, "cancel_event", cancel_event)
     if residual_kind is not None:
         residual = residual_kind
     points = _coerce_points(points)
@@ -793,7 +1057,8 @@ def fit_ellipse(points: Any, parameters: ParameterSet | Mapping[str, Any] | None
     def objective(candidate: Mapping[str, float]) -> np.ndarray:
         return residual_function(points, candidate, weights=weights)
     return _run_fit(points, parameter_set, objective, loss=loss, f_scale=f_scale, max_nfev=max_nfev,
-                    model="ellipse", components=1, labels=None)
+                    model="ellipse", components=1, labels=None,
+                    cancel_event=cancel_event)
 
 
 def _coerce_labels(labels: Any, n: int) -> np.ndarray | None:
@@ -865,9 +1130,18 @@ def _multistart_parameter_sets(parameters: ParameterSet, count: int) -> tuple[Pa
         vector = base.copy()
         fraction = fractions[(start_index - 1) % len(fractions)]
         offset = offsets[(start_index - 1) % len(offsets)]
-        for index, (value, lo, hi) in enumerate(zip(base, lower, upper)):
+        for index, (name, value, lo, hi) in enumerate(zip(parameters.free_names, base, lower, upper)):
             if np.isfinite(lo) and np.isfinite(hi):
-                vector[index] = lo + fraction * (hi - lo)
+                if name == "axis_ratio" and lo > 0.0 and hi > 0.0 and lo < 0.05:
+                    # Axis ratio is a scale parameter over decades in the
+                    # flat regime.  Log interpolation gives deterministic
+                    # starts near .02/.05 instead of spending every start in
+                    # the visually near-circular half of the interval.
+                    log_lo = math.log(max(float(lo), 0.005 * float(hi)))
+                    log_hi = math.log(float(hi))
+                    vector[index] = math.exp(log_lo + fraction * (log_hi - log_lo))
+                else:
+                    vector[index] = lo + fraction * (hi - lo)
             else:
                 scale = max(abs(float(value)), abs(float(lo)) if np.isfinite(lo) else 0.0,
                             abs(float(hi)) if np.isfinite(hi) else 0.0, 1.0)
@@ -904,7 +1178,8 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
                            config: Any = None, residual_kind: str | None = None,
                            reference_axis_deg: float = 0.0,
                            reference_axis: float | None = None,
-                           multistart: int = 7) -> EllipseFitResult:
+                           multistart: int = 7,
+                           cancel_event: Any = None) -> EllipseFitResult:
     """Fit a mirror-symmetric pair of ellipses sharing centre and axes."""
 
     if parameters is not None and params is not None:
@@ -918,6 +1193,7 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
         max_nfev = getattr(config, "max_nfev", max_nfev)
         reference_axis_deg = getattr(config, "reference_axis_deg", reference_axis_deg)
         multistart = getattr(config, "multistart", multistart)
+        cancel_event = getattr(config, "cancel_event", cancel_event)
     if residual_kind is not None:
         residual = residual_kind
     points = _coerce_points(points)
@@ -967,6 +1243,7 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
     starts = _multistart_parameter_sets(parameter_set, multistart_count)
     candidates: list[tuple[int, EllipseFitResult, dict[str, Any]]] = []
     for start_index, start in enumerate(starts):
+        raise_if_cancelled(cancel_event, "ellipse:symmetric:multistart")
         result = _run_fit(
             points,
             start,
@@ -979,6 +1256,7 @@ def fit_symmetric_ellipses(points: Any, parameters: ParameterSet | Mapping[str, 
             labels=labels,
             reference_axis=reference,
             residual=residual,
+            cancel_event=cancel_event,
         )
         candidates.append((start_index, result, _candidate_solution_record(start_index, start, result)))
     # Prefer a solver-reported success, then finite cost, then the smallest

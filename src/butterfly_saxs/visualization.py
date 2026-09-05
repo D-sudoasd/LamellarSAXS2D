@@ -66,6 +66,20 @@ def _finite_limits(values: np.ndarray, lower: float = 1.0, upper: float = 99.5) 
     return float(lo), float(hi)
 
 
+def _display_transform(values: np.ndarray, scale: str) -> np.ndarray:
+    """Apply a display-only contrast transform while preserving sign."""
+
+    mode = str(scale or "linear").strip().lower().replace("-", "_")
+    array = np.asarray(values, dtype=float)
+    if mode in {"linear", "raw", "none"}:
+        return array
+    if mode in {"log", "log1p", "signed_log"}:
+        return np.sign(array) * np.log1p(np.abs(array))
+    if mode in {"asinh", "arcsinh"}:
+        return np.arcsinh(array)
+    raise ValueError("display_scale must be 'linear', 'log1p', or 'asinh'")
+
+
 def _extent(qx: np.ndarray, qy: np.ndarray) -> tuple[float, float, float, float]:
     finite_x = np.asarray(qx, dtype=float)[np.isfinite(qx)]
     finite_y = np.asarray(qy, dtype=float)[np.isfinite(qy)]
@@ -92,6 +106,8 @@ def plot_fit_diagnostics(
     output: str | Path | None = None,
     title: str | None = None,
     dpi: int = 300,
+    display_scale: str = "linear",
+    display_percentile: float = 99.5,
 ) -> Any:
     """Create observed/model/residual/overlay diagnostics with honest shared scales.
 
@@ -114,12 +130,22 @@ def plot_fit_diagnostics(
         if mask.shape != obs.shape:
             raise ValueError("valid_mask 与图像 shape 不一致")
         valid &= mask
+    try:
+        percentile = float(display_percentile)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("display_percentile must be between 50 and 100") from exc
+    if not np.isfinite(percentile) or not 50.0 <= percentile <= 100.0:
+        raise ValueError("display_percentile must be between 50 and 100")
     residual = np.where(valid, obs - mod, np.nan)
-    obs_show = np.where(valid, obs, np.nan)
-    mod_show = np.where(valid, mod, np.nan)
-    data_lo, data_hi = _finite_limits(np.concatenate([obs_show[valid], mod_show[valid]]))
-    resid_finite = residual[np.isfinite(residual)]
-    resid_lim = float(np.percentile(np.abs(resid_finite), 99.0)) if resid_finite.size else 1.0
+    obs_show = _display_transform(np.where(valid, obs, np.nan), display_scale)
+    mod_show = _display_transform(np.where(valid, mod, np.nan), display_scale)
+    residual_show = _display_transform(residual, display_scale)
+    data_lo, data_hi = _finite_limits(
+        np.concatenate([obs_show[valid], mod_show[valid]]),
+        upper=percentile,
+    )
+    resid_finite = residual_show[np.isfinite(residual_show)]
+    resid_lim = float(np.percentile(np.abs(resid_finite), percentile)) if resid_finite.size else 1.0
     if not np.isfinite(resid_lim) or resid_lim <= 0:
         resid_lim = 1.0
     ext = _extent(np.asarray(qx), np.asarray(qy))
@@ -129,7 +155,7 @@ def plot_fit_diagnostics(
     panels = (
         (axes[0, 0], obs_show, "Observed", "cividis", data_lo, data_hi),
         (axes[0, 1], mod_show, "Model", "cividis", data_lo, data_hi),
-        (axes[1, 0], residual, "Residual", "PuOr", -resid_lim, resid_lim),
+        (axes[1, 0], residual_show, "Residual", "PuOr", -resid_lim, resid_lim),
         (axes[1, 1], obs_show, "Overlay", "cividis", data_lo, data_hi),
     )
     for label, (ax, array, panel_title, cmap, vmin, vmax) in zip("ABCD", panels):
@@ -147,7 +173,14 @@ def plot_fit_diagnostics(
         ax.set_xlabel(qx_label)
         ax.set_ylabel(qy_label)
         ax.text(-0.13, 1.04, label, transform=ax.transAxes, fontweight="bold", fontsize=10)
-        fig.colorbar(image, ax=ax, shrink=0.82, label="Intensity (input units)" if panel_title != "Residual" else "Data - model")
+        color_label = (
+            "Intensity (input units)"
+            if panel_title != "Residual"
+            else "Data - model"
+        )
+        if str(display_scale).strip().lower() not in {"linear", "raw", "none"}:
+            color_label += f" · display {display_scale}"
+        fig.colorbar(image, ax=ax, shrink=0.82, label=color_label)
 
     overlay = axes[1, 1]
     if ridge_xy is not None:

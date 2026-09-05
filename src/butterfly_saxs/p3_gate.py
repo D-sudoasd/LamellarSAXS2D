@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import platform
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -72,6 +73,172 @@ _CONSENSUS_CONTENT_FIELDS = (
     "review_time",
 )
 
+# These are the numeric contracts consumed by P4.  Keeping the schema here
+# prevents a frozen metadata envelope from being mistaken for usable numeric
+# acceptance evidence.  The values are deliberately conservative: ranges
+# reject malformed documents but never rewrite or loosen a threshold.
+_NUMERIC_THRESHOLD_FIELDS: dict[str, dict[str, tuple[float | None, float | None, str]]] = {
+    "t1_high_snr": {
+        "ridge_detector_median_error_px_max": (0.0, None, "number"),
+        "ridge_detector_p95_error_px_max": (0.0, None, "number"),
+        "ridge_f1_min": (0.0, 1.0, "number_open"),
+        "lobe_periodic_angle_error_deg_max": (0.0, 180.0, "number"),
+        "ellipse_a_relative_error_max": (0.0, None, "number"),
+        "ellipse_b_relative_error_max": (0.0, None, "number"),
+        "ellipse_theta_periodic_error_deg_max": (0.0, 180.0, "number"),
+        "ellipse_center_equivalent_pixel_error_max": (0.0, None, "number"),
+    },
+    "t2_independent": {
+        "ridge_error_local_fwhm_fraction_max": (0.0, None, "number"),
+        "pattern_class_accuracy_min": (0.0, 1.0, "number_open"),
+        "projection_a_relative_error_max": (0.0, None, "number"),
+        "projection_b_relative_error_max": (0.0, None, "number"),
+        "projection_tilt_error_deg_max": (0.0, 180.0, "number"),
+    },
+    "full2d_quality": {
+        "scaled_condition_pass_lt": (0.0, None, "number"),
+        "scaled_condition_warn_lt_or_equal": (0.0, None, "number"),
+        "scaled_condition_fail_gt": (0.0, None, "number"),
+    },
+    "uncertainty": {
+        "repeats_per_representative_condition_min": (1.0, None, "integer"),
+        "repeats_per_representative_condition_max": (1.0, None, "integer"),
+        "interval_level": (0.0, 1.0, "number_open"),
+        "empirical_coverage_min": (0.0, 1.0, "number_open"),
+        "empirical_coverage_max": (0.0, 1.0, "number"),
+        "false_pass_rate_max": (0.0, 1.0, "number"),
+    },
+    "real_data": {
+        "ridge_f1_min": (0.0, 1.0, "number_open"),
+        "lobe_periodic_angle_error_deg_max": (0.0, 180.0, "number"),
+        "repeat_frame_apparent_parameter_cv_max": (0.0, None, "number"),
+        "pilot_frame_count": (1.0, None, "integer"),
+        "pilot_difficult_or_negative_count_min": (0.0, None, "integer_open"),
+        "holding_sequence_denominator": (1.0, None, "integer"),
+        "usable_fraction_min": (0.0, 1.0, "number_open"),
+    },
+}
+_BOOLEAN_THRESHOLD_FIELDS: dict[str, tuple[str, ...]] = {
+    "t1_high_snr": ("same_seed_deterministic",),
+    "t2_independent": ("structure_truth_is_not_empirical_inverse_truth",),
+    "full2d_quality": (
+        "nonfinite_condition_fails",
+        "critical_bound_hit_fails",
+        "withheld_failure_fails",
+        "structured_residual_fails",
+    ),
+    "uncertainty": ("statistical_and_selection_uncertainty_separate",),
+    "real_data": (
+        "independent_warm_start_difference_within_combined_uncertainty",
+        "forward_reverse_systematic_bias_allowed",
+        "resume_matches_continuous",
+    ),
+}
+
+
+def _numeric_threshold_contract(
+    threshold: Mapping[str, Any],
+    *,
+    require_final_blocks: bool,
+) -> dict[str, Any]:
+    """Validate the complete typed P3 threshold content and its references."""
+
+    required_blocks = tuple(_NUMERIC_THRESHOLD_FIELDS)
+    evidence_sources = threshold.get("evidence_sources")
+    evidence_names = set(evidence_sources) if isinstance(evidence_sources, Mapping) else set()
+    content = {name: threshold.get(name) for name in required_blocks}
+    content_digest = hashlib.sha256(
+        json.dumps(
+            content,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+    recorded_digest = threshold.get("threshold_content_sha256")
+    content_bound = isinstance(recorded_digest, str) and recorded_digest.casefold() == content_digest
+    result: dict[str, Any] = {
+        "required_blocks": list(required_blocks),
+        "blocks": {},
+        "content_sha256": content_digest,
+        "recorded_content_sha256": recorded_digest,
+        "content_bound": content_bound,
+    }
+    all_valid = True
+    for block_name in required_blocks:
+        block = threshold.get(block_name)
+        errors: list[str] = []
+        if not isinstance(block, Mapping):
+            errors.append("missing_or_not_mapping")
+            result["blocks"][block_name] = {"valid": False, "errors": errors}
+            all_valid = False
+            continue
+        refs = block.get("evidence_refs")
+        if not isinstance(refs, list) or not refs or not all(
+            isinstance(item, str) and item.strip() for item in refs
+        ):
+            errors.append("evidence_refs_missing_or_empty")
+        else:
+            unknown_refs = sorted(
+                set(str(item).strip() for item in refs).difference(
+                    evidence_names | {"fixed_contracts", "evidence_record_contract"}
+                )
+            )
+            if unknown_refs:
+                errors.append(f"unknown_evidence_refs:{','.join(unknown_refs)}")
+        for field, (minimum, maximum, kind) in _NUMERIC_THRESHOLD_FIELDS[block_name].items():
+            value = block.get(field)
+            if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, float, np.integer, np.floating)):
+                errors.append(f"{field}:not_numeric")
+                continue
+            number = float(value)
+            if not math.isfinite(number):
+                errors.append(f"{field}:nonfinite")
+                continue
+            if kind in {"integer", "integer_open"} and (
+                not float(number).is_integer() or int(number) != number
+            ):
+                errors.append(f"{field}:not_integer")
+            if minimum is not None and (
+                number <= minimum
+                if kind in {"number_open", "integer_open"}
+                else number < minimum
+            ):
+                errors.append(f"{field}:below_minimum")
+            if maximum is not None and number > maximum:
+                errors.append(f"{field}:above_maximum")
+        for field in _BOOLEAN_THRESHOLD_FIELDS[block_name]:
+            if not isinstance(block.get(field), bool):
+                errors.append(f"{field}:not_bool")
+        # The full2d condition ladder and paired bounds must be ordered.  A
+        # frozen but contradictory ladder cannot be consumed by P4.
+        if block_name == "full2d_quality" and not errors:
+            if not (
+                float(block["scaled_condition_pass_lt"])
+                <= float(block["scaled_condition_warn_lt_or_equal"])
+                <= float(block["scaled_condition_fail_gt"])
+            ):
+                errors.append("condition_thresholds_not_ordered")
+        if block_name == "uncertainty" and not errors:
+            if int(block["repeats_per_representative_condition_max"]) < int(
+                block["repeats_per_representative_condition_min"]
+            ) or float(block["empirical_coverage_max"]) < float(
+                block["empirical_coverage_min"]
+            ):
+                errors.append("uncertainty_ranges_not_ordered")
+        result["blocks"][block_name] = {
+            "valid": not errors,
+            "errors": errors,
+            "evidence_refs": list(refs) if isinstance(refs, list) else [],
+        }
+        if errors:
+            all_valid = False
+    result["content_valid"] = bool(all_valid)
+    result["valid"] = bool(all_valid and (content_bound if require_final_blocks else True))
+    result["required_for_final_pass_fail"] = bool(require_final_blocks)
+    return result
+
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"JSON 包含非有限数值：{value}")
@@ -99,6 +266,18 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _artifact_hash_matches(path: Path, expected: Any) -> bool:
+    if not isinstance(expected, str):
+        return False
+    expected = expected.strip().lower()
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected):
+        return False
+    try:
+        return path.is_file() and _sha256_file(path) == expected
+    except OSError:
+        return False
 
 
 def _scalar_text(archive: Any, key: str) -> str | None:
@@ -269,6 +448,16 @@ def _npz_arrays_valid(
                         return False
                 if np.asarray(archive["mask"]).dtype != bool:
                     return False
+                if "valid_mask" in required_arrays:
+                    valid_mask = np.asarray(archive["valid_mask"])
+                    if valid_mask.dtype != bool or not np.array_equal(
+                        valid_mask, ~np.asarray(archive["mask"], dtype=bool)
+                    ):
+                        return False
+                if "truth_ridge_support" in required_arrays and np.asarray(
+                    archive["truth_ridge_support"]
+                ).dtype != bool:
+                    return False
                 qx = np.asarray(archive["qx"], dtype=float)
                 qy = np.asarray(archive["qy"], dtype=float)
                 q = np.asarray(archive["q"], dtype=float)
@@ -294,9 +483,15 @@ def _t1_truth_valid(manifest_path: Path, cases: Sequence[Any]) -> bool:
             or not isinstance(truth_name, str)
         ):
             return False
+        npz_path = manifest_path.parent / npz_name
+        truth_path = manifest_path.parent / truth_name
+        if not _artifact_hash_matches(npz_path, item.get("npz_sha256")) or not _artifact_hash_matches(
+            truth_path, item.get("truth_json_sha256")
+        ):
+            return False
         try:
-            _, truth = _load_mapping(manifest_path.parent / truth_name, "T1 case truth")
-            with np.load(manifest_path.parent / npz_name, allow_pickle=False) as archive:
+            _, truth = _load_mapping(truth_path, "T1 case truth")
+            with np.load(npz_path, allow_pickle=False) as archive:
                 npz_q_unit = _scalar_text(archive, "q_unit")
                 npz_version = _scalar_text(archive, "generator_version")
                 npz_hash = _scalar_text(archive, "generator_hash")
@@ -357,8 +552,12 @@ def _t2_fft_and_truth_valid(manifest_path: Path, cases: Sequence[Any]) -> bool:
             if positions.ndim != 1 or len(positions) < 2 or np.any(np.diff(positions) <= 0):
                 return False
         filename = item.get("npz_file", item.get("npz"))
+        if not isinstance(filename, str) or not _artifact_hash_matches(
+            manifest_path.parent / filename, item.get("npz_sha256")
+        ):
+            return False
         try:
-            with np.load(manifest_path.parent / str(filename), allow_pickle=False) as archive:
+            with np.load(manifest_path.parent / filename, allow_pickle=False) as archive:
                 density = np.asarray(archive["real_space_density"], dtype=float)
                 clean = np.asarray(archive["intensity_noiseless"], dtype=float)
                 projection_reference = np.asarray(archive["projection_reference"], dtype=float)
@@ -853,7 +1052,19 @@ def evaluate_p3_gate(
             t1_path,
             t1_cases,
             filename_keys=("npz", "npz_file"),
-            required_arrays={"intensity", "qx", "qy", "q", "mask", "truth_intensity", "noise"},
+            required_arrays={
+                "intensity",
+                "qx",
+                "qy",
+                "q",
+                "mask",
+                "valid_mask",
+                "truth_intensity",
+                "noise",
+                "truth_ridge_plus",
+                "truth_ridge_minus",
+                "truth_ridge_support",
+            },
         )
         and _t1_truth_valid(t1_path, t1_cases)
     )
@@ -941,6 +1152,10 @@ def evaluate_p3_gate(
         "frozen_at": _parse_timestamp(sources.get("frozen_at")) is not None,
     }
     sources_complete = all(source_checks.values())
+    numeric_contract = _numeric_threshold_contract(
+        threshold,
+        require_final_blocks=threshold.get("usable_for_final_pass_fail") is True,
+    )
     thresholds_frozen = (
         threshold.get("schema_version") == "lamellarsaxs2d.acceptance_thresholds.v1"
         and threshold.get("thresholds_version") == "v1"
@@ -952,6 +1167,7 @@ def evaluate_p3_gate(
         and policy.get("requires_instrument_resolution") is True
         and policy.get("requires_pilot_evidence") is True
         and sources_complete
+        and numeric_contract["valid"]
     )
 
     checks = [
@@ -989,6 +1205,7 @@ def evaluate_p3_gate(
                 "usable_for_final_pass_fail": threshold.get("usable_for_final_pass_fail"),
                 "evidence_sources_complete": sources_complete,
                 "evidence_source_checks": source_checks,
+                "numeric_threshold_contract": numeric_contract,
             },
         ),
     ]
@@ -1031,6 +1248,14 @@ def evaluate_p3_gate(
             "t1_generator_hash": T1_GENERATOR_HASH,
             "t2_generator_version": T2_GENERATOR_VERSION,
             "t2_generator_hash": T2_GENERATOR_HASH,
+            "numeric_threshold_contract_sha256": hashlib.sha256(
+                json.dumps(
+                    numeric_contract,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
         },
         "next_phase": "P4" if go else None,
         "scope": "read_only_evidence_gate; does not run fitting or alter thresholds",

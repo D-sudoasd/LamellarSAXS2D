@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping
 import copy
 import os
+import tempfile
 import tomllib
 
 
@@ -241,6 +242,14 @@ class ProjectConfig:
             "frame", "dataset", "ridge", "ridge_method", "ridge_bins", "n_angles",
             "n_ridge_angles", "n_angular_bins", "n_radial_bins", "curvature",
             "curvature_sigma", "curvature_percentile", "curvature_normal_step", "ellipse",
+            "ellipse_preset", "ellipse_residual", "ellipse_multistart",
+            "ellipse_axis_ratio_min", "ellipse_axis_ratio_max", "ellipse_a_min",
+            "ellipse_a_max", "ellipse_b_min", "ellipse_b_max",
+            "ellipse_theta_min_deg", "ellipse_theta_max_deg", "ellipse_fixed_center",
+            "ellipse_center_qx", "ellipse_center_qy", "ellipse_fixed_angle",
+            "ellipse_angle_deg", "ridge_snr_threshold", "ridge_min_peak_fraction",
+            "ellipse_fixed_a", "ellipse_fixed_axis_ratio", "ridge_min_coverage",
+            "full2d_multistart", "series", "start", "stop", "stride", "frame_range",
         ):
             if key in merged:
                 analysis[key] = merged.pop(key)
@@ -297,15 +306,32 @@ class ProjectConfig:
             return os.fspath(path if path.is_absolute() else base / path)
 
         analysis = copy.deepcopy(self.analysis)
-        for key in ("mask", "valid_mask", "manifest", "checkpoint", "sigma", "weights"):
-            value = analysis.get(key)
-            if isinstance(value, (str, os.PathLike)):
-                analysis[key] = resolve(os.fspath(value))
-            elif isinstance(value, (list, tuple)):
-                analysis[key] = [
-                    resolve(os.fspath(item)) if isinstance(item, (str, os.PathLike)) else item
-                    for item in value
-                ]
+        path_keys = {
+            "mask", "mask_path", "valid_mask", "valid_mask_path", "manifest",
+            "checkpoint", "sigma", "sigma_path", "weights", "weights_path",
+            "poni", "poni_path", "qmap", "qmap_path", "uncertainty",
+            "uncertainty_path", "calibration", "calibration_path", "source",
+        }
+
+        def resolve_nested(value: Any, key: str | None = None) -> Any:
+            if isinstance(value, Mapping):
+                return {
+                    str(name): resolve_nested(item, str(name))
+                    for name, item in value.items()
+                }
+            if isinstance(value, list):
+                return [resolve_nested(item, key) for item in value]
+            if isinstance(value, tuple):
+                return tuple(resolve_nested(item, key) for item in value)
+            if key is not None and key.casefold() in path_keys:
+                if isinstance(value, (str, os.PathLike)):
+                    if str(value).strip().casefold() in {"in-memory", "in_memory"}:
+                        return os.fspath(value)
+                    return resolve(os.fspath(value))
+            return value
+
+        analysis = resolve_nested(analysis)
+        analysis.setdefault("base_dir", os.fspath(base))
 
         return ProjectConfig(
             input_paths=[resolve(item) or item for item in self.input_paths],
@@ -386,10 +412,25 @@ def save_project(
         if values:
             _emit_table(lines, name, values)
     text = "\n".join(lines).rstrip() + "\n"
+    temporary: str | None = None
     try:
-        destination.write_text(text, encoding="utf-8", newline="\n")
+        fd, temporary = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        temporary = None
     except OSError as exc:
         raise ProjectConfigError(f"无法写入项目配置：{destination}（{exc}）") from exc
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
     return destination
 
 

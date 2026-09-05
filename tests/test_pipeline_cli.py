@@ -336,6 +336,24 @@ def test_public_angle_names_and_analysis_options_are_preserved() -> None:
     assert result.ellipse_fit.get("alpha_candidate_deg") is None
 
 
+def test_pipeline_and_service_share_mixed_q_window_precedence() -> None:
+    from butterfly_saxs.pipeline import _analysis_options
+    from butterfly_saxs.service import _validated_analysis_settings
+
+    image = np.zeros((3, 3), dtype=float)
+    qx, qy = np.meshgrid(np.arange(3, dtype=float), np.arange(3, dtype=float))
+    qmap = {"qx": qx, "qy": qy, "q": np.hypot(qx, qy), "q_unit": "nm^-1"}
+    settings = {"q_window": [1.0, 3.0], "q_min": 0.0}
+
+    pipeline_window = _analysis_options(image, qmap, settings)["q_window"]
+    service_settings = _validated_analysis_settings(settings)
+
+    assert tuple(float(value) for value in pipeline_window) == pytest.approx((0.0, 3.0))
+    assert (service_settings["q_min"], service_settings["q_max"]) == pytest.approx(
+        (0.0, 3.0)
+    )
+
+
 def test_pipeline_ellipse_uses_draw_axis_reference_and_exposes_spacing_aliases() -> None:
     from butterfly_saxs.pipeline import fit_symmetric_ellipses
 

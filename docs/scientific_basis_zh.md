@@ -24,10 +24,13 @@
 常见科学/质量 flags 包括：
 
 - `apparent_geometry_only`、`nonunique_inverse_problem`：结果是观测图样的表观几何，单个二维图样不能唯一决定真实结构。
+- `ridge_method = "azimuthal_peak"` 的 `q_star` 是 q annulus 的代表坐标，不能当作径向峰或直接换算层片周期；lobe 周围独立径向 profile 才提供 radial `q_star`、FWHM、面积和 SNR。
+- `flat_ellipse` 中的轴比、a/b、angle、fixed-center、fixed-a 或 fixed-axis-ratio 是显式的经验拟合约束（先验）；达到边界或只有短弧支持时，结果必须同时阅读 `bound_*`、`condition`、`short_arc` 与 `major_axis_extrapolated`。
 - `empirical_model_only`：`full2d` 使用经验强度模型。
 - `uncalibrated_pixel_q`：未提供 PONI 且未显式提供 `q_scale` 时，坐标是 `pixel-q`，不是物理单位。
 - `spacing_unavailable_unknown_q_unit`、`spacing_unavailable_nonzero_center`、`spacing_requires_origin_centered_ellipse_assumption`：周期换算缺少物理 q 单位或不满足原点中心假设。
 - `low_coverage`、`low_snr`、`no_curvature_candidate`、`single_branch_supported`、`parameter_at_bound`、`solver_failed`：分别提示像素支持不足、信噪不足、曲率脊未找到、仅一个椭圆分支有支持、参数碰到边界或求解失败。
+- 蝴蝶严格配对使用相对于 `reference_axis_deg` 和拟合中心的象限：`QI+QIII` 为一个分支，`QII+QIV` 为另一个分支。`ellipse.symmetry` 保存四象限计数、分支泄漏、对向配对支持和中心对称观测误差；缺失对向 lobe、未标记点或自由中心会标为 `WARN/FAIL`，不会生成镜像点。azimuthal annulus 的 `q_difference` 可能由同一采样 annulus 强制一致，只能作为采样诊断，不能单独证明物理中心对称。
 - `covariance_local_linear_approximation`：`full2d` 的协方差是最优点附近 Jacobian 的局部线性近似。
 
 flags 是结果的一部分，不能因 `success=True` 而清除。

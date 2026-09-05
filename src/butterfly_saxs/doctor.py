@@ -13,7 +13,9 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import sys
+import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -64,6 +66,109 @@ def _version_text(
         return f"installed (version lookup failed: {type(exc).__name__})"
 
 
+def _project_root(cwd: Path) -> Path:
+    candidate = cwd.expanduser().resolve(strict=False)
+    if candidate.is_file():
+        candidate = candidate.parent
+    for root in (candidate, *candidate.parents):
+        if (root / "pyproject.toml").is_file():
+            return root
+    return candidate
+
+
+def _declared_specifiers(root: Path, *, require_ui: bool) -> dict[str, str]:
+    """Read the project's real dependency declarations without importing it."""
+
+    pyproject = root / "pyproject.toml"
+    document: dict[str, Any] = {}
+    if pyproject.is_file():
+        try:
+            with pyproject.open("rb") as handle:
+                parsed = tomllib.load(handle)
+            if isinstance(parsed, dict):
+                document = parsed
+        except (OSError, tomllib.TOMLDecodeError):
+            document = {}
+    project = document.get("project", {}) if isinstance(document, dict) else {}
+    dependencies: list[Any] = []
+    if isinstance(project, dict):
+        raw = project.get("dependencies", [])
+        if isinstance(raw, list):
+            dependencies.extend(raw)
+        optional = project.get("optional-dependencies", {})
+        if require_ui and isinstance(optional, dict) and isinstance(optional.get("ui"), list):
+            dependencies.extend(optional["ui"])
+    specs: dict[str, str] = {}
+    requirement_pattern = re.compile(
+        r"^\s*([A-Za-z0-9_.-]+)(?:\[[^\]]+\])?\s*([^;]*)"
+    )
+    for raw in dependencies:
+        if not isinstance(raw, str):
+            continue
+        match = requirement_pattern.match(raw)
+        if match is None:
+            continue
+        name, specifier = match.groups()
+        specs[name.casefold().replace("_", "-")] = specifier.strip()
+    if not specs:
+        try:
+            installed_requirements = importlib.metadata.requires("butterfly-saxs") or []
+        except importlib.metadata.PackageNotFoundError:
+            installed_requirements = []
+        for raw in installed_requirements:
+            if not isinstance(raw, str):
+                continue
+            match = requirement_pattern.match(raw)
+            if match is None:
+                continue
+            name, specifier = match.groups()
+            # Ignore optional extras when the caller did not request that
+            # extra; the core declaration is still checked below.
+            specs[name.casefold().replace("_", "-")] = specifier.strip()
+    return specs
+
+
+def _version_key(value: str) -> tuple[int, ...] | None:
+    parts = re.findall(r"\d+", str(value))
+    if not parts:
+        return None
+    return tuple(int(part) for part in parts[:4])
+
+
+def _version_satisfies(version: str, specifier: str) -> bool:
+    if not specifier:
+        return True
+    actual = _version_key(version)
+    if actual is None:
+        return False
+    for raw_clause in specifier.split(","):
+        clause = raw_clause.strip()
+        if not clause:
+            continue
+        match = re.match(r"^(~=|==|!=|>=|<=|>|<)\s*([0-9][^,\s]*)$", clause)
+        if match is None:
+            return False
+        operator, target_text = match.groups()
+        target = _version_key(target_text)
+        if target is None:
+            return False
+        if operator == "==" and actual != target:
+            return False
+        if operator == "!=" and actual == target:
+            return False
+        if operator == ">=" and actual < target:
+            return False
+        if operator == "<=" and actual > target:
+            return False
+        if operator == ">" and actual <= target:
+            return False
+        if operator == "<" and actual >= target:
+            return False
+        if operator == "~=" and (actual < target or actual[:1] != target[:1]):
+            return False
+    return True
+
+
 def _dependency_check(
     display_name: str,
     module_name: str,
@@ -73,6 +178,8 @@ def _dependency_check(
     required: bool,
     importer: Callable[[str], Any],
     version_getter: Callable[[str], str],
+    specifier: str = "",
+    cwd: Path | None = None,
 ) -> DiagnosticCheck:
     try:
         importer(module_name)
@@ -83,19 +190,39 @@ def _dependency_check(
             required=required,
             ok=False,
             detail=f"{type(exc).__name__}: {exc}",
-            remediation=_repair_command(),
+            remediation=_repair_command(cwd),
+        )
+    try:
+        version = str(version_getter(distribution))
+    except Exception as exc:  # noqa: BLE001 - metadata failure is not readiness
+        return DiagnosticCheck(
+            name=display_name,
+            category=category,
+            required=required,
+            ok=False,
+            detail=f"version metadata unavailable: {type(exc).__name__}",
+            remediation=_repair_command(cwd),
+        )
+    if specifier and not _version_satisfies(version, specifier):
+        return DiagnosticCheck(
+            name=display_name,
+            category=category,
+            required=required,
+            ok=False,
+            detail=f"{version} does not satisfy {specifier}",
+            remediation=_repair_command(cwd),
         )
     return DiagnosticCheck(
         name=display_name,
         category=category,
         required=required,
         ok=True,
-        detail=_version_text(distribution, version_getter=version_getter),
+        detail=f"{version}{(' ' + specifier) if specifier else ''}",
     )
 
 
 def _repair_command(cwd: Path | None = None) -> str:
-    root = Path.cwd() if cwd is None else Path(cwd)
+    root = _project_root(Path.cwd() if cwd is None else Path(cwd))
     constraint = root / "constraints" / "validation-py311-313.txt"
     if (root / "pyproject.toml").exists():
         if constraint.exists():
@@ -120,6 +247,17 @@ def collect_diagnostics(
 ) -> dict[str, Any]:
     """Collect deterministic environment checks without starting Qt."""
 
+    root = _project_root(Path.cwd() if cwd is None else Path(cwd))
+    declared = _declared_specifiers(root, require_ui=bool(require_ui))
+    core_declared = {
+        distribution.casefold().replace("_", "-")
+        for _display, _module, distribution in _CORE_MODULES
+    }
+    ui_declared = {
+        distribution.casefold().replace("_", "-")
+        for _display, _module, distribution in _UI_MODULES
+    }
+    declarations_complete = core_declared <= set(declared)
     version = tuple(version_info or sys.version_info[:3])
     python_ok = SUPPORTED_MIN <= version[:2] < SUPPORTED_MAX_EXCLUSIVE
     checks: list[DiagnosticCheck] = [
@@ -149,6 +287,12 @@ def collect_diagnostics(
                 required=True,
                 importer=importer,
                 version_getter=version_getter,
+                specifier=(
+                    declared.get(distribution.casefold().replace("_", "-"), "")
+                    if declarations_complete
+                    else "<project dependency declaration unavailable>"
+                ),
+                cwd=root,
             )
         )
     for display_name, module_name, distribution in _UI_MODULES:
@@ -161,6 +305,12 @@ def collect_diagnostics(
                 required=bool(require_ui),
                 importer=importer,
                 version_getter=version_getter,
+                specifier=(
+                    declared.get(distribution.casefold().replace("_", "-"), "")
+                    if declarations_complete and ui_declared <= set(declared)
+                    else "<project dependency declaration unavailable>"
+                ),
+                cwd=root,
             )
         )
     for display_name, module_name, distribution in _OPTIONAL_MODULES:
@@ -173,10 +323,11 @@ def collect_diagnostics(
                 required=False,
                 importer=importer,
                 version_getter=version_getter,
+                specifier=declared.get(distribution.casefold().replace("_", "-"), ""),
+                cwd=root,
             )
         )
 
-    root = Path.cwd() if cwd is None else Path(cwd)
     required_failures = [check for check in checks if check.required and not check.ok]
     return {
         "schema_version": 1,
@@ -196,6 +347,10 @@ def collect_diagnostics(
             "machine": platform.machine(),
         },
         "working_directory": str(root.resolve()),
+        "declared_requirements": declared,
+        "requirements_declaration_complete": bool(
+            declarations_complete and (not require_ui or ui_declared <= set(declared))
+        ),
         "checks": [asdict(check) for check in checks],
         "required_failures": [check.name for check in required_failures],
         "repair_command": _repair_command(root),

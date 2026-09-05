@@ -22,6 +22,8 @@ from typing import Any
 
 import numpy as np
 
+from .csv_utils import safe_csv_cell
+
 
 OUTPUT_NAMES = (
     "observed.png",
@@ -538,10 +540,13 @@ def _csv_bytes(rows: Sequence[Mapping[str, Any]]) -> bytes:
     writer = csv.DictWriter(output, fieldnames=PARAMETER_COLUMNS, lineterminator="\n")
     writer.writeheader()
     for row in rows:
-        serialised = dict(row)
+        serialised = {
+            name: safe_csv_cell(value)
+            for name, value in dict(row).items()
+        }
         for name in ("value", "min", "max", "stderr"):
             value = serialised.get(name)
-            serialised[name] = "" if value is None else value
+            serialised[name] = safe_csv_cell(value)
         writer.writerow(serialised)
     return output.getvalue().encode("utf-8")
 
@@ -587,14 +592,27 @@ def capture_input_records(
     source: Any = None,
     poni: Any = None,
     mask: Any = None,
+    frame: Any = None,
+    dataset: Any = None,
+    mask_frame: Any = None,
+    mask_dataset: Any = None,
 ) -> dict[str, dict[str, Any]]:
     """Capture path, existence, and SHA-256 for fit-defining files."""
 
-    return {
+    records = {
         "source": _file_record(source),
         "poni": _file_record(poni),
         "mask": _file_record(mask),
     }
+    if frame is not None:
+        records["source"]["frame"] = _json_safe(frame)
+    if dataset is not None:
+        records["source"]["dataset"] = _json_safe(dataset)
+    if mask_frame is not None:
+        records["mask"]["frame"] = _json_safe(mask_frame)
+    if mask_dataset is not None:
+        records["mask"]["dataset"] = _json_safe(mask_dataset)
+    return records
 
 
 def _canonical_record_path(value: Any) -> str | None:
@@ -636,6 +654,13 @@ def _verify_input_records(
                 raise ValueError(f"{role} 的拟合时记录缺少 SHA-256")
             if expected_hash != current_hash:
                 raise ValueError(f"{role} 输入在拟合后已变化：SHA-256 不一致")
+        for selector_name in ("frame", "dataset"):
+            if selector_name not in expected_record:
+                continue
+            if expected_record.get(selector_name) != current_record.get(selector_name):
+                raise ValueError(
+                    f"{role} 输入选择器 {selector_name} 与拟合时记录不一致"
+                )
         verified[role] = expected_record
     return verified
 
@@ -664,6 +689,8 @@ def _provenance(
     source, poni, mask = _input_values(result, context)
     frame = _first(_read(context, ("frame", "frame_id", "index")), _read(result, ("frame", "frame_id")), _read(metadata, ("frame", "frame_id")))
     dataset = _first(_read(context, ("dataset", "dataset_id")), _read(result, ("dataset", "dataset_id")), _read(metadata, ("dataset", "dataset_id")))
+    mask_frame = _first(_read(context, ("mask_frame",)), _read(result, ("mask_frame",)), _read(metadata, ("mask_frame",)))
+    mask_dataset = _first(_read(context, ("mask_dataset",)), _read(result, ("mask_dataset",)), _read(metadata, ("mask_dataset",)))
     roi = _first(_read(context, ("roi", "rois", "exclusion_roi")), _read(result, ("roi", "rois", "exclusion_roi")), _read(metadata, ("roi", "rois")))
     return {
         "schema_version": "lamellarsaxs2d.manual_fit_provenance.v1",
@@ -678,6 +705,8 @@ def _provenance(
         "source": _json_safe(source),
         "frame": _json_safe(frame),
         "dataset": _json_safe(dataset),
+        "mask_frame": _json_safe(mask_frame),
+        "mask_dataset": _json_safe(mask_dataset),
         "poni": _json_safe(poni),
         "mask": _json_safe(mask),
         "roi": _json_safe(roi),
@@ -725,13 +754,38 @@ def export_manual_fit(
 
     review_payload = _normalise_review(review)
     source, poni, mask = _input_values(result_mapping, context_mapping)
-    current_inputs = capture_input_records(source=source, poni=poni, mask=mask)
+    frame = _first(
+        _read(context_mapping, ("frame", "frame_id", "index")),
+        _read(result_mapping, ("frame", "frame_id")),
+    )
+    dataset = _first(
+        _read(context_mapping, ("dataset", "dataset_id")),
+        _read(result_mapping, ("dataset", "dataset_id")),
+    )
+    mask_frame = _read(context_mapping, ("mask_frame",), None)
+    mask_dataset = _read(context_mapping, ("mask_dataset",), None)
+    current_inputs = capture_input_records(
+        source=source,
+        poni=poni,
+        mask=mask,
+        frame=frame,
+        dataset=dataset,
+        mask_frame=mask_frame,
+        mask_dataset=mask_dataset,
+    )
     expected_inputs = _first(
         _read(context_mapping, ("fit_input_records", "input_records")),
         _read(result_mapping, ("fit_input_records", "input_records")),
         default=None,
     )
     fit_inputs = _verify_input_records(expected_inputs, current_inputs)
+    # Legacy fit records predate selector fields.  Preserve their accepted
+    # compatibility while carrying the selector observed at export into the
+    # provenance record for the new schema.
+    for role in _INPUT_ROLES:
+        for selector_name in ("frame", "dataset"):
+            if selector_name not in fit_inputs[role] and selector_name in current_inputs[role]:
+                fit_inputs[role][selector_name] = current_inputs[role][selector_name]
     observed, model, residual, qx, q_unit, valid, qy = _extract_arrays(result, context_mapping)
     rows = _parameter_rows(result, context_mapping)
     ridges = _result_ridges(result)

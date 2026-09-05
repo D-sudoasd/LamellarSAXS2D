@@ -7,8 +7,20 @@ import pytest
 from butterfly_saxs import doctor
 
 
-def _version(_distribution: str) -> str:
-    return "1.2.3"
+def _version(distribution: str) -> str:
+    versions = {
+        "numpy": "2.1.0",
+        "scipy": "1.13.0",
+        "matplotlib": "3.8.0",
+        "fabio": "2024.4.0",
+        "pyFAI": "2024.5.0",
+        "tifffile": "2024.5.0",
+        "PyYAML": "6.0.0",
+        "PySide6": "6.8.0",
+        "pyqtgraph": "0.13.7",
+        "h5py": "3.10.0",
+    }
+    return versions.get(distribution, "1.2.3")
 
 
 def test_doctor_requires_only_requested_ui_dependencies() -> None:

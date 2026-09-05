@@ -32,6 +32,10 @@ from .validation import (
     normalise_q_arrays,
     validate_q_coordinates,
 )
+from .cancellation import AnalysisCancelled, raise_if_cancelled
+from .path_utils import filter_supported_image_paths
+from .csv_utils import safe_csv_cell
+from .public_ellipse import canonical_ellipse_payload
 
 
 class PipelineError(RuntimeError):
@@ -187,7 +191,13 @@ def _find_callable(module_names: Sequence[str], function_names: Sequence[str]) -
 
 
 def _call_adapter(fn: Any, *, image: np.ndarray, qmap: Any = None, config: Any = None, **extra: Any) -> Any:
-    """Call an optional adapter across the small API variants used in this repo."""
+    """Call an optional adapter without retrying exceptions from its body.
+
+    Older versions tried several positional forms after *any* ``TypeError``.
+    That made a genuine engine bug look like a signature mismatch and could
+    execute a stateful adapter more than once.  Signature inspection now
+    chooses one call shape; the resulting exception is allowed to propagate.
+    """
 
     values = {
         "image": image,
@@ -203,39 +213,81 @@ def _call_adapter(fn: Any, *, image: np.ndarray, qmap: Any = None, config: Any =
         signature = _inspect.signature(fn)
     except (TypeError, ValueError):
         signature = None
-    if signature is not None:
-        accepts_kwargs = any(
-            parameter.kind == _inspect.Parameter.VAR_KEYWORD
-            for parameter in signature.parameters.values()
-        )
-        kwargs = {
-            name: value
-            for name, value in values.items()
-            if value is not None
-            and (accepts_kwargs or name in signature.parameters)
-        }
-        try:
-            return fn(**kwargs)
-        except TypeError:
-            # A positional-only function is common in small scientific helper
-            # modules.  Fall through to the conservative forms below.
-            pass
-    attempts = [
-        ((image, qmap), {}),
-        ((image,), {"qmap": qmap}),
-        ((image,), {}),
-    ]
-    last_error: TypeError | None = None
-    for args, kwargs in attempts:
-        if qmap is None and args == (image, qmap):
+    if signature is None:
+        # There is no safe way to distinguish a positional-only contract from
+        # a body exception without a signature.  Use the documented richest
+        # positional form exactly once and preserve its original exception.
+        return fn(image, qmap) if qmap is not None else fn(image)
+
+    parameters = tuple(signature.parameters.values())
+    accepts_kwargs = any(
+        parameter.kind == _inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    positional_args: list[Any] = []
+    keyword_args: dict[str, Any] = {}
+    for parameter in parameters:
+        if parameter.kind == _inspect.Parameter.VAR_POSITIONAL:
             continue
-        try:
-            return fn(*args, **kwargs)
-        except TypeError as exc:
-            last_error = exc
-    if last_error is not None:
-        raise last_error
-    return fn(image)
+        if parameter.name not in values:
+            continue
+        value = values[parameter.name]
+        if value is None and parameter.default is not _inspect.Parameter.empty:
+            continue
+        if parameter.kind == _inspect.Parameter.POSITIONAL_ONLY:
+            positional_args.append(value)
+        elif parameter.kind in (
+            _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            _inspect.Parameter.KEYWORD_ONLY,
+        ):
+            keyword_args[parameter.name] = value
+    if accepts_kwargs:
+        for name, value in values.items():
+            if value is not None and name not in keyword_args:
+                keyword_args[name] = value
+
+    required = [
+        parameter
+        for parameter in parameters
+        if parameter.default is _inspect.Parameter.empty
+        and parameter.kind
+        in (
+            _inspect.Parameter.POSITIONAL_ONLY,
+            _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            _inspect.Parameter.KEYWORD_ONLY,
+        )
+    ]
+    missing = [
+        parameter.name
+        for parameter in required
+        if parameter.name not in values
+        or (values[parameter.name] is None and parameter.default is _inspect.Parameter.empty)
+    ]
+    if missing:
+        # Small third-party adapters often use neutral names such as ``x``
+        # and ``y``.  Keep that compatibility with one arity-based call while
+        # still avoiding retries after an exception from the call itself.
+        if all(
+            parameter.kind
+            in (
+                _inspect.Parameter.POSITIONAL_ONLY,
+                _inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            )
+            for parameter in required
+        ) and len(required) in {1, 2}:
+            positional_args = [image] if len(required) == 1 else [image, qmap]
+            keyword_args = {
+                name: value
+                for name, value in keyword_args.items()
+                if name not in {parameter.name for parameter in required}
+            }
+        else:
+            names = ", ".join(missing)
+            raise TypeError(
+                f"adapter {getattr(fn, '__name__', fn)!r} has unsupported required argument(s): {names}"
+            )
+    # This is the sole invocation.  In particular, do not catch TypeError:
+    # it may have been raised by the adapter's numerical implementation.
+    return fn(*positional_args, **keyword_args)
 
 
 def _coerce_array(value: Any) -> np.ndarray:
@@ -293,10 +345,10 @@ def _coerce_qmap(value: Any, shape: tuple[int, int]) -> Any:
         source_unit = result.get("q_unit", result.get("unit"))
         if source_unit is None:
             source_unit = metadata.get("q_unit", metadata.get("unit"))
-        if source_unit is None and any(
-            key in result for key in ("qx_nm_inv", "qy_nm_inv", "q_nm_inv")
-        ):
-            source_unit = "nm^-1"
+        if source_unit is None:
+            from .settings import infer_q_unit_from_keys
+
+            source_unit = infer_q_unit_from_keys(result)
         qx_array, qy_array, q_array, unit_info = normalise_q_arrays(
             qx,
             qy,
@@ -830,8 +882,57 @@ def build_qmap(
 
 def _q_window(image: np.ndarray, qmap: Any, config: Any = None) -> tuple[float, float] | Any:
     configured = _config_value(config, "q_window", _config_value(config, "q_range", None))
+    explicit_q_min = _config_value(config, "q_min", None)
+    explicit_q_max = _config_value(config, "q_max", None)
+    configured_bounds: tuple[Any, Any] | None = None
     if configured is not None:
-        return configured
+        if isinstance(configured, Mapping):
+            configured_bounds = (
+                configured.get("min", configured.get("q_min", configured.get("low"))),
+                configured.get("max", configured.get("q_max", configured.get("high"))),
+            )
+        else:
+            try:
+                configured_bounds = tuple(configured)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise PipelineError("q_window must be a (min, max) pair") from exc
+            if len(configured_bounds) != 2:
+                raise PipelineError("q_window must be a (min, max) pair")
+        if explicit_q_min is None and explicit_q_max is None:
+            return configured_bounds
+    q_min = _config_value(config, "q_min", None)
+    q_max = _config_value(config, "q_max", None)
+    if q_min is None and configured_bounds is not None:
+        q_min = configured_bounds[0]
+    if q_max is None and configured_bounds is not None:
+        q_max = configured_bounds[1]
+    if q_min is not None or q_max is not None:
+        if isinstance(q_min, str) and q_min.strip().casefold() in {"", "auto"}:
+            q_min = None
+        if isinstance(q_max, str) and q_max.strip().casefold() in {"", "auto"}:
+            q_max = None
+        try:
+            finite_q_min = None if q_min is None else float(q_min)
+            finite_q_max = None if q_max is None else float(q_max)
+        except (TypeError, ValueError) as exc:
+            raise PipelineError("q_min/q_max must be finite numbers or Auto") from exc
+        if finite_q_min is not None and not math.isfinite(finite_q_min):
+            raise PipelineError("q_min must be finite or Auto")
+        if finite_q_max is not None and not math.isfinite(finite_q_max):
+            raise PipelineError("q_max must be finite or Auto")
+        try:
+            _, _, q = _qmap_arrays(qmap, image.shape)
+            finite = q[np.isfinite(q)]
+            if not finite.size:
+                raise PipelineError("q map has no finite pixels")
+            return (
+                float(np.min(finite)) if finite_q_min is None else finite_q_min,
+                float(np.max(finite)) if finite_q_max is None else finite_q_max,
+            )
+        except (PipelineError, ValueError):
+            if finite_q_min is None or finite_q_max is None:
+                raise
+            return finite_q_min, finite_q_max
     try:
         _, _, q = _qmap_arrays(qmap, image.shape)
         finite = q[np.isfinite(q)]
@@ -844,42 +945,83 @@ def _q_window(image: np.ndarray, qmap: Any, config: Any = None) -> tuple[float, 
 
 def _analysis_options(image: np.ndarray, qmap: Any, config: Any = None) -> dict[str, Any]:
     """Resolve the analysis mapping once for every observable entry point."""
+    # The service resolver is the canonical non-qmap settings boundary.  Map
+    # historical pipeline aliases into it once, then only resolve q bounds
+    # from the actual q map below.
+    from .settings import resolve_analysis_settings
 
-    curvature = _config_value(config, "curvature", None)
-    if isinstance(curvature, Mapping):
-        curvature_sigma = curvature.get("sigma", curvature.get("smooth_sigma", 2.0))
-        curvature_percentile = curvature.get("percentile", 25.0)
-        curvature_normal_step = curvature.get("normal_step", 1.0)
-    elif curvature is not None and not isinstance(curvature, bool):
-        curvature_sigma, curvature_percentile, curvature_normal_step = curvature, 25.0, 1.0
+    raw: dict[str, Any] = {}
+    if isinstance(config, Mapping):
+        for group_name in ("analysis", "project", "input", "inputs", "output"):
+            group = config.get(group_name)
+            if isinstance(group, Mapping):
+                raw.update(group)
+        raw.update(
+            {
+                str(key): value
+                for key, value in config.items()
+                if key not in {"analysis", "project", "input", "inputs", "output"}
+            }
+        )
     else:
-        curvature_sigma = _config_value(config, "curvature_sigma", 2.0)
-        curvature_percentile = _config_value(config, "curvature_percentile", 25.0)
-        curvature_normal_step = _config_value(config, "curvature_normal_step", 1.0)
-    try:
-        n_angles = max(4, int(_config_value(config, "n_angles", _config_value(config, "n_ridge_angles", 72))))
-    except (TypeError, ValueError):
-        n_angles = 72
-    try:
-        n_angular_bins = max(12, int(_config_value(config, "n_angular_bins", _config_value(config, "ridge_bins", 360))))
-    except (TypeError, ValueError):
-        n_angular_bins = 360
-    try:
-        n_radial_bins = max(32, int(_config_value(config, "n_radial_bins", 256)))
-    except (TypeError, ValueError):
-        n_radial_bins = 256
+        analysis = getattr(config, "analysis", None) if config is not None else None
+        if isinstance(analysis, Mapping):
+            raw.update(analysis)
+    if "n_angles" in raw and "n_ridge_angles" not in raw:
+        raw["n_ridge_angles"] = raw["n_angles"]
+    if "ridge_bins" in raw and "n_angular_bins" not in raw:
+        raw["n_angular_bins"] = raw["ridge_bins"]
+    if "curvature_normal_step" in raw and "normal_step" not in raw:
+        raw["normal_step"] = raw["curvature_normal_step"]
+    curvature = raw.get("curvature")
+    if isinstance(curvature, Mapping):
+        raw.setdefault("curvature_sigma", curvature.get("sigma", curvature.get("smooth_sigma", 2.0)))
+        raw.setdefault("curvature_percentile", curvature.get("percentile", 25.0))
+        raw.setdefault("normal_step", curvature.get("normal_step", 1.0))
+    elif curvature is not None and not isinstance(curvature, bool):
+        raw.setdefault("curvature_sigma", curvature)
+    canonical = resolve_analysis_settings(raw)
+    method = canonical["ridge_method"]
+    ellipse = canonical.get("ellipse")
     return {
-        "q_window": _q_window(image, qmap, config),
-        "mask": _config_value(config, "mask", None),
-        "ridge_method": str(_config_value(config, "ridge_method", "radial_peak")),
-        "n_angles": n_angles,
-        "n_angular_bins": n_angular_bins,
-        "n_radial_bins": n_radial_bins,
-        "draw_axis_deg": float(_config_value(config, "draw_axis_deg", 90.0)),
-        "curvature_sigma": float(curvature_sigma),
-        "curvature_percentile": float(curvature_percentile),
-        "curvature_normal_step": float(curvature_normal_step),
+        "q_window": _q_window(image, qmap, canonical),
+        "mask": raw.get("mask"),
+        "ridge_method": method,
+        "ridge_snr_threshold": canonical["ridge_snr_threshold"],
+        "ridge_min_peak_fraction": canonical["ridge_min_peak_fraction"],
+        "ridge_min_coverage": canonical["ridge_min_coverage"],
+        "n_angles": canonical["n_ridge_angles"],
+        "n_angular_bins": canonical["n_angular_bins"],
+        "n_radial_bins": canonical["n_radial_bins"],
+        "max_pixels": canonical["max_pixels"],
+        "draw_axis_deg": canonical["draw_axis_deg"],
+        "curvature_sigma": canonical["curvature_sigma"],
+        "curvature_percentile": canonical["curvature_percentile"],
+        "curvature_normal_step": canonical["normal_step"],
+        "ellipse": ellipse,
+        "ellipse_residual": canonical["ellipse_residual"],
+        "ellipse_multistart": canonical["ellipse_multistart"],
+        "full2d_multistart": canonical["full2d_multistart"],
     }
+
+
+def _call_supported(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Call an evolving scientific seam without hiding body exceptions."""
+
+    try:
+        signature = _inspect.signature(function)
+    except (TypeError, ValueError):
+        return function(*args, **kwargs)
+    parameters = signature.parameters
+    if any(item.kind == _inspect.Parameter.VAR_KEYWORD for item in parameters.values()):
+        return function(*args, **kwargs)
+    accepted = {
+        name: value
+        for name, value in kwargs.items()
+        if name in parameters
+        and parameters[name].kind != _inspect.Parameter.POSITIONAL_ONLY
+    }
+    return function(*args, **accepted)
 
 
 def _configured_external_mask(
@@ -1019,6 +1161,7 @@ def measure_observables(
     frame: Any = None,
     fit_ellipse: bool = True,
     analysis_domain: AnalysisDomain | None = None,
+    cancel_event: Any = None,
 ) -> dict[str, Any]:
     """Measure angular/lobe/ridge observables with the declared config."""
 
@@ -1027,7 +1170,14 @@ def measure_observables(
     options = _analysis_options(image, qmap, config)
     domain = analysis_domain or _analysis_domain(image, qmap, config=config)
     observed_frame = frame if frame is not None else _loaded_frame(image)
-    result = observable_module.measure_observables(
+    from .settings import ellipse_parameter_specs
+
+    ellipse_parameters = ellipse_parameter_specs(
+        {"ellipse": options["ellipse"]} if options["ellipse"] is not None else None,
+        q_window=domain.q_window,
+    )
+    result = _call_supported(
+        observable_module.measure_observables,
         observed_frame,
         qmap,
         domain.q_window,
@@ -1037,15 +1187,31 @@ def measure_observables(
         fit_ellipse=bool(fit_ellipse),
         mask=~domain.fit_valid_mask,
         ridge_method=options["ridge_method"],
+        ridge_snr_threshold=options["ridge_snr_threshold"],
+        ridge_min_peak_fraction=options["ridge_min_peak_fraction"],
+        ridge_min_coverage=options["ridge_min_coverage"],
         draw_axis_deg=options["draw_axis_deg"],
         curvature_sigma=options["curvature_sigma"],
         curvature_percentile=options["curvature_percentile"],
         curvature_normal_step=options["curvature_normal_step"],
         p4_quality_thresholds=_config_value(config, "p4_quality_thresholds", None),
+        ellipse_parameters=ellipse_parameters,
+        ellipse_residual=options["ellipse_residual"],
+        ellipse_multistart=options["ellipse_multistart"],
+        cancel_event=cancel_event,
     )
     # Do not infer alpha/phi from the fitted ellipse rotation.  The papers'
     # microscopic tilts are not identifiable from this apparent trajectory.
-    return _public_angles(_as_mapping(result))
+    public = _public_angles(_as_mapping(result))
+    if isinstance(public, Mapping):
+        normalized_ridges = _ridges_from_observable_bundle(public)
+        ridge = public.get("ridge")
+        if normalized_ridges is not None and isinstance(ridge, Mapping):
+            ridge = dict(ridge)
+            ridge["points"] = normalized_ridges
+            public = dict(public)
+            public["ridge"] = ridge
+    return public
 
 
 def extract_ridges(
@@ -1062,7 +1228,8 @@ def extract_ridges(
     options = _analysis_options(image, qmap, config)
     domain = analysis_domain or _analysis_domain(image, qmap, config=config)
     frame = _loaded_frame(image)
-    track = observable_module.measure_radial_ridges(
+    track = _call_supported(
+        observable_module.measure_radial_ridges,
         frame,
         qmap,
         domain.q_window,
@@ -1070,6 +1237,9 @@ def extract_ridges(
         n_bins=options["n_radial_bins"],
         mask=~domain.fit_valid_mask,
         ridge_method=options["ridge_method"],
+        snr_threshold=options["ridge_snr_threshold"],
+        ridge_min_peak_fraction=options["ridge_min_peak_fraction"],
+        ridge_min_coverage=options["ridge_min_coverage"],
         curvature_sigma=options["curvature_sigma"],
         curvature_percentile=options["curvature_percentile"],
         curvature_normal_step=options["curvature_normal_step"],
@@ -1080,6 +1250,20 @@ def extract_ridges(
         point = _public_angles(_as_mapping(item))
         if not isinstance(point, Mapping):
             continue
+        metadata = point.get("metadata")
+        if not isinstance(metadata, Mapping):
+            candidate_metadata = getattr(item, "metadata", None)
+            metadata = candidate_metadata if isinstance(candidate_metadata, Mapping) else None
+        if isinstance(metadata, Mapping):
+            point = dict(point)
+            for key in (
+                "quadrant",
+                "quadrant_pair",
+                "branch_assignment_source",
+                "symmetry_flags",
+            ):
+                if key in metadata:
+                    point.setdefault(key, metadata[key])
         point = {str(key): _jsonable(value, array_summary=False) for key, value in point.items()}
         # Invalid sectors are retained as records for coverage diagnostics but
         # do not contribute artificial (0, 0) coordinates to the ellipse fit.
@@ -1100,20 +1284,76 @@ def _ridges_from_observable_bundle(observables: Any) -> list[dict[str, Any]] | N
     merely to feed the ellipse adapter.
     """
 
-    if not isinstance(observables, Mapping):
+    bundle = observables if isinstance(observables, Mapping) else _as_mapping(observables)
+    if not isinstance(bundle, Mapping):
         return None
-    ridge = observables.get("ridge")
-    if not isinstance(ridge, Mapping):
+    ridge = bundle.get("ridge")
+    ridge_mapping = ridge if isinstance(ridge, Mapping) else _as_mapping(ridge)
+    if not isinstance(ridge_mapping, Mapping):
         return None
-    raw_points = ridge.get("points")
+    raw_points = ridge_mapping.get("points")
     if not isinstance(raw_points, Sequence) or isinstance(raw_points, (str, bytes)):
         return None
+    ellipse = bundle.get("ellipse")
+    ellipse_mapping = ellipse if isinstance(ellipse, Mapping) else _as_mapping(ellipse)
+    reference_axis_deg = float(
+        ellipse_mapping.get("reference_axis_deg", 0.0)
+        if isinstance(ellipse_mapping, Mapping)
+        else 0.0
+    )
+    parameter_values = (
+        ellipse_mapping.get("parameters", {})
+        if isinstance(ellipse_mapping, Mapping)
+        else {}
+    )
+    if not isinstance(parameter_values, Mapping):
+        parameter_values = {}
+    center_qx = float(parameter_values.get("center_qx", parameter_values.get("cx", 0.0)) or 0.0)
+    center_qy = float(parameter_values.get("center_qy", parameter_values.get("cy", 0.0)) or 0.0)
     points: list[dict[str, Any]] = []
     for item in raw_points:
         mapping = _as_mapping(item)
         if not mapping:
             continue
+        metadata = mapping.get("metadata")
+        if not isinstance(metadata, Mapping):
+            candidate_metadata = getattr(item, "metadata", None)
+            metadata = candidate_metadata if isinstance(candidate_metadata, Mapping) else None
         point = {str(key): _jsonable(value, array_summary=False) for key, value in mapping.items()}
+        if isinstance(metadata, Mapping):
+            point.update(
+                {
+                    key: _jsonable(metadata[key], array_summary=False)
+                    for key in (
+                        "quadrant",
+                        "quadrant_pair",
+                        "branch_assignment_source",
+                        "symmetry_flags",
+                    )
+                    if key in metadata
+                }
+            )
+        try:
+            qx_value = float(point.get("qx"))
+            qy_value = float(point.get("qy"))
+            local_angle = float(
+                (
+                    np.arctan2(qy_value - center_qy, qx_value - center_qx)
+                    - np.deg2rad(reference_axis_deg)
+                )
+                % (2.0 * np.pi)
+            )
+            quadrant_index = int(np.floor(local_angle / (0.5 * np.pi))) % 4
+            quadrant_name = ("QI", "QII", "QIII", "QIV")[quadrant_index]
+            point.setdefault("quadrant", quadrant_name)
+            point.setdefault(
+                "quadrant_pair",
+                "QI+QIII" if quadrant_index in (0, 2) else "QII+QIV",
+            )
+            point.setdefault("branch_assignment_source", "reference_quadrant")
+            point.setdefault("symmetry_flags", [])
+        except (TypeError, ValueError, OverflowError):
+            pass
         if point.get("valid") is False:
             point.pop("qx", None)
             point.pop("qy", None)
@@ -1178,177 +1418,25 @@ def _public_ellipse_fit(
     qmap: Any = None,
     config: Any = None,
 ) -> dict[str, Any]:
-    """Adapt one already-computed observable ellipse without solving again.
+    """Compatibility wrapper around the shared canonical ellipse payload."""
 
-    ``observables.measure_observables`` performs the canonical solver once.
-    Both the high-level pipeline and external ridge callers use this adapter
-    to expose the stable degree/public schema, so a nested observable and the
-    top-level ``ellipse_fit`` cannot silently diverge through a second fit.
-    """
-
-    values = _ellipse_value(fit, "parameter_values", {})
-    if not isinstance(values, Mapping) or not values:
-        values = _ellipse_value(fit, "values", {})
-    if not isinstance(values, Mapping):
-        values = {}
-    a = _as_float(values.get("a", _ellipse_value(fit, "a", np.nan)))
-    ratio = _as_float(
-        values.get(
-            "axis_ratio",
-            _ellipse_value(fit, "axis_ratio", _ellipse_value(fit, "axes_ratio", np.nan)),
-        )
+    payload = canonical_ellipse_payload(
+        fit, n_points=n_points, qmap=qmap, config=config
     )
-    b = _as_float(values.get("b", _ellipse_value(fit, "b", np.nan)))
-    if not np.isfinite(b) and np.isfinite(a * ratio):
-        b = float(a * ratio)
-    if not np.isfinite(ratio) and np.isfinite(a) and a != 0:
-        ratio = float(b / a)
-
-    theta_value = _ellipse_value(fit, "theta_deg", None)
-    if theta_value is None:
-        theta_value = values.get("theta_deg")
-    if theta_value is None:
-        theta_value = np.degrees(_as_float(values.get("theta", np.nan)))
-    theta_deg = _as_float(theta_value)
-
-    centre = _ellipse_value(fit, "center", None)
-    if centre is None:
-        centre = (
-            values.get("cx", _ellipse_value(fit, "center_qx", 0.0)),
-            values.get("cy", _ellipse_value(fit, "center_qy", 0.0)),
-        )
-    try:
-        cx, cy = float(centre[0]), float(centre[1])
-    except (IndexError, TypeError, ValueError):
-        cx = _as_float(_ellipse_value(fit, "center_qx", values.get("cx", 0.0)), 0.0)
-        cy = _as_float(_ellipse_value(fit, "center_qy", values.get("cy", 0.0)), 0.0)
-
-    reference_axis_deg = _as_float(
-        _ellipse_value(fit, "reference_axis_deg", float("nan")),
-        float("nan"),
-    )
-    if not np.isfinite(reference_axis_deg):
-        reference_axis_deg = float(_config_value(config, "draw_axis_deg", 90.0)) - 90.0
-
-    fit_q_unit = _ellipse_value(fit, "q_unit", None)
-    q_unit = str(fit_q_unit) if fit_q_unit is not None else _qmap_unit(qmap, config)
-    l_n = _as_float(
-        _ellipse_value(fit, "Ln_from_minor_axis_nm", _ellipse_value(fit, "L_N", np.nan))
-    )
-    l_z = _as_float(
-        _ellipse_value(fit, "Lz_from_draw_axis_nm", _ellipse_value(fit, "L_z", np.nan))
-    )
-    eccentricity = _as_float(
-        _ellipse_value(
-            fit,
-            "eccentricity",
-            _ellipse_value(fit, "ellipticity", np.sqrt(max(0.0, 1.0 - ratio * ratio))),
-        )
-    )
-    common = {
-        "a": a,
-        "b": b,
-        "semi_major": a,
-        "semi_minor": b,
-        "axis_ratio": ratio,
-        "center_qx": cx,
-        "center_qy": cy,
-        "reference_axis_deg": reference_axis_deg,
-        "ellipse_axis_tilt_deg": theta_deg,
-        "q_unit": q_unit,
-        "eccentricity": eccentricity,
-        "ellipticity": eccentricity,
-        "L_N": l_n,
-        "L_z": l_z,
-        "Ln_from_minor_axis_nm": l_n,
-        "Lz_from_draw_axis_nm": l_z,
-    }
-    coverage = _as_mapping(_ellipse_value(fit, "coverage", None))
-    rmse = _as_float(_ellipse_value(fit, "rmse", np.nan))
-    members: list[dict[str, Any]] = []
-    for member in _ellipse_value(fit, "ellipses", ()) or ():
-        member_mapping = _as_mapping(member)
-        member_theta = member_mapping.get("theta_deg")
-        if member_theta is None:
-            member_theta = np.degrees(_as_float(member_mapping.get("theta", np.nan)))
-        members.append(dict(common, theta_deg=_as_float(member_theta)))
-    if not members:
-        members = [dict(common, theta_deg=theta_deg), dict(common, theta_deg=-theta_deg)]
-    parameters = dict(common, theta_deg=theta_deg)
-    raw_flags = _ellipse_value(fit, "flags", ()) or ()
-    if isinstance(raw_flags, str):
-        raw_flags = (raw_flags,)
-    configured_flags = _config_value(config, "flags", ()) or ()
-    if isinstance(configured_flags, str):
-        configured_flags = (configured_flags,)
-    public_flags = tuple(
-        dict.fromkeys(
-            (
-                "apparent_geometry_only",
-                "nonunique_inverse_problem",
-                *(str(item) for item in raw_flags),
-                *(str(item) for item in configured_flags),
-            )
-        )
-    )
-    success = bool(_ellipse_value(fit, "success", False))
-    solver_status = _ellipse_value(fit, "status", None)
-    if solver_status is None:
-        solver_status = "ok" if success else "failed"
-    quality = _as_mapping(_ellipse_value(fit, "quality", None))
-    quality_status = str(
-        quality.get("status", quality.get("engineering_status", "")) or ""
-    ).upper()
-    status = str(solver_status)
-    residuals = np.asarray(_ellipse_value(fit, "residuals", np.asarray([])), dtype=float)
-    stderr = _ellipse_value(fit, "stderr", {}) or {}
-    condition = _as_float(
-        _ellipse_value(fit, "condition_number", _ellipse_value(fit, "condition", np.nan))
-    )
-    return {
-        "status": str(status),
-        "solver_status": str(solver_status),
-        "quality_status": quality_status or None,
-        "quality": quality,
-        "success": success,
-        "message": str(_ellipse_value(fit, "message", "")),
-        "n_points": int(_ellipse_value(fit, "n_points", coverage.get("n_points", n_points))),
-        "ellipses": members,
-        "parameters": parameters,
-        "a": a,
-        "b": b,
-        "axis_ratio": ratio,
-        "theta_deg": theta_deg,
-        "ellipse_axis_tilt_deg": theta_deg,
-        "reference_axis_deg": reference_axis_deg,
-        "eccentricity": eccentricity,
-        "ellipticity": eccentricity,
-        "q_unit": q_unit,
-        "L_N": l_n,
-        "L_z": l_z,
-        "Ln_from_minor_axis_nm": l_n,
-        "Lz_from_draw_axis_nm": l_z,
-        "rmse": rmse,
-        "residual_rms": rmse,
-        "residuals": residuals,
-        "stderr": dict(stderr),
-        "coverage": coverage,
-        "condition": condition,
-        "bound_flags": _jsonable(_ellipse_value(fit, "bound_flags", {}) or {}),
-        "bound_status": _jsonable(_ellipse_value(fit, "bound_status", {}) or {}),
-        "branch_counts": _jsonable(_ellipse_value(fit, "branch_counts", (0, 0))),
-        "branch_assignment": _jsonable(
-            _ellipse_value(fit, "branch_assignment", np.asarray([]))
-        ),
-        "candidate_solutions": _jsonable(
-            _ellipse_value(fit, "candidate_solutions", ()) or ()
-        ),
-        "selected_start_index": int(
-            _ellipse_value(fit, "selected_start_index", 0) or 0
-        ),
-        "multistart_count": int(_ellipse_value(fit, "multistart_count", 1) or 1),
-        "flags": public_flags,
-    }
+    assignment = payload.get("branch_assignment")
+    if assignment is not None and not isinstance(assignment, Mapping):
+        try:
+            assignment_array = np.asarray(assignment)
+            payload["branch_assignment_values"] = assignment_array
+            # Historical pipeline callers received a compact array descriptor;
+            # retain that shape while exposing the lossless aligned vector.
+            payload["branch_assignment"] = {
+                "shape": list(assignment_array.shape),
+                "dtype": str(assignment_array.dtype),
+            }
+        except (TypeError, ValueError):
+            pass
+    return payload
 
 
 def fit_symmetric_ellipses(
@@ -1362,18 +1450,34 @@ def fit_symmetric_ellipses(
     from . import observables as observable_module
 
     if isinstance(points, Mapping):
-        points = points.get("points", points.get("ridges", points))
-    rows: list[tuple[float, float]] = []
-    for item in points or []:
+        source_points = points.get("points", points.get("ridges", points))
+    else:
+        source_points = getattr(points, "points", points)
+    rows: list[dict[str, Any]] = []
+    for item in source_points or []:
         if isinstance(item, Mapping):
             if item.get("valid") is False:
                 continue
             x, y = item.get("qx", item.get("x")), item.get("qy", item.get("y"))
+            row = {
+                "qx": x,
+                "qy": y,
+                "branch_id": item.get("branch_id", item.get("component")),
+                "weight": item.get("weight"),
+            }
         else:
             x, y = getattr(item, "qx", getattr(item, "x", None)), getattr(item, "qy", getattr(item, "y", None))
+            row = {
+                "qx": x,
+                "qy": y,
+                "branch_id": getattr(item, "branch_id", getattr(item, "component", None)),
+                "weight": getattr(item, "weight", None),
+            }
         try:
             if x is not None and y is not None and math.isfinite(float(x)) and math.isfinite(float(y)) and np.hypot(float(x), float(y)) > 0:
-                rows.append((float(x), float(y)))
+                row["qx"] = float(x)
+                row["qy"] = float(y)
+                rows.append(row)
         except (TypeError, ValueError):
             continue
     if len(rows) < 5:
@@ -1381,19 +1485,43 @@ def fit_symmetric_ellipses(
     values_cfg = _config_value(config, "ellipse", None)
     kwargs: dict[str, Any] = {}
     if isinstance(values_cfg, Mapping):
-        kwargs["parameters"] = dict(values_cfg)
+        from .settings import ellipse_parameter_specs, normalize_ellipse_settings
+
+        normalized = normalize_ellipse_settings({"ellipse": values_cfg})
+        if normalized is not None:
+            radii = np.asarray([[row["qx"], row["qy"]] for row in rows], dtype=float)
+            ellipse_q_window = (
+                float(np.min(np.hypot(radii[:, 0], radii[:, 1]))),
+                float(np.max(np.hypot(radii[:, 0], radii[:, 1]))),
+            )
+            kwargs["parameters"] = ellipse_parameter_specs(
+                {"ellipse": normalized},
+                q_window=ellipse_q_window,
+            )
+            kwargs["residual"] = normalized["residual"]
+            kwargs["multistart"] = normalized["multistart"]
+        else:
+            kwargs["parameters"] = dict(values_cfg)
     for key in ("residual", "loss", "f_scale", "max_nfev"):
         value = _config_value(config, key, None)
         if value is not None:
             kwargs[key] = value
     draw_axis_deg = float(_config_value(config, "draw_axis_deg", 90.0))
     reference_axis_deg = draw_axis_deg - 90.0
+    strict_symmetry = bool(
+        _config_value(
+            config,
+            "strict_symmetry",
+            any(row.get("branch_id") is not None for row in rows),
+        )
+    )
     try:
         fit = observable_module.fit_symmetric_double_ellipse(
-            np.asarray(rows, dtype=float),
+            rows,
             **kwargs,
             reference_axis_deg=reference_axis_deg,
             q_unit=_qmap_unit(qmap, config),
+            strict_symmetry=strict_symmetry,
         )
     except (TypeError, ValueError, FloatingPointError) as exc:
         return {"status": "failed", "n_points": len(rows), "ellipses": [], "rmse": float("nan"), "message": str(exc)}
@@ -1464,6 +1592,7 @@ def fit_full2d(
     frame: Any = None,
     initial_parameters: Any = None,
     analysis_domain: AnalysisDomain | None = None,
+    cancel_event: Any = None,
 ) -> Any:
     """Run the empirical pixel-wise intensity refinement when requested."""
 
@@ -1538,12 +1667,16 @@ def fit_full2d(
         "bounds": analysis.get("bounds"),
         # Precision-first default: every valid detector pixel participates.
         # A deterministic speed cap is opt-in through analysis.max_pixels.
-        "max_pixels": analysis.get("max_pixels"),
+        # ``0`` is the public spelling for all valid detector pixels.  The
+        # intensity engine uses ``None`` for that mode; forwarding zero would
+        # otherwise create a one-pixel sample.
+        "max_pixels": None if options["max_pixels"] == 0 else options["max_pixels"],
         "seed": analysis.get("seed", 0),
         "scales": analysis.get("scales", (0.25, 0.5, 1.0)),
         "robust_loss": analysis.get("robust_loss", analysis.get("loss", "soft_l1")),
         "f_scale": analysis.get("f_scale", 1.0),
         "max_nfev": analysis.get("max_nfev", 800),
+        "multistart": analysis.get("full2d_multistart", options["full2d_multistart"]),
         "reference_axis_deg": float(options["draw_axis_deg"]) - 90.0,
         # Detector counts/absolute intensity can differ by many orders of
         # magnitude.  Scale only internally generated defaults; explicit or
@@ -1551,6 +1684,7 @@ def fit_full2d(
         "auto_scale_initial": bool(
             analysis.get("auto_scale_initial", auto_initial)
         ),
+        "cancel_event": cancel_event,
     }
     for name in ("sigma", "weights"):
         value = analysis.get(name)
@@ -1572,7 +1706,9 @@ def fit_full2d(
     kwargs["mask"] = ~domain.fit_valid_mask
     kwargs = {key: value for key, value in kwargs.items() if value is not None}
     try:
-        fit = fit_intensity_model(observed_frame, qmap, initial, **kwargs)
+        fit = _call_supported(fit_intensity_model, observed_frame, qmap, initial, **kwargs)
+    except AnalysisCancelled:
+        raise
     except Exception as exc:  # noqa: BLE001 - full2d is an explicit optional stage
         return {
             "status": "error",
@@ -1606,6 +1742,30 @@ def fit_full2d(
         # result class did not carry an explicit flags field.
         flags=tuple(getattr(fit, "flags", ("empirical_model_only", "nonunique_inverse_problem"))),
     )
+    for name in (
+        "sample_cost",
+        "full_cost",
+        "selection_objective",
+        "candidate_solutions",
+        "selected_start_index",
+        "multistart_count",
+    ):
+        if name not in raw:
+            value = getattr(fit, name, None)
+            if value is not None:
+                raw[name] = _jsonable(value, array_summary=False)
+    raw["fit_audit"] = {
+        name: raw.get(name)
+        for name in (
+            "sample_cost",
+            "full_cost",
+            "selection_objective",
+            "candidate_solutions",
+            "selected_start_index",
+            "multistart_count",
+        )
+        if raw.get(name) is not None
+    }
     if "condition" not in raw and "condition_number" in raw:
         raw["condition"] = raw["condition_number"]
     return raw
@@ -1626,6 +1786,8 @@ class PipelineResult:
     output_paths: list[str] = field(default_factory=list)
     valid_mask: np.ndarray | None = None
     analysis_domain: AnalysisDomain | None = None
+    analysis: dict[str, Any] = field(default_factory=dict)
+    analysis_arrays: dict[str, np.ndarray] = field(default_factory=dict, repr=False)
 
     @property
     def data(self) -> np.ndarray:
@@ -1645,6 +1807,18 @@ class PipelineResult:
             return self.ellipse_fit.get("parameters", {})
         return {}
 
+    @property
+    def lobe_radial_profiles(self) -> Any:
+        """Independent narrow-sector radial profiles around observed lobes."""
+
+        return self.observables.get("lobe_radial_profiles") if isinstance(self.observables, Mapping) else None
+
+    @property
+    def lobe_radial_peaks(self) -> Any:
+        """Radial peak summaries paired with :attr:`lobe_radial_profiles`."""
+
+        return self.observables.get("lobe_radial_peaks") if isinstance(self.observables, Mapping) else None
+
     def __getitem__(self, key: str) -> Any:
         return self.to_mapping()[key]
 
@@ -1661,6 +1835,8 @@ class PipelineResult:
             # Batch/checkpoint consumers resume from this stable top-level
             # parameter source rather than knowing which fit stage produced it.
             "parameters": self.parameters,
+            "lobe_radial_profiles": self.lobe_radial_profiles,
+            "lobe_radial_peaks": self.lobe_radial_peaks,
             "full2d": self.full2d,
             "output_paths": self.output_paths,
             "image": self.image,
@@ -1669,7 +1845,22 @@ class PipelineResult:
             "analysis_domain": (
                 None if self.analysis_domain is None else self.analysis_domain.to_summary()
             ),
+            "analysis": self.analysis,
         }
+        if include_arrays and self.analysis_domain is not None:
+            for name in (
+                "finite_mask",
+                "detector_valid_mask",
+                "external_valid_mask",
+                "q_window_mask",
+                "roi_exclusion_mask",
+                "weight_valid_mask",
+                "fit_valid_mask",
+                "sampled_valid_mask",
+            ):
+                result[name] = np.asarray(getattr(self.analysis_domain, name), dtype=bool)
+        if include_arrays and self.analysis_arrays:
+            result.update(self.analysis_arrays)
         return _jsonable(result, array_summary=not include_arrays)
 
 
@@ -1779,9 +1970,12 @@ def analyze_frame(
     mask_dataset: str | None = None,
     output: str | os.PathLike[str] | None = None,
     force: bool = False,
+    geometry_cache: Any = None,
+    cancel_event: Any = None,
 ) -> PipelineResult:
     """Run read → qmap → observables → ridge → symmetric ellipse → full2d."""
 
+    raise_if_cancelled(cancel_event, "frame-load")
     bundle = _read_frame_bundle(
         source,
         config=config,
@@ -1795,13 +1989,52 @@ def analyze_frame(
     image, metadata, embedded_qmap = bundle.image, bundle.metadata, bundle.qmap
     if isinstance(source, (str, os.PathLike)):
         metadata.setdefault("path", os.fspath(source))
-    qmap_obj = build_qmap(
-        image,
-        poni=poni or _config_value(config, "poni_path", _config_value(config, "poni", None)),
-        qmap=qmap if qmap is not None else embedded_qmap,
-        config=config,
-        valid_mask=bundle.valid_mask,
-    )
+    # Selector identity travels with the result so directory exports cannot
+    # overwrite two frames from one multi-frame/dataset container.
+    if frame is not None:
+        metadata["frame_selector"] = int(frame)
+    elif _config_value(config, "frame", None) is not None:
+        metadata["frame_selector"] = int(_config_value(config, "frame", None))
+    if dataset is not None:
+        metadata["dataset_selector"] = str(dataset)
+    elif _config_value(config, "dataset", None) is not None:
+        metadata["dataset_selector"] = str(_config_value(config, "dataset", None))
+    selected_poni = poni or _config_value(config, "poni_path", _config_value(config, "poni", None))
+    selected_embedded_qmap = qmap if qmap is not None else embedded_qmap
+    if geometry_cache is not None and selected_poni is not None and selected_embedded_qmap is None:
+        if isinstance(selected_poni, (str, os.PathLike)):
+            try:
+                stat = Path(selected_poni).stat()
+                cache_key = (os.fspath(Path(selected_poni).resolve()), stat.st_size, stat.st_mtime_ns, image.shape)
+            except OSError:
+                cache_key = (os.fspath(selected_poni), image.shape)
+        else:
+            cache_key = (id(selected_poni), image.shape)
+        base_qmap = geometry_cache.get(cache_key) if isinstance(geometry_cache, Mapping) else None
+        if base_qmap is None:
+            base_qmap = build_qmap(
+                image,
+                poni=selected_poni,
+                config=config,
+                valid_mask=None,
+            )
+            if isinstance(geometry_cache, dict):
+                geometry_cache[cache_key] = base_qmap
+        qmap_obj = build_qmap(
+            image,
+            qmap=base_qmap,
+            config=config,
+            valid_mask=bundle.valid_mask,
+        )
+    else:
+        qmap_obj = build_qmap(
+            image,
+            poni=selected_poni,
+            qmap=selected_embedded_qmap,
+            config=config,
+            valid_mask=bundle.valid_mask,
+        )
+    options = _analysis_options(image, qmap_obj, config)
     domain = _analysis_domain(
         image,
         qmap_obj,
@@ -1821,6 +2054,7 @@ def analyze_frame(
         frame=bundle.frame,
         fit_ellipse=True,
         analysis_domain=domain,
+        cancel_event=cancel_event,
     )
     observable_ellipse = observables.get("ellipse") if isinstance(observables, Mapping) else None
     if isinstance(observable_ellipse, Mapping):
@@ -1841,6 +2075,11 @@ def analyze_frame(
         ridges = extract_ridges(
             image, qmap_obj, config=config, analysis_domain=domain
         )
+    if isinstance(observables, Mapping) and isinstance(observables.get("ridge"), Mapping):
+        public_ridge = dict(observables["ridge"])
+        public_ridge["points"] = ridges
+        observables = dict(observables)
+        observables["ridge"] = public_ridge
     ellipse_fit = _public_ellipse_fit(
         observable_ellipse,
         n_points=len(ridges),
@@ -1855,6 +2094,11 @@ def analyze_frame(
         "parameters": {},
         "flags": ("ellipse_unavailable",),
     }
+    if options["ellipse"] is not None:
+        ellipse_fit["constraint_config"] = _jsonable(options["ellipse"], array_summary=False)
+        ellipse_fit["flags"] = tuple(
+            dict.fromkeys(tuple(ellipse_fit.get("flags", ())) + ("ellipse_constraints_active",))
+        )
     # Make the nested and top-level public views literally share the same
     # adapter output.  This prevents degree/radian or alias drift at export.
     observables["ellipse"] = ellipse_fit
@@ -1873,6 +2117,7 @@ def analyze_frame(
             frame=bundle.frame,
             initial_parameters=initial_parameters,
             analysis_domain=domain,
+            cancel_event=cancel_event,
         )
         if run_full2d
         else None
@@ -1892,9 +2137,14 @@ def analyze_frame(
             "mechanism_under_determined": True,
             "forward_simulation_only": False,
             "nonunique_inverse_problem": True,
+            "ellipse_constraints_active": options["ellipse"] is not None,
         },
         valid_mask=domain.fit_valid_mask,
         analysis_domain=domain,
+        analysis={
+            **options,
+            "q_window": list(domain.q_window),
+        },
     )
     if output is not None:
         result.output_paths = [os.fspath(path) for path in export_result(result, output, force=force)]
@@ -1908,6 +2158,36 @@ def _safe_stem(source: Any, fallback: str = "frame") -> str:
         stem = fallback
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._")
     return stem or fallback
+
+
+def _result_output_stem(result: PipelineResult) -> str:
+    """Build a selector-aware directory-export stem.
+
+    A multi-frame HDF5/NPZ/TIFF source can yield several valid results with
+    the same filename stem.  Keep the historical stem for ordinary single
+    frames, but append explicit selector tokens whenever they are present so
+    writing a directory cannot silently target the wrong frame.
+    """
+
+    metadata = result.metadata if isinstance(result.metadata, Mapping) else {}
+    stem = _safe_stem(metadata.get("path"), "frame")
+    frame_value = metadata.get("frame_selector", metadata.get("frame"))
+    dataset_value = metadata.get("dataset_selector", metadata.get("dataset"))
+    frame_id = metadata.get("frame_id")
+    tokens: list[str] = []
+    if frame_value is not None and frame_value != "":
+        try:
+            tokens.append(f"frame_{int(frame_value):04d}")
+        except (TypeError, ValueError):
+            tokens.append(f"frame_{_safe_stem(frame_value, 'selected')}")
+    if dataset_value is not None and str(dataset_value).strip():
+        tokens.append(f"dataset_{_safe_stem(dataset_value, 'selected')}")
+    if frame_id is not None and str(frame_id).strip() and str(frame_id) != Path(str(metadata.get("path", ""))).stem:
+        tokens.append(f"id_{_safe_stem(frame_id, 'selected')}")
+    parent_token = metadata.get("source_parent_token")
+    if parent_token is not None and str(parent_token).strip():
+        tokens.append(f"src_{_safe_stem(parent_token, 'source')}")
+    return stem if not tokens else f"{stem}__{'__'.join(tokens)}"
 
 
 def _result_arrays(result: PipelineResult) -> dict[str, np.ndarray]:
@@ -1929,6 +2209,10 @@ def _result_arrays(result: PipelineResult) -> dict[str, np.ndarray]:
                 getattr(result.analysis_domain, name),
                 dtype=bool,
             )
+    for name, value in result.analysis_arrays.items():
+        array = np.asarray(value)
+        if array.shape == result.image.shape:
+            arrays[name] = array
     if isinstance(result.qmap, Mapping):
         for key in ("qx", "qy", "q", "theta"):
             if key in result.qmap:
@@ -1940,6 +2224,27 @@ def _result_arrays(result: PipelineResult) -> dict[str, np.ndarray]:
             values = [row[key] for row in result.ridges if isinstance(row, Mapping) and key in row]
             if values:
                 arrays[f"ridge_{key}"] = np.asarray(values, dtype=float)
+    for index, profile in enumerate(result.lobe_radial_profiles or ()):
+        mapping = _as_mapping(profile)
+        if not mapping:
+            continue
+        for key in ("angle_deg", "q", "intensity", "counts", "candidate_counts", "coverage"):
+            if key not in mapping:
+                continue
+            value = np.asarray(mapping[key])
+            if value.ndim:
+                arrays[f"lobe_radial_profile_{index}_{key}"] = value
+    for index, peak in enumerate(result.lobe_radial_peaks or ()):
+        mapping = _as_mapping(peak)
+        if not mapping:
+            continue
+        for key in ("angle_deg", "q", "q_star", "intensity", "baseline", "snr", "radial_fwhm", "area"):
+            if key not in mapping:
+                continue
+            try:
+                arrays[f"lobe_radial_peak_{index}_{key}"] = np.asarray(mapping[key], dtype=float)
+            except (TypeError, ValueError):
+                continue
     if isinstance(result.full2d, Mapping):
         for key in ("model", "residual", "model_image", "residual_image"):
             value = result.full2d.get(key)
@@ -1963,6 +2268,15 @@ def export_result(
     if not isinstance(result, PipelineResult):
         mapping = dict(result)
         image = np.asarray(mapping.get("image", mapping.get("data")))
+        metadata = dict(mapping.get("metadata", {}) or {})
+        if mapping.get("frame_selector", mapping.get("frame")) is not None:
+            metadata.setdefault(
+                "frame_selector", mapping.get("frame_selector", mapping.get("frame"))
+            )
+        if mapping.get("dataset", mapping.get("dataset_selector")) is not None:
+            metadata.setdefault(
+                "dataset_selector", mapping.get("dataset", mapping.get("dataset_selector"))
+            )
         result = PipelineResult(
             image=image,
             qmap=mapping.get("qmap", {}),
@@ -1970,15 +2284,35 @@ def export_result(
             ridges=list(mapping.get("ridges", [])),
             ellipse_fit=dict(mapping.get("ellipse_fit", mapping.get("ellipse", {}))),
             full2d=mapping.get("full2d"),
-            metadata=dict(mapping.get("metadata", {})),
+            metadata=metadata,
             flags=dict(mapping.get("flags", {})),
+            valid_mask=(
+                np.asarray(mapping["valid_mask"], dtype=bool)
+                if mapping.get("valid_mask") is not None
+                else None
+            ),
+            analysis=dict(mapping.get("analysis", {}) or {}),
+            analysis_arrays={
+                str(name): np.asarray(mapping[name], dtype=bool)
+                for name in (
+                    "finite_mask",
+                    "detector_valid_mask",
+                    "external_valid_mask",
+                    "q_window_mask",
+                    "roi_exclusion_mask",
+                    "weight_valid_mask",
+                    "fit_valid_mask",
+                    "sampled_valid_mask",
+                )
+                if name in mapping
+            },
         )
     target = Path(output)
     suffix = target.suffix.lower()
     if suffix in {".json", ".npz", ".csv"}:
         paths = [target]
     else:
-        stem = _safe_stem(result.metadata.get("path"), "frame")
+        stem = _result_output_stem(result)
         paths = [target / f"{stem}.json", target / f"{stem}.npz"]
     existing = [path for path in paths if path.exists()]
     if existing and not force:
@@ -1994,16 +2328,45 @@ def export_result(
             path.write_text(json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         elif path.suffix.lower() == ".npz":
             arrays = _result_arrays(result)
-            arrays["observables_json"] = np.asarray(json.dumps(_jsonable(result.observables), ensure_ascii=False))
+            # Observable profiles are modest in size compared with detector
+            # arrays.  Keep them lossless in the NPZ sidecar so annulus/lobe
+            # q bins, counts and coverage survive JSON-summary compaction.
+            arrays["observables_json"] = np.asarray(
+                json.dumps(
+                    _jsonable(result.observables, array_summary=False),
+                    ensure_ascii=False,
+                )
+            )
             np.savez_compressed(path, **arrays)
         elif path.suffix.lower() == ".csv":
             with path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(("parameter", "value"))
+                def csv_value(value: Any) -> Any:
+                    converted = _jsonable(value, array_summary=False)
+                    if isinstance(converted, (Mapping, list, tuple)):
+                        converted = json.dumps(
+                            converted,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        )
+                    return safe_csv_cell(converted)
+
                 for key, value in result.observables.items():
-                    writer.writerow((key, _jsonable(value, array_summary=False)))
+                    writer.writerow(
+                        (
+                            safe_csv_cell(key),
+                            csv_value(value),
+                        )
+                    )
                 for key, value in result.ellipse_fit.get("parameters", {}).items():
-                    writer.writerow((f"ellipse.{key}", _jsonable(value, array_summary=False)))
+                    writer.writerow(
+                        (
+                            safe_csv_cell(f"ellipse.{key}"),
+                            csv_value(value),
+                        )
+                    )
         else:
             raise PipelineError(f"不支持的输出格式：{path.suffix}")
         written.append(path)
@@ -2018,7 +2381,7 @@ def _expand_inputs(inputs: Iterable[Any]) -> list[Any]:
             continue
         text = os.fspath(value)
         if any(char in text for char in "*?[]"):
-            expanded.extend(sorted(Path(match) for match in glob.glob(text)))
+            expanded.extend(sorted(filter_supported_image_paths(glob.glob(text))))
         else:
             expanded.append(value)
     return expanded
@@ -2032,24 +2395,106 @@ def batch_analyze(
     output_dir: str | os.PathLike[str] | None = None,
     full2d: bool | None = None,
     force: bool = False,
-) -> list[PipelineResult]:
+    manifest: Any = None,
+    series: str | None = None,
+    start: int | None = None,
+    stop: int | None = None,
+    stride: int = 1,
+    frame_range: str | Sequence[int] | None = None,
+    bounded: bool = False,
+    checkpoint: str | os.PathLike[str] | None = None,
+    resume: bool = False,
+    cancel_event: Any = None,
+    progress: Any = None,
+    result_sink: Any = None,
+) -> list[PipelineResult] | BatchRunResult:
     """Analyze a sequence of frames and optionally export one bundle per frame."""
+
+    from .batch import build_frame_refs, parse_frame_range, select_frame_refs
 
     values = _expand_inputs(inputs)
     if not values:
         raise PipelineError("没有可处理的输入帧")
+    refs = build_frame_refs(values, manifest=manifest)
+    if frame_range is not None:
+        range_start, range_stop, range_stride = parse_frame_range(frame_range)
+        if start is not None or stop is not None or stride != 1:
+            raise PipelineError("frame_range cannot be combined with start/stop/stride")
+        start, stop, stride = range_start, range_stop, range_stride
+    refs = select_frame_refs(refs, series=series, start=start, stop=stop, stride=stride)
+    if not refs:
+        raise PipelineError("批量选择没有匹配任何输入帧")
+    geometry_cache: dict[Any, Any] = {}
     destination = output_dir or _config_value(config, "output_dir", _config_value(config, "output", None))
-    results: list[PipelineResult] = []
-    for item in values:
-        result = analyze_frame(item, poni=poni, config=config, full2d=full2d)
+    stem_counts: dict[str, int] = {}
+    for ref in refs:
+        stem_counts[ref.path.stem.casefold()] = stem_counts.get(ref.path.stem.casefold(), 0) + 1
+
+    def analyze_for_batch(
+        ref: FrameRef,
+        initial_parameters: Any = None,
+        config: Any = None,
+    ) -> PipelineResult:
+        result = analyze_frame(
+            ref.path,
+            poni=poni,
+            config=config,
+            full2d=full2d,
+            initial_parameters=initial_parameters,
+            frame=ref.frame_selector,
+            dataset=ref.dataset_id or None,
+            geometry_cache=geometry_cache,
+            cancel_event=cancel_event,
+        )
+        result.metadata["frame_id"] = ref.id
+        if stem_counts.get(ref.path.stem.casefold(), 0) > 1:
+            result.metadata["source_parent_token"] = ref.path.parent.name
+        if ref.source is not None:
+            result.metadata["series"] = ref.source
         if destination is not None:
             target = Path(destination)
-            result.output_paths = [os.fspath(path) for path in export_result(result, target, force=force)]
-        results.append(result)
+            result.output_paths = [
+                os.fspath(path)
+                for path in export_result(result, target, force=force or resume)
+            ]
+        return result
+
+    run = run_batch_frames(
+        refs,
+        analyze_for_batch,
+        mode=str(_config_value(config, "batch_mode", "independent")),
+        config=config,
+        checkpoint=checkpoint,
+        resume=resume,
+        series=series,
+        start=None,
+        stop=None,
+        stride=1,
+        cancel_event=cancel_event,
+        progress=progress,
+        result_sink=result_sink,
+        retain_results=result_sink is None,
+        allow_mixed_series=series is not None,
+    )
+    if bounded:
+        return run
+    results: list[PipelineResult] = []
+    for item in run.frame_results:
+        if item.traceback:
+            raise PipelineError(item.error or "batch analyzer failed")
+        if item.result is not None:
+            results.append(item.result)
     return results
 
 
-def run_project(
+def batch_analyze_bounded(*args: Any, **kwargs: Any) -> BatchRunResult:
+    """Explicit common-runner API for bounded batch processing."""
+
+    kwargs["bounded"] = True
+    return batch_analyze(*args, **kwargs)  # type: ignore[return-value]
+
+
+def _run_project_bounded(
     project: ProjectConfig | str | os.PathLike[str],
     *,
     force: bool = False,
@@ -2075,8 +2520,19 @@ def run_project(
     manifest = analysis.get("manifest")
     checkpoint = analysis.get("checkpoint")
     resume = bool(analysis.get("resume", False))
+    series = analysis.get("series")
+    start = analysis.get("start")
+    stop = analysis.get("stop")
+    stride = analysis.get("stride", 1)
+    frame_range = analysis.get("frame_range")
     destination = Path(config.output_dir)
     project_config = config
+    geometry_cache: dict[Any, Any] = {}
+    project_stem_counts: dict[str, int] = {}
+    for value in values:
+        candidate_path = Path(value.path if isinstance(value, FrameRef) else value)
+        key = candidate_path.stem.casefold()
+        project_stem_counts[key] = project_stem_counts.get(key, 0) + 1
     batch_config = ProjectConfig(
         input_paths=project_config.input_paths,
         poni_path=project_config.poni_path,
@@ -2086,11 +2542,21 @@ def run_project(
         analysis={
             key: value
             for key, value in project_config.analysis.items()
-            if key not in {"batch_mode", "mode", "manifest", "checkpoint", "resume"}
+            if key not in {"batch_mode", "mode", "manifest", "checkpoint", "resume", "stream", "stream_results"}
         },
         export=project_config.export,
         metadata=project_config.metadata,
     )
+    stream_writer = None
+    if bool(analysis.get("stream", analysis.get("stream_results", False))):
+        from .export import StreamingBatchExporter
+
+        stream_writer = StreamingBatchExporter(
+            destination,
+            provenance={"source": "project", "stream": True},
+            force=bool(force or resume),
+            resume=resume,
+        )
 
     def analyze_for_project(
         frame_ref: FrameRef,
@@ -2106,22 +2572,97 @@ def run_project(
             initial_parameters=initial_parameters,
             frame=frame_ref.frame_selector,
             dataset=frame_ref.dataset_id or None,
+            geometry_cache=geometry_cache,
         )
-        result.output_paths = [
-            os.fspath(path)
-            for path in export_result(result, destination, force=force)
-        ]
+        if isinstance(result.metadata, Mapping):
+            result.metadata["frame_id"] = frame_ref.id
+            if project_stem_counts.get(frame_ref.path.stem.casefold(), 0) > 1:
+                result.metadata["source_parent_token"] = frame_ref.path.parent.name
+            if frame_ref.source is not None:
+                result.metadata["series"] = frame_ref.source
+        if stream_writer is None:
+            result.output_paths = [
+                os.fspath(path)
+                for path in export_result(result, destination, force=bool(force or resume))
+            ]
         return result
+    try:
+        run = run_batch_frames(
+            values,
+            analyze_for_project,
+            mode=mode,
+            config=batch_config,
+            manifest=manifest,
+            checkpoint=checkpoint,
+            resume=resume,
+            series=series,
+            start=start,
+            stop=stop,
+            stride=stride,
+            frame_range=frame_range,
+            result_sink=None if stream_writer is None else stream_writer.write,
+            retain_results=stream_writer is None,
+        )
+        if stream_writer is not None:
+            stream_writer.finalize(run)
+        return run
+    except Exception:
+        if stream_writer is not None:
+            stream_writer.abort()
+        raise
 
-    return run_batch_frames(
-        values,
-        analyze_for_project,
-        mode=mode,
-        config=batch_config,
-        manifest=manifest,
-        checkpoint=checkpoint,
-        resume=resume,
-    )
+
+class LegacyProjectResults(list[Any]):
+    """Historical list-shaped project result with batch metadata attached."""
+
+    def __init__(self, run: BatchRunResult) -> None:
+        super().__init__(
+            item.result for item in run.frame_results if item.result is not None
+        )
+        self._run = run
+        self.frame_results = run.frame_results
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._run, name)
+
+    @property
+    def successful(self) -> list[Any]:
+        return list(self._run.successful)
+
+    @property
+    def failures(self) -> list[Any]:
+        return list(self._run.failures)
+
+
+def run_project(
+    project: ProjectConfig | str | os.PathLike[str],
+    *,
+    force: bool = False,
+) -> LegacyProjectResults:
+    """Preserve the historical list-shaped project API by default."""
+
+    return LegacyProjectResults(_run_project_bounded(project, force=force))
+
+
+def run_project_bounded(
+    project: ProjectConfig | str | os.PathLike[str],
+    *,
+    force: bool = False,
+) -> BatchRunResult:
+    """Versioned name for the resumable common project runner."""
+
+    return _run_project_bounded(project, force=force)
+
+
+def run_project_legacy(
+    project: ProjectConfig | str | os.PathLike[str],
+    *,
+    force: bool = False,
+) -> list[Any]:
+    """Compatibility adapter returning the historical per-frame list."""
+
+    run = _run_project_bounded(project, force=force)
+    return [item.result for item in run.frame_results if item.result is not None]
 
 
 def synthetic_butterfly(
@@ -2228,6 +2769,7 @@ gui = launch_gui
 __all__ = [
     "PipelineError",
     "PipelineResult",
+    "LegacyProjectResults",
     "read_frame",
     "build_qmap",
     "measure_observables",
@@ -2237,7 +2779,10 @@ __all__ = [
     "inspect_frame",
     "analyze_frame",
     "batch_analyze",
+    "batch_analyze_bounded",
     "run_project",
+    "run_project_bounded",
+    "run_project_legacy",
     "export_result",
     "synthetic_butterfly",
     "synthetic_frame",

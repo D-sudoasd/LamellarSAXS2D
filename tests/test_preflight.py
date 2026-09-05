@@ -287,7 +287,7 @@ def test_uncertainty_hdf5_source_and_components_are_reported(
         loaded = original_load_image(path, **kwargs)
         loaded.metadata["header"] = {
             "UncertaintyStatus": "partial",
-            "UncertaintyHDF5": rf"H:\archive\images_h5\{uncertainty_file.name}",
+            "UncertaintyHDF5": "images_h5/image_uncertainty.h5",
         }
         return loaded
 

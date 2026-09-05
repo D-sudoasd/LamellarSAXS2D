@@ -37,6 +37,8 @@ _GUIDE_TEXT = {
         "result_none": "尚未运行 Preview / Optimize",
         "result_failed": "最近结果失败；请检查 flags 与残差",
         "result_ready": "{kind} 已完成；人工状态：{review}",
+        "geometry_result": "{kind} 已完成；仅几何测量，尚未运行整幅强度精修；质量：{quality}",
+        "geometry_review": "检查 Observed 中的 ridge 与椭圆，以及几何质量 flags；整幅强度精修尚未运行。",
         "open_image": "打开二维 SAXS 图像。",
         "select_poni": "选择与该数据对应的 PONI；未标定前不要解释间距。",
         "preview": "设置 q 范围和 mask 后运行 Preview。",
@@ -63,6 +65,8 @@ _GUIDE_TEXT = {
         "result_none": "Preview / Optimize has not been run",
         "result_failed": "latest result failed; inspect flags and residuals",
         "result_ready": "{kind} complete; manual status: {review}",
+        "geometry_result": "{kind} complete; geometry only, whole-pixel intensity fit not run; quality: {quality}",
+        "geometry_review": "Review the observed ridge and ellipse plus geometry quality flags; whole-pixel intensity fit has not run.",
         "open_image": "Open a two-dimensional SAXS image.",
         "select_poni": "Select the matching PONI before interpreting physical spacing.",
         "preview": "Set the q range and mask, then run Preview.",
@@ -126,6 +130,34 @@ def _result_failed(window: Any) -> bool:
         return False
 
 
+def _geometry_only(window: Any) -> bool:
+    result = getattr(window, "_last_result", None)
+    action = _base._read(
+        result,
+        ("geometry_action", "geometry_stage", "analysis_stage"),
+        None,
+    )
+    if str(action or "").strip().lower() in {
+        "remeasure",
+        "refine",
+        "geometry",
+        "geometry_only",
+    }:
+        return True
+    model_status = _base._read(result, ("model_status",), None)
+    if str(model_status or "").strip().lower() in {
+        "unfitted_preview",
+        "geometry_only",
+        "not_run",
+        "unfitted",
+    }:
+        return True
+    return str(getattr(window, "_last_result_kind", "")).lower() in {
+        "measure_geometry",
+        "refine_geometry",
+    }
+
+
 def _workflow_lines(window: Any) -> tuple[str, bool]:
     text = _GUIDE_TEXT[_language(window)]
     observed = getattr(window, "_observed", None)
@@ -169,22 +201,53 @@ def _workflow_lines(window: Any) -> tuple[str, bool]:
         if isinstance(fit_session, Mapping)
         else "unreviewed"
     )
+    geometry_only = _geometry_only(window)
     if result is None:
         result_value = text["result_none"]
     elif failed:
         result_value = text["result_failed"]
+    elif geometry_only:
+        ellipse = _base._read(
+            result,
+            ("ellipse_fit", "ellipse", "ellipse_result"),
+            None,
+        )
+        quality = _base._read(
+            ellipse,
+            ("quality_status", "status"),
+            _base._read(
+                _base._read(ellipse, ("quality",), {}),
+                ("status",),
+                "WARN",
+            ),
+        ) or "WARN"
+        raw_kind = str(getattr(window, "_last_result_kind", None) or "geometry")
+        if _language(window) == "zh_CN":
+            kind = "几何测量" if raw_kind == "measure_geometry" else "几何精修"
+        else:
+            kind = (
+                "geometry measurement"
+                if raw_kind == "measure_geometry"
+                else "geometry refinement"
+            )
+        result_value = text["geometry_result"].format(
+            kind=kind,
+            quality=quality,
+        )
     else:
         kind = str(getattr(window, "_last_result_kind", None) or "result")
         result_value = text["result_ready"].format(kind=kind, review=review)
 
     if observed is None:
         next_step = text["open_image"]
+    elif failed:
+        next_step = text["inspect_failure"]
     elif not q_ready:
         next_step = text["select_poni"]
     elif result is None:
         next_step = text["preview"]
-    elif failed:
-        next_step = text["inspect_failure"]
+    elif geometry_only:
+        next_step = text["geometry_review"]
     elif review in {"unreviewed", ""}:
         next_step = text["review"]
     else:
@@ -222,6 +285,43 @@ def _refresh_workflow_guide(window: Any) -> None:
         )
 
 
+def _ensure_widget_visible_exact(scroll: Any, widget: Any) -> None:
+    """Scroll a focused control until both horizontal edges are visible."""
+
+    if scroll is None or widget is None or not widget.isVisible():
+        return
+    scroll.ensureWidgetVisible(widget, 0, 0)
+    viewport = scroll.viewport()
+    bar = scroll.horizontalScrollBar()
+    for _ in range(2):
+        top_left = widget.mapTo(viewport, widget.rect().topLeft())
+        bottom_right = widget.mapTo(viewport, widget.rect().bottomRight())
+        delta = 0
+        if top_left.x() < viewport.rect().left():
+            delta = top_left.x() - viewport.rect().left()
+        elif bottom_right.x() > viewport.rect().right():
+            delta = bottom_right.x() - viewport.rect().right()
+        if not delta:
+            break
+        bar.setValue(bar.value() + delta)
+
+
+class _FocusVisibilityFilter(QtCore.QObject):
+    """Bring keyboard-focused dock controls fully into the scroll viewport."""
+
+    def __init__(self, scroll: Any, parent: Any = None) -> None:
+        super().__init__(parent)
+        self.scroll = scroll
+
+    def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802 - Qt API
+        if event.type() == QtCore.QEvent.Type.FocusIn:
+            QtCore.QTimer.singleShot(
+                0,
+                lambda: _ensure_widget_visible_exact(self.scroll, watched),
+            )
+        return False
+
+
 def upgrade_window(window: Any) -> Any:
     """Add idempotent workflow guidance and scroll-safe dock presentation."""
 
@@ -230,12 +330,25 @@ def upgrade_window(window: Any) -> Any:
     dock = getattr(window, "parameters_dock", None)
     if dock is None:
         return window
-    panel = dock.widget()
-    if panel is None:
+    dock_widget = dock.widget()
+    if dock_widget is None:
         return window
 
-    layout = panel.layout()
-    if layout is not None:
+    # ``main_window.create_app`` can be imported directly by lightweight
+    # launchers and probes, so the presentation layer may be installed after
+    # the dock has already been built.  Reuse an existing scroll area instead
+    # of wrapping it a second time.
+    if isinstance(dock_widget, QtWidgets.QScrollArea):
+        scroll = dock_widget
+        panel = scroll.widget()
+        if panel is None:
+            return window
+        layout = panel.layout()
+    else:
+        panel = dock_widget
+        layout = panel.layout()
+
+    if layout is not None and not hasattr(window, "workflow_status_group"):
         guide = QtWidgets.QGroupBox(panel)
         guide.setObjectName("workflowStatusGroup")
         guide_layout = QtWidgets.QVBoxLayout(guide)
@@ -244,7 +357,10 @@ def upgrade_window(window: Any) -> Any:
         label.setObjectName("workflowStatusLabel")
         label.setWordWrap(True)
         label.setTextFormat(QtCore.Qt.TextFormat.PlainText)
-        label.setAccessibleName("LamellarSAXS2D workflow status")
+        label.setAccessibleName(window._tr("a11y.workflow_status"))
+        # Bound the guide's long prose so it participates in the dock's
+        # narrow layout instead of imposing a 700 px minimum width.
+        label.setFixedWidth(320)
         guide_layout.addWidget(label)
         layout.insertWidget(0, guide)
         window.workflow_status_group = guide
@@ -252,29 +368,55 @@ def upgrade_window(window: Any) -> Any:
 
     table = getattr(window, "parameter_table", None)
     if table is not None:
-        table.setMinimumHeight(max(220, table.minimumSizeHint().height()))
+        table.setMinimumHeight(max(170, table.minimumSizeHint().height()))
 
-    panel.setParent(None)
-    if layout is not None:
-        layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
-    panel.setMinimumHeight(max(840, panel.minimumSizeHint().height()))
+    if not isinstance(dock_widget, QtWidgets.QScrollArea):
+        panel.setParent(None)
+        if layout is not None:
+            layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinimumSize)
+        panel.setMinimumHeight(max(720, panel.minimumSizeHint().height()))
 
-    scroll = QtWidgets.QScrollArea(dock)
-    scroll.setObjectName("parametersScrollArea")
-    scroll.setWidgetResizable(True)
-    scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-    scroll.setHorizontalScrollBarPolicy(
-        QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
-    )
-    scroll.setVerticalScrollBarPolicy(
-        QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
-    )
-    scroll.setAccessibleName("Scrollable analysis controls")
-    scroll.setWidget(panel)
-    dock.setWidget(scroll)
-    dock.setMinimumWidth(460)
+        scroll = QtWidgets.QScrollArea(dock)
+        scroll.setObjectName("parametersScrollArea")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        # The control panel has a wider natural layout than a narrow dock.
+        # Keep horizontal scrolling available so ensureWidgetVisible(), focus
+        # traversal, and keyboard users can reach every right-hand field.
+        scroll.setHorizontalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        scroll.setVerticalScrollBarPolicy(
+            QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        scroll.setAccessibleName(window._tr("a11y.scroll_controls"))
+        scroll.setWidget(panel)
+        dock.setWidget(scroll)
+    else:
+        # Keep a deterministic minimum content height so the scroll bar is
+        # available on 980x680 windows while still allowing the dock to shrink
+        # when the user maximizes the central plot.
+        panel.setMinimumHeight(max(720, panel.minimumSizeHint().height()))
+
+    dock.setMinimumWidth(360)
+    dock.setMaximumWidth(520)
+    try:
+        target_width = min(440, max(380, int(window.width() * 0.32)))
+        window.resizeDocks(
+            [dock],
+            [target_width],
+            QtCore.Qt.Orientation.Horizontal,
+        )
+    except Exception:
+        pass
     window.parameters_scroll_area = scroll
     window.parameters_panel = panel
+    focus_filter = _FocusVisibilityFilter(scroll, window)
+    for widget in panel.findChildren(QtWidgets.QWidget):
+        widget.installEventFilter(focus_filter)
+    window._focus_visibility_filter = focus_filter
+    if callable(getattr(window, "_retranslate_accessible_names", None)):
+        window._retranslate_accessible_names()
 
     timer = QtCore.QTimer(window)
     timer.setObjectName("workflowStatusTimer")
@@ -306,17 +448,19 @@ RefinementWindow = RefinementMainWindow
 WorkbenchWindow = RefinementMainWindow
 symmetric_ellipses = _base.symmetric_ellipses
 
-# The base factories perform all configuration/project loading.  Redirect their
-# class lookup to the public presentation subclass rather than duplicating that
-# scientific start-up logic here.
-_base.RefinementMainWindow = RefinementMainWindow
-_base.MainWindow = RefinementMainWindow
-_base.Workbench = RefinementMainWindow
-_base.RefinementWindow = RefinementMainWindow
-_base.WorkbenchWindow = RefinementMainWindow
+def create_app(argv: list[str] | None = None, **kwargs: Any) -> tuple[Any, Any]:
+    """Create the public workbench through an explicit factory hook."""
 
-create_app = _base.create_app
-launch = _base.launch
+    kwargs["window_cls"] = RefinementMainWindow
+    return _base.create_app(argv, **kwargs)
+
+
+def launch(argv: list[str] | None = None, **kwargs: Any) -> int:
+    """Run the public workbench without mutating ``main_window`` globals."""
+
+    app, window = create_app(argv, **kwargs)
+    window.show()
+    return int(app.exec())
 
 
 __all__ = [

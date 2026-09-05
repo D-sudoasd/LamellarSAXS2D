@@ -18,10 +18,12 @@ The screenshot uses synthetic data and demonstrates the observed, model, residua
 - PONI-calibrated reciprocal-space maps and explicit masks or exclusion regions.
 - Read-only package preflight for manifests, geometry, masks, units, correction state, uncertainty state, and SHA-256 evidence.
 - P3 same-model/independent-FFT benchmark generators, an eight-frame blind-annotation pack, and a read-only Go/No-Go evidence gate.
-- Radial and azimuthal profiles, lobe measurements, ridge extraction, and q-space symmetric double-ellipse fitting.
+- Radial and azimuthal profiles, lobe measurements, directly observed azimuthal-peak or radial ridge extraction, and q-space symmetric double-ellipse fitting.
+- Explicit `flat_ellipse` and `very_flat_ellipse` measurement presets (editable `b/a` bounds; the latter defaults to `0.005–0.35`), deterministic multistart and separate geometry-only remeasurement/refinement.
+- Quadrant pairing is defined in the fitted `(q-center)`/reference-axis frame: QI+QIII form one mirrored pair and QII+QIV the other. The fitter never fabricates a missing counterpart; unsupported opposite quadrants remain flagged.
 - Optional full-pixel empirical 2D refinement with bounds, fixed parameters, expression constraints, weights, and residual diagnostics.
 - Qt workbench with live preview, background optimization, parameter tables, overlays, batch controls, evolution plots, a scroll-safe control dock, and a state-aware next-step guide.
-- Independent or quality-gated warm-start processing, checkpoints, failed-frame isolation, and auditable CSV/JSON/NPZ exports.
+- Independent or quality-gated warm-start processing, selector-aware checkpoints, cooperative cancellation/progress, optional streaming exports, failed-frame isolation, and auditable CSV/JSON/NPZ exports.
 - First-run environment diagnostics and a crash-visible GUI launcher that records otherwise silent `pythonw` start-up failures.
 
 ## Install from source
@@ -55,6 +57,13 @@ On Linux/macOS:
 Core analysis does not require Qt. For core-only use, install with `python -m pip install -e .` and run `bsaxs-doctor` without `--require-ui`.
 
 ### Windows desktop launch
+
+The launcher searches `.venv-project`, `.venv`, and `venv` first, then asks
+the Windows Python launcher for Python 3.13, 3.12 or 3.11 and prepends this
+checkout's `src` directory to `PYTHONPATH`. It does not use the Microsoft
+Store `python.exe` alias or install global packages. `--check` requires the
+optional UI dependencies; install the project extras in a project environment
+when the diagnostic reports a missing `pyqtgraph`/Qt package.
 
 After the environment check passes, double-click `启动_LamellarSAXS2D.cmd`, or run:
 
@@ -136,7 +145,7 @@ bsaxs p3-status --t1-manifest <T1-truth_manifest.json> \
 
 The symmetric ellipses and optional `full2d` model are empirical reciprocal-space measurement/refinement models. A successful fit does **not** uniquely recover a three-dimensional lamellar structure or establish a deformation mechanism from one 2D pattern. Structural interpretation requires explicit geometric assumptions and independent experimental evidence.
 
-The implementation is informed by the ellipse and lamellar-pattern analysis discussed by [Grubb, Murthy & Francescangeli (2016)](https://doi.org/10.1002/polb.23930) and [Grubb et al. (2021)](https://doi.org/10.1016/j.polymer.2021.123566). The papers themselves are not redistributed in this repository.
+The implementation is informed by the ellipse and lamellar-pattern analysis discussed by [Wang, Murthy & Grubb (2007), *“Butterfly” small-angle X-ray scattering patterns in semicrystalline polymers are double-elliptical*](https://doi.org/10.1016/j.polymer.2007.04.026), [Grubb, Murthy & Francescangeli (2016)](https://doi.org/10.1002/polb.23930), and [Grubb et al. (2021)](https://doi.org/10.1016/j.polymer.2021.123566). The papers themselves are not redistributed in this repository.
 
 ---
 
@@ -151,6 +160,9 @@ LamellarSAXS2D 面向取向层片体系的各向异性二维 SAXS 花样，提�
 - 在拟合前只读检查数据包、manifest、PONI、mask、单位、校正/不确定度状态和输入哈希。
 - 生成 P3 同模型/独立 FFT 基准、8 帧盲标包，并提供缺证据即 No-Go 的只读证据门；是否进入下一阶段由团队依据报告决定。
 - 提取径向/方位剖面、lobe、ridge，并在 q 空间拟合共享中心和半轴的镜像双椭圆。
+- `flat_ellipse` 与 `very_flat_ellipse` 是可编辑的观测几何先验；`very_flat_ellipse` 默认 `b/a=0.005–0.35`，不会覆盖项目中已明确给出的边界。
+- 象限配对在 `(q-center)`/reference-axis 坐标中执行：QI+QIII 为一对，QII+QIV 为另一对。软件只使用实际观测到的 ridge 点，不用镜像点补齐缺失象限；缺失对侧、短弧和外推都会保留在 flags/quality/coverage 诊断中。
+- `azimuthal_peak` 表示 q annulus 内的观测方位最大值；`radial_peak`/lobe radial profile 才给出沿方位的径向 `q_star`。`full2d` 是另一个使用全有效像素的经验强度模型，三者不互相冒充。
 - 可选像素级 `full2d` 经验精修，支持参数边界、固定、表达式绑定、权重和残差诊断。
 - Qt 界面提供 Observed、Model、Residual、Overlay 四视图和可编辑参数表；人工修改参数后，Preview 会同步更新经验模型及 Overlay 中的模型双椭圆，Optimize 只作为当前单帧的可选辅助。
 - 右侧控制栏采用可滚动布局，并在顶部显示输入、q 标定、mask/ROI、结果状态及“建议下一步”；在笔记本或 980×680 窗口下，底部审核与快照控件仍可访问。

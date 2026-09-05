@@ -53,6 +53,16 @@ PONI 是物理 q 坐标的校准输入，CBF、EDF、TIF/TIFF 的最小示例：
 
 没有 PONI 时 pipeline 可以生成以图像中心为基准的确定性像素坐标，q 单位为 `pixel-q` 并带 `uncalibrated_pixel_q`。这适合算法烟测或同条件相对比较，不是物理 `nm^-1`。只有在用户掌握可靠标定并显式配置 `q_scale`/`q_unit` 时，才可把该坐标声明为物理 q；不要因为字段名叫 `q` 就自动换算纳米周期。`pixel-q` 与 `nm^-1`、论文 Table 3 的 pixel 半轴的区别见科学文档。
 
+对于 `ridge_method = "azimuthal_peak"`，ridge 点表示每个 q annulus 内的观测方位最大值，`q_star` 是该 annulus 的代表 q，不是沿某个方位的径向峰位置。因此该模式的 `Ln/L_N/L_z` 不会由 annulus q 伪造；椭圆结果会明确标记直接支持范围、分支覆盖、bound、condition、`short_arc` 和 `major_axis_extrapolated`。四个 lobe 的独立窄方位径向 profile 与 `lobe_radial_profiles`/`lobe_radial_peaks` 仍可提供真正的 radial `q_star`、radial FWHM、面积和 SNR；只有这些径向观测量满足 q 单位和原点假设时，才会派生周期字段。
+
+### 蝴蝶翼的 very-flat 先验与象限配对
+
+当翼部只覆盖一段很短的弧线时，建议从 `very_flat_ellipse` 开始。它默认把 `b/a` 限制在 `0.005–0.35`，这些数值是可编辑先验，不是软件替用户测得的精度；项目、CLI 或 UI 中已经明确给出的 `a/b`、ratio、center、angle 边界会原样保留。`flat_ellipse` 是兼容名称，适合仍希望使用普通扁椭圆入口的项目。
+
+双椭圆的分支在拟合中心和 reference axis 定义的 `(q-center)` 坐标中配对：QI 与 QIII 属于同一对，QII 与 QIV 属于另一对；同一对共享 `a`、`b` 和 center，两个镜像倾角为 `reference ± theta`。软件只使用实际观测到的 ridge 点，绝不会用镜像点补齐缺失象限。对侧缺失、单分支、短弧、边界命中和 major-axis extrapolation 会分别进入 ridge/ellipse 的 `valid`、`reason`、`coverage`、`flags` 和 quality 诊断；GUI 中观测 ridge 与模型双椭圆也使用独立颜色，不能把模型线当作新增观测。
+
+这一经验配对逻辑与 Wang、Murthy、Grubb 对聚合物蝴蝶图样的 double-elliptical 讨论一致（[Polymer 48 (2007) 3393–3399](https://doi.org/10.1016/j.polymer.2007.04.026)）；它支持 q 空间表观测量的组织，不单独证明三维层片结构或变形机制。
+
 ## 2. 输入格式与选择器
 
 核心 I/O 支持：
@@ -98,6 +108,9 @@ directory = "results"
 [analysis]
 q_window = [0.02, 0.20]
 ridge_method = "surface_curvature"
+ridge_snr_threshold = 2.0
+ridge_min_peak_fraction = 0.0
+ridge_min_coverage = 0.0
 n_angles = 72
 n_angular_bins = 360
 n_radial_bins = 256
@@ -113,6 +126,24 @@ robust_loss = "soft_l1"
 # 自动生成初值时，软件只估计幅度/背景的起始数值尺度，不改变输入强度；
 # 显式参数和 warm start 默认保持原值。需要强制重估时再设置为 true。
 # auto_scale_initial = true
+
+# 蝴蝶翼常只在部分方位有直接支持时，建议显式使用受约束的测量椭圆。
+# 这些约束实际传入 ridge 椭圆拟合，与 full2d 强度参数表分开。
+# [analysis.ellipse]
+# preset = "flat_ellipse"
+# axis_ratio_min = 0.005
+# axis_ratio_max = 0.35
+# a_min = 0.2
+# a_max = 4.0
+# fixed_a = false
+# fixed_axis_ratio = false
+# fixed_center = true
+# center_qx = 0.0
+# center_qy = 0.0
+# theta_min_deg = 0.0
+# theta_max_deg = 90.0
+# residual = "geometric"
+# multistart = 7
 
 [[analysis.rois]]
 type = "rectangle"
@@ -182,6 +213,8 @@ UI 文件选择器直接列出 CBF、EDF、TIF、TIFF；核心 I/O 还支持 NPY
 3. 在右侧参数表编辑 `Value`、`Min`、`Max`、`Vary`、`Expr`、`Unit`。角度的公共 UI 字段使用 degree 标注；内部求解器可用弧度，但不要把 degree 与 radian 混填。
 4. 在 `Exclusion ROI (pixel)` 选择 `Rectangle` 或 `Ellipse`，填写边界/中心与半径，点击 `Apply`；`Clear` 清除 UI 排除区。
 5. `Preview` 根据当前参数显示 observed/model/residual/overlay；Overlay 中青色虚线双椭圆来自右侧当前模型参数，橙色实线椭圆来自观测 ridge 的独立拟合，两者不得混作同一证据。`Optimize` 在后台精修可变参数；`Auto Preview` 控制参数改变后的自动预览。状态栏显示 RMSE、ndata、flags、coverage。
+   右侧 `Measured ellipse constraints` 中的 `Flat ellipse` / `Very flat ellipse` preset 会把 axis-ratio、a/b、angle、center、residual 和 multistart 约束真正传给观测 ridge 椭圆拟合；其中 Very flat 默认 ratio 为 `0.005–0.35`，但不会覆盖已有显式边界。它不修改 full2d 强度参数表，也不把先验边界当成测量精度。`Remeasure geometry` 只重测 ridge/lobe/椭圆，`Refine geometry` 重跑受约束 geometry 并刷新质量诊断。很扁且只覆盖部分弧段时，应同时检查 `direct_major_extent_fraction`、`short_arc`、`condition`、`bound` 和 `major_axis_extrapolated`。
+   `Azimuthal peak` 在 q annulus 内找方位最大值，适合蝴蝶翼；`Radial peak` 沿每个方位找径向峰，两者的 q 量不能混用。`Fit q window` 可把倒易空间 Overlay 放大到当前 q 范围，`Full detector` 恢复整幅视图；这只改变显示范围。
 6. 在 `Fit session` 中填写 `Snapshot note` 后点击 `Save snapshot`，可保存多个带顺序和备注的完整参数表；`Restore snapshot` 精确恢复所选参数。每次 Optimize 前软件还会自动保存一次完整状态，`Restore before optimize` 可撤销本次自动精修。取消任务或忽略延迟返回的结果后，旧 worker 不会覆盖当前参数。
 7. 最新一次 Preview 或 Optimize 成功后，填写 `Reviewer`，再点 `Accept current` 或 `Reject current`。修改参数、分析范围、输入、PONI、mask 或 ROI 后，状态会立即回到 `unreviewed`，必须重新 Preview 才能审核或导出。`accepted` 只表示该审核者接受当前人工拟合会话，不表示软件或 P3 科学门给出 PASS。
 8. `Project → Export evidence…`（中文界面为“项目 → 导出拟合证据…”）选择输出目录，固定生成 `observed.png`、`model.png`、`residual.png`、`overlay.png`、`parameters.csv`、`fit_session.json` 和 `provenance.json`。输入是当前屏幕对应的最新 Preview/Optimize、参数表和审核状态；输出默认不覆盖已有同名文件。UI 在载入 source/PONI/mask 时记录其 SHA-256，并把该快照绑定到本次 Preview/Optimize；导出前会重新计算当前文件哈希，任一文件被替换、删除或缺少拟合时哈希都会拒绝导出。成功标准是状态栏显示已将 7 个证据文件导出到目标路径，七个文件均非空，`parameters.csv` 与当前参数表一致，两个 JSON 中 q 单位、输入路径/hash、`input_binding_verified=true` 和 `manual_status` 可复核。未审核结果也可以导出，但必须保持 `unreviewed`。
@@ -201,9 +234,22 @@ PowerShell 中若使用通配符，建议加引号让 CLI 自己展开；CLI 也
 .\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\frame_*.cbf" --poni geometry\detector.poni -o results\batch --mode independent
 .\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\frame_*.cbf" --poni geometry\detector.poni -o results\batch --mode warm_start --manifest sequence.csv --checkpoint results\checkpoint.json
 .\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\frame_*.cbf" -c project.toml --resume --force
+
+# 只处理 manifest 中显式标记的序列，并按有序位置取一个含首尾范围。
+.\.venv-project\Scripts\python.exe -m butterfly_saxs batch -c project.toml `
+  --series hold_375C --range 60:120:2 --stream
 ```
 
 `manifest` 可用 CSV/JSON 提供 `path`、`frame_id`、`time`、`order`、`dataset`、零基 `frame`（或 `frame_index`）等元数据。manifest 文件中的相对 `path` 按 manifest 所在目录解析。它可以让同一个 HDF5/NPZ/TIFF 容器中的不同 dataset/frame 成为独立批处理记录；这些选择器会传给实际读取器并进入 checkpoint 身份。没有 manifest 时使用自然文件名排序。`checkpoint` 记录输入内容 hash、配置 hash、模式和每帧控制状态；`--resume` 只有 hash/mode 相符时才恢复。
+配置 hash 还绑定 PONI、mask、valid-mask、sigma、weights 和 uncertainty 文件的当前 SHA-256 内容；文件被替换即使路径不变也会拒绝恢复。输入/校准/mask 源保持只读。
+
+`--series` 按 manifest 的 `series`/`series_id`/`group`/`sample` 或 FrameRef 的 `source` 精确筛选；`--start`、`--stop` 和 `--stride` 在筛选后的自然/manifest 顺序上工作，`stop` 包含在内。也可以用 `--range START:STOP[:STEP]` 一次声明范围，不能和三项分开参数混用。序列位置选择与容器内的 `--frame` 选择是两套独立语义。
+
+`--stream` 逐帧把 CSV、JSONL 和 NPZ 数组写入临时证据包，并释放已处理帧的 detector 数组；适合 1679×1475 或更大探测器的长序列。流式 checkpoint 仍只保存数组摘要。resume 会先验证上一轮 manifest、NPZ 元数据和声明的数组成员，再保留已恢复帧的原始数组，只替换实际重跑的帧；如果上一轮 bundle 没有可验证的 manifest/数组，会拒绝恢复。参数、ridge、lobe、椭圆和 flags 仍逐帧保留。取消请求会在当前帧结束后停止，并把 `cancelled`、`processed_count`、`elapsed_s` 与最后 checkpoint 写出。
+
+恢复只接受 checkpoint 中 `status=ok` 且质量检查通过的帧；失败、质量 FAIL 或不完整帧会在恢复时重新读取和拟合，这是预期的 failed-frame retry 行为。若所有选中帧都能从已验证 checkpoint 恢复，stream exporter 会走 no-op fast path，保留原 NPZ 成员而不重新压缩；这只优化 I/O，不把质量 WARN/FAIL 改写成 PASS。
+
+Qt/service 批处理还支持 `stage = "geometry"`（或 `full2d = false`）只提取 observed ridge/lobe/椭圆；省略这两个字段时保持旧的 full2d 优化行为。geometry 阶段的 `parameters` 是实际测得的椭圆参数，full2d 强度参数保存在独立的 `intensity_parameters` 字段，不会覆盖用户的强度初值。流式导出额外写出 `lobe_measurements.csv`，其中每个观测 lobe 的角度、radial `q_star`、FWHM、SNR、面积、coverage、valid/reason 和 q 单位都是标量列；这张表不把 azimuthal annulus q 冒充 radial 峰。
 
 批处理即使有失败帧也会先写出其余帧和失败记录，便于原位序列排查；只要存在失败帧，CLI 进程返回码为 `1`，全帧成功返回 `0`。因此自动化脚本既可读取 `frame_summary.csv` 做逐帧处理，也不会把部分失败误判为整批成功。
 

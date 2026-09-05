@@ -76,7 +76,7 @@ if QT_AVAILABLE:
     class WorkerSignals(QtCore.QObject):
         finished = QtCore.Signal(int, str, object)
         error = QtCore.Signal(int, str, object)
-        progress = QtCore.Signal(int, str)
+        progress = QtCore.Signal(int, str, object)
 
 
     class AnalysisWorker(QtCore.QRunnable):
@@ -103,6 +103,11 @@ if QT_AVAILABLE:
             self.generation = self.request.generation
             self.kind = self.request.kind
             self.signals = WorkerSignals()
+
+        def report_progress(self, payload: Any) -> None:
+            """Thread-safe callback passed to batch/service progress hooks."""
+
+            self.signals.progress.emit(self.generation, self.kind, payload)
 
         @QtCore.Slot()
         def run(self) -> None:  # noqa: D401 - QRunnable API
@@ -160,6 +165,9 @@ else:
             self.generation = self.request.generation
             self.kind = self.request.kind
             self.signals = WorkerSignals()
+
+        def report_progress(self, payload: Any) -> None:
+            self.signals.progress.emit(self.generation, self.kind, payload)
 
         def run(self) -> None:
             try:

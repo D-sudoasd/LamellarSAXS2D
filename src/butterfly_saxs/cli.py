@@ -19,9 +19,15 @@ from .pipeline import (
     inspect_frame,
     launch_gui,
     run_project,
+    run_project_bounded,
     synthetic_butterfly,
 )
 from .project import ProjectConfig, ProjectConfigError, load_project
+from .settings import deep_merge_mapping
+from .path_utils import filter_supported_image_paths
+
+
+_DEFAULT_LEGACY_PROJECT_RUNNER = run_project
 
 
 def _shape(value: str) -> tuple[int, int]:
@@ -42,6 +48,158 @@ def _config(value: str | None) -> ProjectConfig | None:
         return None
     source = Path(value)
     return load_project(source).resolve_paths(source.parent)
+
+
+def _analysis_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Collect explicit CLI refinement controls without overriding TOML defaults."""
+
+    mapping: dict[str, Any] = {}
+    for argument, key in (
+        ("q_min", "q_min"),
+        ("q_max", "q_max"),
+        ("q_window", "q_window"),
+        ("ridge_method", "ridge_method"),
+        ("ridge_snr_threshold", "ridge_snr_threshold"),
+        ("ridge_min_peak_fraction", "ridge_min_peak_fraction"),
+        ("ridge_min_coverage", "ridge_min_coverage"),
+        ("full2d_multistart", "full2d_multistart"),
+        ("mask", "mask"),
+        ("valid_mask", "valid_mask"),
+        ("mask_frame", "mask_frame"),
+        ("mask_dataset", "mask_dataset"),
+    ):
+        value = getattr(args, argument, None)
+        if value is not None:
+            mapping[key] = value
+    ellipse: dict[str, Any] = {}
+    for argument, key in (
+        ("ellipse_preset", "preset"),
+        ("ellipse_ratio_min", "axis_ratio_min"),
+        ("ellipse_ratio_max", "axis_ratio_max"),
+        ("ellipse_a", "a"),
+        ("ellipse_b", "b"),
+        ("ellipse_ratio", "axis_ratio"),
+        ("ellipse_a_min", "a_min"),
+        ("ellipse_a_max", "a_max"),
+        ("ellipse_b_min", "b_min"),
+        ("ellipse_b_max", "b_max"),
+        ("ellipse_angle_min", "theta_min_deg"),
+        ("ellipse_angle_max", "theta_max_deg"),
+        ("ellipse_fixed_center", "fixed_center"),
+        ("ellipse_fixed_a", "fixed_a"),
+        ("ellipse_fixed_ratio", "fixed_axis_ratio"),
+        ("ellipse_center_qx", "center_qx"),
+        ("ellipse_center_qy", "center_qy"),
+        ("ellipse_fixed_angle", "fixed_angle"),
+        ("ellipse_angle_deg", "angle_deg"),
+        ("ellipse_residual", "residual"),
+        ("ellipse_multistart", "multistart"),
+    ):
+        value = getattr(args, argument, None)
+        if value is not None:
+            ellipse[key] = value
+    if ellipse:
+        mapping["ellipse"] = ellipse
+    return mapping
+
+
+def _with_analysis(config: ProjectConfig | None, overrides: Mapping[str, Any]) -> Any:
+    """Return a config carrying explicit CLI overrides with TOML precedence."""
+
+    if not overrides:
+        return config
+    if config is None:
+        return ProjectConfig(analysis=dict(overrides))
+    return ProjectConfig(
+        input_paths=config.input_paths,
+        poni_path=config.poni_path,
+        output_dir=config.output_dir,
+        q_unit=config.q_unit,
+        full2d=config.full2d,
+        analysis=deep_merge_mapping(config.analysis, overrides),
+        export=config.export,
+        metadata=config.metadata,
+    )
+
+
+def _add_refinement_options(parser: argparse.ArgumentParser) -> None:
+    """Add the common flat-ellipse/ridge controls to a CLI subcommand."""
+
+    parser.add_argument(
+        "--q-window",
+        type=float,
+        nargs=2,
+        metavar=("Q_MIN", "Q_MAX"),
+        help="analysis q window in the active q-map unit",
+    )
+    parser.add_argument("--q-min", type=float, help="analysis q lower bound")
+    parser.add_argument("--q-max", type=float, help="analysis q upper bound")
+    parser.add_argument(
+        "--ridge-method",
+        choices=("radial_peak", "azimuthal_peak", "surface_curvature"),
+        help="ridge localization method (radial_peak, azimuthal_peak, or surface_curvature)",
+    )
+    parser.add_argument("--ridge-snr-threshold", type=float, help="minimum ridge SNR")
+    parser.add_argument(
+        "--ridge-min-peak-fraction",
+        type=float,
+        help="minimum valid support fraction for a ridge candidate [0, 1]",
+    )
+    parser.add_argument(
+        "--ridge-min-coverage",
+        type=float,
+        help="minimum detector coverage for a ridge candidate [0, 1]",
+    )
+    parser.add_argument(
+        "--ellipse-preset",
+        choices=("standard", "flat_ellipse", "very_flat_ellipse"),
+        help="constrained measured-ellipse preset",
+    )
+    parser.add_argument("--ellipse-ratio-min", type=float, help="measured ellipse b/a lower bound")
+    parser.add_argument("--ellipse-ratio-max", type=float, help="measured ellipse b/a upper bound")
+    parser.add_argument("--ellipse-a", type=float, help="measured ellipse a starting value")
+    parser.add_argument("--ellipse-b", type=float, help="measured ellipse b starting value")
+    parser.add_argument("--ellipse-ratio", type=float, help="measured ellipse b/a starting value")
+    parser.add_argument("--ellipse-a-min", type=float, help="measured ellipse a lower bound")
+    parser.add_argument("--ellipse-a-max", type=float, help="measured ellipse a upper bound")
+    parser.add_argument("--ellipse-b-min", type=float, help="derived measured ellipse b lower bound")
+    parser.add_argument("--ellipse-b-max", type=float, help="derived measured ellipse b upper bound")
+    parser.add_argument("--ellipse-angle-min", type=float, help="measured ellipse angle lower bound (deg)")
+    parser.add_argument("--ellipse-angle-max", type=float, help="measured ellipse angle upper bound (deg)")
+    parser.add_argument(
+        "--ellipse-fixed-center",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="fix measured ellipse centre at ellipse-center-qx/qy",
+    )
+    parser.add_argument(
+        "--ellipse-fixed-a",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="fix measured ellipse a at its explicit value",
+    )
+    parser.add_argument(
+        "--ellipse-fixed-ratio",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="fix measured ellipse b/a at its explicit value",
+    )
+    parser.add_argument("--ellipse-center-qx", type=float, help="measured ellipse centre qx")
+    parser.add_argument("--ellipse-center-qy", type=float, help="measured ellipse centre qy")
+    parser.add_argument(
+        "--ellipse-fixed-angle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="fix the measured ellipse angle at ellipse-angle-deg",
+    )
+    parser.add_argument("--ellipse-angle-deg", type=float, help="measured ellipse angle initial value (deg)")
+    parser.add_argument(
+        "--ellipse-residual",
+        choices=("sampson", "geometric"),
+        help="residual used by measured ellipse fit",
+    )
+    parser.add_argument("--ellipse-multistart", type=int, help="deterministic measured ellipse starts")
+    parser.add_argument("--full2d-multistart", type=int, help="deterministic full2d starts")
 
 
 def _print_json(value: Any) -> None:
@@ -114,6 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("-o", "--output", help="JSON/NPZ 文件或输出目录")
     analyze_parser.add_argument("--full2d", action="store_true", help="调用可选的 full2d 精修模块")
     analyze_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    _add_refinement_options(analyze_parser)
 
     batch_parser = sub.add_parser("batch", help="批量分析原位序列")
     batch_parser.add_argument("inputs", nargs="*", help="输入图像或通配符")
@@ -132,6 +291,21 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--checkpoint", help="批量检查点 JSON 路径")
     batch_parser.add_argument("--resume", action="store_true", help="从已有检查点恢复")
     batch_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    batch_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="逐帧写出参数/脊线和 NPZ，释放已处理帧的 detector 数组",
+    )
+    batch_parser.add_argument("--series", help="只处理 manifest 中指定的 series/group")
+    batch_parser.add_argument("--start", type=int, help="选中有序序列的起始位置（含）")
+    batch_parser.add_argument("--stop", type=int, help="选中有序序列的结束位置（含）")
+    batch_parser.add_argument("--stride", type=int, default=None, help="有序序列步长")
+    batch_parser.add_argument(
+        "--range",
+        dest="frame_range",
+        help="序列范围 START:STOP[:STEP]，STOP 包含在内",
+    )
+    _add_refinement_options(batch_parser)
 
     synthetic_parser = sub.add_parser("synthetic", help="生成可重复的蝴蝶状二维测试花样")
     synthetic_parser.add_argument("-o", "--output", help=".npy/.npz/.tif 输出路径；不提供则只打印摘要")
@@ -152,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
     project_parser = sub.add_parser("project", help="执行 TOML 项目配置")
     project_parser.add_argument("config", help="项目 TOML 文件")
     project_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    project_parser.add_argument(
+        "--legacy-json",
+        action="store_true",
+        help="以旧版 per-frame JSON 列表输出；默认输出带 schema_version 的批处理 envelope",
+    )
 
     preflight_parser = sub.add_parser(
         "preflight", help="只读检查真实数据包、几何、掩膜、单位与清单"
@@ -265,6 +444,7 @@ def _handle_inspect(args: argparse.Namespace) -> int:
 
 def _handle_analyze(args: argparse.Namespace) -> int:
     config = _config(args.config)
+    config = _with_analysis(config, _analysis_overrides(args))
     source = _pick_input(args, config)
     result = analyze_frame(
         source,
@@ -292,6 +472,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
     from . import export as export_module
 
     config = _config(args.config)
+    config = _with_analysis(config, _analysis_overrides(args))
     inputs = list(args.inputs)
     if not inputs and config:
         inputs = list(config.input_paths)
@@ -304,9 +485,14 @@ def _handle_batch(args: argparse.Namespace) -> int:
     for value in inputs:
         text = os.fspath(value)
         if any(char in text for char in "*?[]"):
-            expanded_inputs.extend(glob.glob(text))
+            expanded_inputs.extend(
+                os.fspath(item) for item in filter_supported_image_paths(glob.glob(text))
+            )
         elif Path(text).is_dir():
-            expanded_inputs.extend(os.fspath(item) for item in Path(text).iterdir() if item.is_file())
+            expanded_inputs.extend(
+                os.fspath(item)
+                for item in filter_supported_image_paths(Path(text).iterdir())
+            )
         else:
             expanded_inputs.append(text)
     inputs = expanded_inputs
@@ -317,20 +503,91 @@ def _handle_batch(args: argparse.Namespace) -> int:
     manifest = args.manifest or analysis.get("manifest")
     checkpoint = args.checkpoint or analysis.get("checkpoint")
     resume = bool(args.resume or analysis.get("resume", False))
+    series = args.series if args.series is not None else analysis.get("series")
+    start = args.start if args.start is not None else analysis.get("start")
+    stop = args.stop if args.stop is not None else analysis.get("stop")
+    explicit_sequence = (
+        args.start is not None
+        or args.stop is not None
+        or args.stride is not None
+        or args.frame_range is not None
+    )
+    if explicit_sequence:
+        start = args.start
+        stop = args.stop
+        stride = args.stride if args.stride is not None else 1
+        frame_range = args.frame_range
+    else:
+        start = analysis.get("start")
+        stop = analysis.get("stop")
+        stride = analysis.get("stride", 1)
+        frame_range = (
+            args.frame_range
+            if args.frame_range is not None
+            else analysis.get("frame_range")
+        )
     output_dir = Path(args.output or (config.output_dir if config else "results"))
-    if output_dir.exists() and any(output_dir.iterdir()) and not args.force:
+    # A resumed run has already validated input/config/mode hashes before its
+    # exports are written.  It may therefore refresh its own known bundle
+    # targets; a fresh run still refuses a non-empty directory by default.
+    if output_dir.exists() and any(output_dir.iterdir()) and not args.force and not resume:
         raise FileExistsError(f"输出目录已有内容，未覆盖：{output_dir}（需要 --force）")
 
     poni = args.poni or (config.poni_path if config else None)
     full2d = args.full2d or (config.full2d if config else False)
 
+    # CLI path overrides are part of the batch configuration identity.  This
+    # binds PONI/mask content fingerprints in ``config_fingerprint`` so a
+    # resume cannot silently reuse results after calibration or mask changes.
+    path_analysis = dict(config.analysis) if isinstance(config, ProjectConfig) else {}
+    for name, value in (
+        ("mask", args.mask),
+        ("valid_mask", args.valid_mask),
+        ("mask_frame", args.mask_frame),
+        ("mask_dataset", args.mask_dataset),
+    ):
+        if value is not None:
+            path_analysis[name] = value
+    if explicit_sequence and frame_range is None:
+        path_analysis.pop("frame_range", None)
+    for name, value in (
+        ("series", args.series),
+        ("start", args.start),
+        ("stop", args.stop),
+        ("stride", stride if explicit_sequence else None),
+        ("frame_range", frame_range if explicit_sequence else None),
+    ):
+        if value is not None:
+            path_analysis[name] = value
+    path_analysis["stage"] = "full2d" if full2d else "geometry"
+    if isinstance(config, ProjectConfig) and (
+        poni != config.poni_path or path_analysis != config.analysis
+    ):
+        batch_config = ProjectConfig(
+            input_paths=config.input_paths,
+            poni_path=poni,
+            output_dir=config.output_dir,
+            q_unit=config.q_unit,
+            full2d=full2d,
+            analysis=path_analysis,
+            export=config.export,
+            metadata=config.metadata,
+        )
+    elif config is None and (poni is not None or path_analysis):
+        batch_config = ProjectConfig(poni_path=poni, analysis=path_analysis)
+    else:
+        batch_config = config
+
     batch_inputs: Any = inputs
     batch_manifest: Any = manifest
-    batch_config: Any = config
     if args.frame is not None or args.dataset is not None:
         # Resolve the manifest before applying CLI overrides so the selected
         # frame/dataset become part of the FrameRef identity and input hash.
-        resolved_refs = batch_module.build_frame_refs(inputs, manifest=manifest)
+        resolved_refs = batch_module.build_frame_refs(
+            inputs,
+            manifest=manifest,
+            allow_mixed_series=series is not None,
+        )
         resolved_with_cli_selectors = []
         for ref in resolved_refs:
             resolved_with_cli_selectors.append(
@@ -362,15 +619,17 @@ def _handle_batch(args: argparse.Namespace) -> int:
             batch_config = {"analysis": selector_config}
         else:
             batch_config = ProjectConfig(
-                input_paths=config.input_paths,
-                poni_path=config.poni_path,
+                input_paths=batch_config.input_paths,
+                poni_path=batch_config.poni_path,
                 output_dir=config.output_dir,
                 q_unit=config.q_unit,
-                full2d=config.full2d,
-                analysis={**config.analysis, **selector_config},
-                export=config.export,
-                metadata=config.metadata,
+                full2d=full2d,
+                analysis=deep_merge_mapping(batch_config.analysis, selector_config),
+                export=batch_config.export,
+                metadata=batch_config.metadata,
             )
+
+    geometry_cache: dict[Any, Any] = {}
 
     def analyze_for_batch(frame_ref: Any, initial_parameters: Any = None, config: Any = None) -> Any:
         source = getattr(frame_ref, "path", frame_ref)
@@ -394,23 +653,53 @@ def _handle_batch(args: argparse.Namespace) -> int:
             mask_frame=args.mask_frame,
             mask_dataset=args.mask_dataset,
             valid_mask=args.valid_mask,
+            geometry_cache=geometry_cache,
         )
 
-    run = batch_module.run_batch(
-        batch_inputs,
-        analyze_for_batch,
-        mode=mode,
-        config=batch_config,
-        manifest=batch_manifest,
-        checkpoint=checkpoint,
-        resume=resume,
-    )
-    exports = export_module.export_batch(
-        run,
-        output_dir,
-        provenance={"command": "bsaxs batch", "full2d": full2d},
-        force=args.force,
-    )
+    stream_writer = None
+    if args.stream:
+        stream_writer = export_module.StreamingBatchExporter(
+            output_dir,
+            provenance={"command": "bsaxs batch", "full2d": full2d, "stream": True},
+            force=bool(args.force or resume),
+            resume=resume,
+        )
+    try:
+        run = batch_module.run_batch(
+            batch_inputs,
+            analyze_for_batch,
+            mode=mode,
+            config=batch_config,
+            manifest=batch_manifest,
+            checkpoint=checkpoint,
+            resume=resume,
+            series=series,
+            start=start,
+            stop=stop,
+            stride=stride,
+            frame_range=frame_range,
+            progress=lambda update: print(
+                f"batch progress {update.get('completed', 0)}/{update.get('total', 0)}",
+                file=sys.stderr,
+                flush=True,
+            ),
+            result_sink=None if stream_writer is None else stream_writer.write,
+            retain_results=stream_writer is None,
+        )
+        exports = (
+            stream_writer.finalize(run)
+            if stream_writer is not None
+            else export_module.export_batch(
+                run,
+                output_dir,
+                provenance={"command": "bsaxs batch", "full2d": full2d},
+                force=bool(args.force or resume),
+            )
+        )
+    except Exception:
+        if stream_writer is not None:
+            stream_writer.abort()
+        raise
     compact_records = []
     for item in run.frame_results:
         record = item.to_record()
@@ -418,7 +707,30 @@ def _handle_batch(args: argparse.Namespace) -> int:
             # Avoid printing/duplicating full detector arrays at the CLI
             # boundary; lossless arrays remain in results.npz and the object
             # returned by the Python API.
-            record["result"] = item.result.to_mapping()
+            result_mapping = item.result.to_mapping()
+            if args.stream and isinstance(result_mapping, Mapping):
+                # Stream mode already writes detector/profile arrays to NPZ;
+                # keep stdout bounded to longitudinal diagnostics and rows.
+                result_mapping = {
+                    key: result_mapping.get(key)
+                    for key in (
+                        "metadata", "flags", "parameters", "ridges", "ridge_points",
+                        "ellipse_fit", "lobe_radial_profiles", "lobe_radial_peaks",
+                        "full2d", "analysis", "analysis_domain", "valid_mask",
+                    )
+                    if key in result_mapping
+                }
+            record["result"] = result_mapping
+        elif args.stream and isinstance(item.result, Mapping):
+            record["result"] = {
+                key: item.result.get(key)
+                for key in (
+                    "metadata", "flags", "parameters", "ridges", "ridge_points",
+                    "ellipse_fit", "lobe_radial_profiles", "lobe_radial_peaks",
+                    "full2d", "analysis", "analysis_domain",
+                )
+                if key in item.result
+            }
         compact_records.append(record)
     report = {
         "mode": run.mode,
@@ -429,6 +741,11 @@ def _handle_batch(args: argparse.Namespace) -> int:
         "n_success": len(run.successful),
         "n_failed": len(run.failures),
         "checkpoint": str(run.checkpoint) if run.checkpoint is not None else None,
+        "selection": run.selection,
+        "cancelled": run.cancelled,
+        "elapsed_s": run.elapsed_s,
+        "processed_count": run.processed_count,
+        "total_count": run.total_count,
         "outputs": {key: str(path) for key, path in exports.items()},
     }
     _print_json(report)
@@ -624,27 +941,39 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "gui":
             return _handle_gui(args)
         if args.command == "project":
-            run = run_project(args.config, force=args.force)
+            # The CLI uses the bounded runner explicitly.  Keep the legacy
+            # symbol as an injection seam for older callers/tests that patch
+            # ``cli.run_project``.
+            project_runner = (
+                run_project
+                if run_project is not _DEFAULT_LEGACY_PROJECT_RUNNER
+                else run_project_bounded
+            )
+            run = project_runner(args.config, force=args.force)
             compact_records = []
             for item in run.frame_results:
                 record = item.to_record()
                 if hasattr(item.result, "to_mapping"):
                     record["result"] = item.result.to_mapping()
                 compact_records.append(record)
-            _print_json(
-                {
-                    "mode": run.mode,
-                    "input_hash": run.input_hash,
-                    "config_hash": run.config_hash,
-                    "frames": compact_records,
-                    "n_frames": len(run.frame_results),
-                    "n_success": len(run.successful),
-                    "n_failed": len(run.failures),
-                    "checkpoint": (
-                        str(run.checkpoint) if run.checkpoint is not None else None
-                    ),
-                }
-            )
+            if args.legacy_json:
+                _print_json(compact_records)
+            else:
+                _print_json(
+                    {
+                        "schema_version": "lamellarsaxs2d.project_run.v2",
+                        "mode": run.mode,
+                        "input_hash": run.input_hash,
+                        "config_hash": run.config_hash,
+                        "frames": compact_records,
+                        "n_frames": len(run.frame_results),
+                        "n_success": len(run.successful),
+                        "n_failed": len(run.failures),
+                        "checkpoint": (
+                            str(run.checkpoint) if run.checkpoint is not None else None
+                        ),
+                    }
+                )
             return 1 if run.failures else 0
         if args.command == "preflight":
             return _handle_preflight(args)
