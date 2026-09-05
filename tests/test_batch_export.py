@@ -147,6 +147,7 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
             "frame5.tif",
             "frame6.tif",
             "frame7.tif",
+            "frame8.tif",
         ],
     )
     calls: list[tuple[str, object]] = []
@@ -181,12 +182,22 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
                 "metrics": {"flags": ["analysis_validation_failed:q window"]},
                 "parameters": {"value": 6},
             }
-        return {"parameters": {"value": 7}}
+        if name == "frame7.tif":
+            return {
+                "ellipse_fit": {
+                    "status": "ok",
+                    "success": True,
+                    "quality_status": "FAIL",
+                },
+                "parameters": {"value": 7},
+            }
+        return {"parameters": {"value": 8}}
 
     run = run_batch(paths, analyze, mode="warm_start")
 
     assert [item.status for item in run] == [
         "ok",
+        "failed",
         "failed",
         "failed",
         "failed",
@@ -202,13 +213,24 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
         1,
         1,
         1,
+        1,
     ]
     assert "metrics.success=False" in (run[1].error or "")
     assert "ellipse_fit.status=insufficient_data" in (run[2].error or "")
     assert "full2d.status=insufficient_data" in (run[3].error or "")
     assert "intensity_fit_failed:RuntimeError" in (run[4].error or "")
     assert "analysis_validation_failed:q window" in (run[5].error or "")
-    assert run[6].warm_start_from == FrameRef(paths[0]).key
+    assert "ellipse_fit.quality_status=FAIL" in (run[6].error or "")
+    assert run[7].warm_start_from == FrameRef(paths[0]).key
+
+
+def test_batch_rejects_top_level_fail_status(tmp_path: Path) -> None:
+    path = _touch_frames(tmp_path, ["frame1.tif"])[0]
+
+    run = run_batch([path], lambda _frame: {"status": "FAIL"})
+
+    assert run[0].status == "failed"
+    assert "status=FAIL" in (run[0].error or "")
 
 
 def test_frame_ref_key_uses_canonical_path_frame_and_dataset_identity(tmp_path: Path) -> None:
@@ -444,6 +466,32 @@ def test_export_provenance_records_versions_and_stays_strict_json(tmp_path: Path
     assert "NaN" not in outputs["provenance"].read_text(encoding="utf-8")
     manifest = json.loads(outputs["manifest"].read_text(encoding="utf-8"))
     assert manifest["provenance"]["versions"] == versions
+
+
+def test_export_public_radial_lobe_row_contains_paired_angles(tmp_path: Path) -> None:
+    frame = FrameFitResult(
+        frame=FrameRef(tmp_path / "frame1.tif"),
+        result={
+            "lobe_radial_peaks": [
+                {
+                    "angle": float(np.deg2rad(35.0)),
+                    "q_star": 0.42,
+                    "q_unit": "nm^-1",
+                    "valid": True,
+                    "method": "radial_peak",
+                }
+            ],
+            "ridge_points": [],
+        },
+    )
+    outputs = export_batch([frame], tmp_path / "exports")
+
+    with outputs["lobe_measurements"].open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    radial = next(row for row in rows if row["measurement_kind"] == "radial")
+    assert float(radial["angle_rad"]) == pytest.approx(np.deg2rad(35.0))
+    assert float(radial["angle_deg"]) == pytest.approx(35.0)
+    assert radial["angle_unit"] == "rad"
 
 
 def test_npz_metadata_marks_checkpoint_omissions_incomplete(tmp_path: Path) -> None:

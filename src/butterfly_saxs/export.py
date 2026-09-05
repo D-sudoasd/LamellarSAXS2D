@@ -9,12 +9,17 @@ as well as a plain sequence of ``FrameFitResult`` objects.
 from __future__ import annotations
 
 import csv
+import io
 import importlib.metadata as importlib_metadata
 import json
 import math
 import os
 import platform
 import re
+import shutil
+import tempfile
+import zipfile
+import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
@@ -24,7 +29,15 @@ from typing import Any
 
 import numpy as np
 
-from .batch import BatchRunResult, FrameFitResult, FrameRef, _json_safe
+from .batch import (
+    BatchRunResult,
+    FrameFitResult,
+    FrameRef,
+    _checkpoint_safe,
+    _config_with_file_fingerprints,
+    _json_safe,
+)
+from .csv_utils import safe_csv_cell
 
 
 _MISSING = object()
@@ -37,6 +50,105 @@ _FLAG_NAMES = (
 )
 
 
+def _artifact_digest(path: Path) -> str:
+    digest = __import__("hashlib").sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _publish_staged_bundle(
+    stage: Path,
+    targets: Mapping[str, Path],
+    *,
+    force: bool,
+    preserve_existing: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, Path]:
+    """Publish a complete known bundle with rollback on publication faults.
+
+    A directory cannot atomically replace a set of historical flat files on
+    every supported filesystem.  The transaction therefore backs up only the
+    exact known targets, verifies every staged artifact, publishes a commit
+    marker last, and restores the old generation if any replace fails.  No
+    unrelated user file is moved or deleted.
+    """
+
+    if not stage.exists():
+        raise FileNotFoundError(f"staging directory does not exist: {stage}")
+    normalized = {str(key): Path(value) for key, value in targets.items()}
+    preserved = set(preserve_existing)
+    missing = [
+        key
+        for key, target in normalized.items()
+        if key not in preserved and not (stage / target.name).is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "staged bundle is missing artifacts: " + ", ".join(sorted(missing))
+        )
+    output = next(iter(normalized.values())).parent
+    output.mkdir(parents=True, exist_ok=True)
+    marker_target = output / ".bundle.commit.json"
+    marker_stage = stage / marker_target.name
+    generation = uuid.uuid4().hex
+    marker_payload = {
+        "schema_version": "lamellarsaxs2d.bundle_commit.v1",
+        "generation": generation,
+        "complete": True,
+        "artifacts": {
+            key: {
+                "name": target.name,
+                "sha256": _artifact_digest(
+                    target if key in preserved else stage / target.name
+                ),
+            }
+            for key, target in normalized.items()
+        },
+    }
+    marker_stage.write_text(
+        json.dumps(marker_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    normalized["commit_marker"] = marker_target
+    backup = Path(tempfile.mkdtemp(prefix=".bundle-backup-", dir=output))
+    old_files: dict[str, bool] = {}
+    published: list[Path] = []
+    try:
+        for key, target in normalized.items():
+            old_files[key] = target.exists()
+            if target.exists():
+                shutil.copy2(target, backup / target.name)
+        for key, target in normalized.items():
+            if key in preserved:
+                if not target.is_file():
+                    raise FileNotFoundError(
+                        f"preserved bundle target does not exist: {target}"
+                    )
+                continue
+            os.replace(stage / target.name, target)
+            published.append(target)
+    except Exception:
+        for key, target in normalized.items():
+            try:
+                old = old_files.get(key, False)
+                backup_file = backup / target.name
+                if old and backup_file.exists():
+                    shutil.copy2(backup_file, target)
+                elif target in published and target.exists():
+                    target.unlink()
+            except OSError:
+                # Preserve the original exception.  The known target remains
+                # visible for a later manual recovery if the filesystem itself
+                # refuses restoration.
+                pass
+        raise
+    finally:
+        shutil.rmtree(backup, ignore_errors=True)
+        shutil.rmtree(stage, ignore_errors=True)
+    return normalized
+
+
 def _value(value: Any, *names: str, default: Any = None) -> Any:
     for name in names:
         if isinstance(value, Mapping) and name in value:
@@ -44,6 +156,17 @@ def _value(value: Any, *names: str, default: Any = None) -> Any:
         if hasattr(value, name):
             return getattr(value, name)
     return default
+
+
+def _sequence(value: Any) -> list[Any]:
+    if value is None or isinstance(value, (str, bytes)):
+        return [] if value is None else [value]
+    if isinstance(value, Mapping):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
 
 
 def _json_text(value: Any) -> str:
@@ -62,9 +185,9 @@ def _scalar(value: Any) -> Any:
     """Convert numpy/Python scalar values for CSV without coercing arrays."""
 
     if value is None or isinstance(value, (str, bool, int)):
-        return value
+        return safe_csv_cell(value)
     if isinstance(value, float):
-        return value if math.isfinite(value) else ""
+        return safe_csv_cell(value) if math.isfinite(value) else ""
     item = getattr(value, "item", None)
     if callable(item):
         try:
@@ -73,7 +196,7 @@ def _scalar(value: Any) -> Any:
             pass
     if isinstance(value, (list, tuple, Mapping)):
         return _json_text(value)
-    return value if isinstance(value, (str, int, float, bool)) else _json_text(value)
+    return safe_csv_cell(value) if isinstance(value, (str, int, float, bool)) else _json_text(value)
 
 
 def _as_mapping(value: Any) -> Mapping[str, Any] | None:
@@ -132,6 +255,8 @@ def _frame_base(item: FrameFitResult, index: int) -> dict[str, Any]:
         "frame_index": index,
         "frame_id": _scalar(frame.frame_id),
         "path": str(frame.path),
+        "frame_selector": _scalar(frame.frame_selector),
+        "dataset": _scalar(frame.dataset_id or None),
         "time": _scalar(frame.time),
         "status": item.status,
         "error": _scalar(item.error) if item.error else "",
@@ -274,6 +399,9 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
         iterable = list(source_mapping.items()) if source_mapping is not None else []
 
     rows: list[dict[str, Any]] = []
+    geometry_units = _value(value, "geometry_parameter_units", default={})
+    if not isinstance(geometry_units, Mapping):
+        geometry_units = {}
     for name, spec in iterable:
         parameter_name = str(name)
         if np.isscalar(spec) or isinstance(spec, str):
@@ -325,6 +453,8 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
             fixed = _context_parameter_value(contexts, ("fixed", "is_fixed"), name)
         if unit is _MISSING:
             unit = _context_parameter_value(contexts, ("units", "unit"), name)
+        if unit is _MISSING:
+            unit = geometry_units.get(str(name), _MISSING)
         if flags is _MISSING:
             flags = _context_parameter_value(
                 contexts,
@@ -466,6 +596,23 @@ def _ridge_points_from_sequence(points: Any) -> list[dict[str, Any]]:
         for index, point in enumerate(points):
             if isinstance(point, Mapping):
                 rows.append({str(key): _scalar(value) for key, value in point.items()})
+            elif (point_mapping := _as_mapping(point)) is not None:
+                row = {
+                    str(key): _scalar(value)
+                    for key, value in point_mapping.items()
+                    if key != "metadata"
+                }
+                metadata = point_mapping.get("metadata")
+                if isinstance(metadata, Mapping):
+                    for key in (
+                        "quadrant",
+                        "quadrant_pair",
+                        "branch_assignment_source",
+                        "symmetry_flags",
+                    ):
+                        if key in metadata:
+                            row[key] = _scalar(metadata[key])
+                rows.append(row)
             elif isinstance(point, Sequence) and not isinstance(point, (str, bytes)):
                 row = {"point_index": index}
                 for axis, coordinate in enumerate(point):
@@ -479,6 +626,150 @@ def _ridge_points_from_sequence(points: Any) -> list[dict[str, Any]]:
 
 def _ellipse_fit(value: Any) -> Any:
     return _value(value, "ellipse_fit", "ellipse", default=None)
+
+
+def _lobe_radial_profiles(value: Any) -> Any:
+    direct = _value(value, "lobe_radial_profiles", "radial_profiles", default=None)
+    if direct is not None:
+        return direct
+    observables = _value(value, "observables", "measurements", default=None)
+    return _value(observables, "lobe_radial_profiles", "radial_profiles", default=None)
+
+
+def _lobe_radial_peaks(value: Any) -> Any:
+    direct = _value(value, "lobe_radial_peaks", "radial_peaks", default=None)
+    if direct is not None:
+        return direct
+    observables = _value(value, "observables", "measurements", default=None)
+    return _value(observables, "lobe_radial_peaks", "radial_peaks", default=None)
+
+
+def _lobe_angular(value: Any) -> Any:
+    """Return direct angular lobe metrics without deriving radial values."""
+
+    direct = _value(value, "lobes", "lobe_metrics", "angular_lobes", default=None)
+    if direct is not None:
+        return direct
+    observables = _value(value, "observables", "measurements", default=None)
+    return _value(observables, "lobes", "lobe_metrics", "angular_lobes", default=None)
+
+
+def _angle_pair(value: Any, angle_deg: Any = None) -> tuple[float | None, float | None]:
+    """Normalize one observed angle to the paired radian/degree fields."""
+
+    try:
+        if value is None and angle_deg is not None:
+            degree = float(angle_deg)
+            return float(np.deg2rad(degree)), degree
+        if value is not None:
+            radians = float(value)
+            return radians, float(np.degrees(radians))
+    except (TypeError, ValueError, OverflowError):
+        return None, None
+    return None, None
+
+
+def _lobe_measurement_rows(item: FrameFitResult, index: int) -> list[dict[str, Any]]:
+    """Flatten all direct angular and radial lobe scalar observables."""
+
+    base = _frame_base(item, index)
+    rows: list[dict[str, Any]] = []
+    angular = _sequence(_lobe_angular(item.result))
+    for lobe_index, lobe in enumerate(angular):
+        angle = _value(lobe, "angle", "azimuth", default=None)
+        angle_deg_value = _value(lobe, "angle_deg", "azimuth_deg", default=None)
+        angle, angle_deg = _angle_pair(angle, angle_deg_value)
+        fwhm = _value(lobe, "fwhm", "azimuthal_fwhm", default=None)
+        try:
+            fwhm_deg = float(np.degrees(float(fwhm)))
+        except (TypeError, ValueError):
+            fwhm_deg = None
+        rows.append(
+            {
+                **base,
+                "measurement_kind": "angular",
+                "lobe_index": lobe_index,
+                "angle_rad": angle,
+                "angle_deg": angle_deg,
+                "angle_unit": "rad",
+                "q_star": None,
+                "q_unit": None,
+                "intensity": _value(lobe, "intensity", default=None),
+                "baseline": _value(lobe, "baseline", default=None),
+                "snr": _value(lobe, "snr", default=None),
+                "fwhm": fwhm,
+                "fwhm_deg": fwhm_deg,
+                "radial_fwhm": None,
+                "azimuthal_fwhm": fwhm,
+                "area": _value(lobe, "area", default=None),
+                "coverage": _value(lobe, "coverage", default=None),
+                "n_pixels": _value(lobe, "n_pixels", default=None),
+                "valid": _value(lobe, "valid", default=None),
+                "accepted": _value(lobe, "valid", "accepted", default=None),
+                "method": "angular_profile",
+                "reason": _value(lobe, "reason", default=None),
+                "refinement": _value(lobe, "refinement", default=None),
+                "flags": _json_text(_value(lobe, "flags", default=())),
+            }
+        )
+    radial = _sequence(_lobe_radial_peaks(item.result))
+    for lobe_index, peak in enumerate(radial):
+        angle = _value(peak, "angle", "azimuth", default=None)
+        angle, angle_deg = _angle_pair(angle, _value(peak, "angle_deg", default=None))
+        rows.append(
+            {
+                **base,
+                "measurement_kind": "radial",
+                "lobe_index": lobe_index,
+                "angle_rad": angle,
+                "angle_deg": angle_deg,
+                "angle_unit": "rad",
+                "q_star": _value(peak, "q_star", "q", "q_position", default=None),
+                "q_unit": _value(peak, "q_unit", default=None),
+                "intensity": _value(peak, "intensity", default=None),
+                "baseline": _value(peak, "baseline", default=None),
+                "snr": _value(peak, "snr", default=None),
+                "fwhm": None,
+                "fwhm_deg": None,
+                "radial_fwhm": _value(peak, "radial_fwhm", default=None),
+                "azimuthal_fwhm": _value(peak, "azimuthal_fwhm", default=None),
+                "area": _value(peak, "area", default=None),
+                "coverage": _value(peak, "coverage", default=None),
+                "n_pixels": _value(peak, "n_pixels", default=None),
+                "valid": _value(peak, "valid", default=None),
+                "accepted": _value(peak, "accepted", "valid", default=None),
+                "method": _value(peak, "method", default="radial_peak"),
+                "reason": _value(peak, "reason", default=None),
+                "refinement": None,
+                "flags": _json_text(_value(peak, "flags", default=())),
+            }
+        )
+    return rows
+
+
+def _fit_audit(value: Any) -> dict[str, Any]:
+    """Collect multistart/sample-vs-full objective fields for export."""
+
+    direct = _value(value, "fit_audit", default=None)
+    if isinstance(direct, Mapping):
+        return dict(direct)
+    full2d = _value(value, "full2d", default=None)
+    source = full2d if full2d is not None else value
+    fields = (
+        "sample_cost",
+        "full_cost",
+        "selection_objective",
+        "candidate_solutions",
+        "selected_start_index",
+        "multistart_count",
+        "symmetry",
+    )
+    result = {
+        name: _value(source, name, default=None)
+        for name in fields
+        if _value(source, name, default=None) is not None
+    }
+    return result
 
 
 def _walk_arrays(value: Any, prefix: str, output: dict[str, Any]) -> None:
@@ -661,6 +952,416 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
     return path
 
 
+class StreamingBatchExporter:
+    """Write a batch bundle while retaining at most one detector frame.
+
+    The regular :func:`export_batch` API remains unchanged for notebooks and
+    small jobs.  This writer is used by the CLI ``--stream`` path: each frame
+    is converted to compact rows and its arrays are appended directly to a
+    temporary NPZ zip member before the in-memory result is released.
+    """
+
+    _FRAME_COLUMNS = [
+        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error",
+        "warm_start_from", "elapsed_s", "resumed", "flags", "scientific_flags",
+        "parameters_json",
+    ]
+    _PARAMETER_COLUMNS = [
+        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "parameter",
+        "value", "stderr", "uncertainty", "fixed", "unit", "flags",
+        "bound_flags", "scientific_flags",
+    ]
+    _RIDGE_COLUMNS = [
+        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error",
+        "warm_start_from", "elapsed_s", "resumed", "point_index", "branch",
+        "qx", "qy", "q", "q_star", "angle", "angle_deg", "intensity",
+        "baseline", "snr", "radial_fwhm", "azimuthal_fwhm", "area", "coverage",
+        "n_pixels", "valid", "accepted", "method", "reason", "flags", "support",
+        "score", "point_score", "trajectory_id", "branch_id", "q_unit",
+        "quadrant", "quadrant_pair", "branch_assignment_source", "symmetry_flags",
+    ]
+    _LOBE_COLUMNS = [
+        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time",
+        "status", "error", "warm_start_from", "elapsed_s", "resumed", "measurement_kind", "lobe_index",
+        "angle_rad", "angle_deg", "angle_unit", "q_star", "q_unit", "intensity", "baseline", "snr", "fwhm", "fwhm_deg", "radial_fwhm",
+        "azimuthal_fwhm", "area", "coverage", "n_pixels", "valid", "accepted",
+        "method", "reason", "refinement", "flags",
+    ]
+
+    def __init__(
+        self,
+        output_dir: str | os.PathLike[str],
+        *,
+        provenance: Mapping[str, Any] | None = None,
+        prefix: str = "",
+        force: bool = False,
+        resume: bool = False,
+    ) -> None:
+        self.output = Path(output_dir)
+        self.prefix = str(prefix or "")
+        self.force = bool(force)
+        self.resume = bool(resume)
+        self.provenance = provenance
+        self.output.mkdir(parents=True, exist_ok=True)
+        self._targets = {
+            "frame_summary": self.output / f"{self.prefix}frame_summary.csv",
+            "parameters_long": self.output / f"{self.prefix}parameters_long.csv",
+            "ridge_points": self.output / f"{self.prefix}ridge_points.csv",
+            "lobe_measurements": self.output / f"{self.prefix}lobe_measurements.csv",
+            "ellipse_fit": self.output / f"{self.prefix}ellipse_fit.json",
+            "ellipse_fit_jsonl": self.output / f"{self.prefix}ellipse_fit.jsonl",
+            "manifest": self.output / f"{self.prefix}manifest.json",
+            "provenance": self.output / f"{self.prefix}provenance.json",
+            "npz": self.output / f"{self.prefix}results.npz",
+            "evolution_png": self.output / f"{self.prefix}evolution.png",
+        }
+        existing = [path for path in self._targets.values() if path.exists()]
+        if existing and not self.force:
+            joined = ", ".join(str(path) for path in existing)
+            raise FileExistsError(
+                f"Export target(s) already exist; pass force=True to overwrite: {joined}"
+            )
+        self._stage = Path(tempfile.mkdtemp(prefix=".stream-", dir=self.output))
+        self._writers: dict[str, Any] = {}
+        self._handles: dict[str, Any] = {}
+        self._ellipse_rows: list[dict[str, Any]] = []
+        self._compact_results: list[FrameFitResult] = []
+        self._missing_frames: list[int] = []
+        self._missing_ids: list[Any] = []
+        self._missing_paths: list[str] = []
+        self._quality_failed_frames: list[int] = []
+        self._array_names: list[str] = []
+        self._touched_frames: set[int] = set()
+        self._old_npz: zipfile.ZipFile | None = None
+        self._old_npz_metadata: dict[str, Any] | None = None
+        self._old_manifest: Mapping[str, Any] | None = None
+        if self.resume:
+            old_npz_path = self._targets["npz"]
+            if not old_npz_path.exists():
+                shutil.rmtree(self._stage, ignore_errors=True)
+                self._stage = Path()
+                raise FileNotFoundError(
+                    f"resume stream export requires the previous NPZ bundle: {old_npz_path}"
+                )
+            try:
+                self._old_npz = zipfile.ZipFile(old_npz_path, "r")
+                if "__metadata__.npy" not in self._old_npz.namelist():
+                    raise ValueError("previous streamed NPZ has no __metadata__ entry")
+                with self._old_npz.open("__metadata__.npy", "r") as handle:
+                    metadata_value = np.load(io.BytesIO(handle.read()), allow_pickle=False)
+                parsed = json.loads(str(metadata_value.item()))
+                if not isinstance(parsed, Mapping):
+                    raise ValueError("previous streamed NPZ metadata is invalid")
+                manifest_path = self._targets["manifest"]
+                if manifest_path.exists():
+                    loaded_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if isinstance(loaded_manifest, Mapping):
+                        self._old_manifest = loaded_manifest
+                if parsed.get("complete") is not True and self._old_manifest is None:
+                    raise ValueError(
+                        "previous streamed NPZ is incomplete and has no manifest; refusing lossy resume"
+                    )
+                old_names = set(self._old_npz.namelist())
+                missing_names = [
+                    name for name in parsed.get("arrays", ())
+                    if f"{name}.npy" not in old_names and name not in old_names
+                ]
+                if missing_names:
+                    raise ValueError(
+                        "previous streamed NPZ is missing declared arrays: "
+                        + ", ".join(str(item) for item in missing_names[:5])
+                    )
+                self._old_npz_metadata = dict(parsed)
+            except Exception:
+                if self._old_npz is not None:
+                    self._old_npz.close()
+                    self._old_npz = None
+                shutil.rmtree(self._stage, ignore_errors=True)
+                self._stage = Path()
+                raise
+        try:
+            for key, columns in (
+                ("frame_summary", self._FRAME_COLUMNS),
+                ("parameters_long", self._PARAMETER_COLUMNS),
+                ("ridge_points", self._RIDGE_COLUMNS),
+                ("lobe_measurements", self._LOBE_COLUMNS),
+            ):
+                handle = (self._stage / self._targets[key].name).open(
+                    "w", newline="", encoding="utf-8"
+                )
+                self._handles[key] = handle
+                writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
+                writer.writeheader()
+                self._writers[key] = writer
+            npz_path = self._stage / self._targets["npz"].name
+            self._npz = zipfile.ZipFile(npz_path, "w", compression=zipfile.ZIP_DEFLATED)
+        except Exception:
+            self.abort()
+            raise
+
+    def write(self, item: FrameFitResult) -> None:
+        index = len(self._compact_results)
+        for row in _frame_summary_rows([item]):
+            row["frame_index"] = index
+            self._writers["frame_summary"].writerow(
+                {key: _scalar(row.get(key, "")) for key in self._FRAME_COLUMNS}
+            )
+        base = _frame_base(item, index)
+        flags = _result_flags(item.result)
+        for parameter in _parameters(item.result):
+            parameter_row = {
+                **{key: _scalar(base.get(key, "")) for key in base},
+                **parameter,
+                "scientific_flags": _json_text(flags),
+            }
+            self._writers["parameters_long"].writerow(
+                {key: _scalar(value) for key, value in parameter_row.items()}
+            )
+        for point_index, point in enumerate(_ridge_points(item.result)):
+            self._writers["ridge_points"].writerow(
+                {
+                    **{key: _scalar(base.get(key, "")) for key in base},
+                    "point_index": point_index,
+                    **point,
+                }
+            )
+        for row in _lobe_measurement_rows(item, index):
+            self._writers["lobe_measurements"].writerow(
+                {key: _scalar(row.get(key, "")) for key in self._LOBE_COLUMNS}
+            )
+        self._ellipse_rows.append(
+            {
+                **base,
+                "ellipse_fit": _json_safe(_ellipse_fit(item.result)),
+                "fit_audit": _json_safe(_fit_audit(item.result)),
+                "lobe_angular": _json_safe(_lobe_angular(item.result)),
+                "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
+                "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
+            }
+        )
+        arrays: dict[str, Any] = {}
+        _walk_arrays(item.result, f"frame_{index:04d}", arrays)
+        for name, value in arrays.items():
+            with self._npz.open(name + ".npy", "w") as handle:
+                np.lib.format.write_array(handle, np.asarray(value), allow_pickle=False)
+            self._array_names.append(name)
+        if item.result is None or _contains_omitted_array(item.result):
+            # A resumed successful frame is represented by a compact
+            # checkpoint mapping.  Its original detector arrays are preserved
+            # from the verified previous NPZ, so it is complete for export.
+            if not (item.resumed and self._old_npz is not None):
+                self._missing_frames.append(index)
+                self._missing_ids.append(_scalar(item.frame.frame_id))
+                self._missing_paths.append(str(item.frame.path))
+        if item.status != "ok":
+            self._quality_failed_frames.append(index)
+        if not item.resumed:
+            self._touched_frames.add(index)
+        compact = FrameFitResult(
+            frame=item.frame,
+            result=_checkpoint_safe(item.result),
+            status=item.status,
+            error=item.error,
+            traceback=item.traceback,
+            warm_start_from=item.warm_start_from,
+            elapsed_s=item.elapsed_s,
+            resumed=item.resumed,
+        )
+        self._compact_results.append(compact)
+        for handle in self._handles.values():
+            handle.flush()
+
+    def finalize(self, batch: BatchRunResult | None = None) -> dict[str, Path]:
+        try:
+            if self._old_manifest is not None and isinstance(batch, BatchRunResult):
+                for key in ("input_hash", "config_hash", "mode"):
+                    if self._old_manifest.get(key) != getattr(batch, key):
+                        raise ValueError(
+                            f"previous streamed bundle {key} does not match the validated resume run"
+                        )
+            if self.resume and not self._compact_results and isinstance(batch, BatchRunResult) and batch.cancelled:
+                # A cancellation before the next frame starts has no new
+                # evidence to publish.  Keep the previous verified tables and
+                # arrays intact instead of replacing them with an empty
+                # bundle; the checkpoint remains the resume source of truth.
+                self._npz.close()
+                for handle in self._handles.values():
+                    handle.close()
+                shutil.rmtree(self._stage, ignore_errors=True)
+                if self._old_npz is not None:
+                    self._old_npz.close()
+                    self._old_npz = None
+                self._stage = Path()
+                return dict(self._targets)
+            metadata = {
+                "arrays": list(self._array_names),
+                "frame_count": len(self._compact_results),
+                "complete": not self._missing_frames
+                and not (isinstance(batch, BatchRunResult) and batch.cancelled),
+                "artifact_complete": not self._missing_frames
+                and not (isinstance(batch, BatchRunResult) and batch.cancelled),
+                "all_frames_processed": bool(
+                    isinstance(batch, BatchRunResult)
+                    and not batch.cancelled
+                    and len(self._compact_results) == batch.total_count
+                ),
+                "quality_complete": not self._quality_failed_frames,
+                "quality_failed_frames": list(self._quality_failed_frames),
+                "missing_frames": sorted(
+                    set(self._missing_frames)
+                    | (
+                        set(range(len(self._compact_results), batch.total_count))
+                        if isinstance(batch, BatchRunResult) and batch.cancelled
+                        else set()
+                    )
+                ),
+                "missing_frame_ids": self._missing_ids,
+                "missing_frame_paths": self._missing_paths,
+            }
+            no_op_resume = bool(
+                self.resume
+                and self._old_npz is not None
+                and not self._touched_frames
+                and not (isinstance(batch, BatchRunResult) and batch.cancelled)
+            )
+            metadata_bytes = io.BytesIO()
+            np.lib.format.write_array(metadata_bytes, np.asarray(_json_text(metadata)), allow_pickle=False)
+            with self._npz.open("__metadata__.npy", "w") as handle:
+                handle.write(metadata_bytes.getvalue())
+            self._npz.close()
+            if self._old_npz is not None and not no_op_resume:
+                # Rebuild the staged archive with verified old entries for
+                # resumed frames and new entries for frames that were rerun.
+                staged_npz = self._stage / self._targets["npz"].name
+                merged_npz = self._stage / (staged_npz.name + ".merged")
+                merged_names: list[str] = []
+                with zipfile.ZipFile(merged_npz, "w", compression=zipfile.ZIP_DEFLATED) as output:
+                    old_names = self._old_npz.namelist()
+                    for name in old_names:
+                        if name == "__metadata__.npy":
+                            continue
+                        match = re.match(r"frame_(\d{4})__", name)
+                        if match and int(match.group(1)) in self._touched_frames:
+                            continue
+                        with self._old_npz.open(name, "r") as source_handle:
+                            with output.open(name, "w") as target_handle:
+                                shutil.copyfileobj(source_handle, target_handle)
+                        merged_names.append(name)
+                    with zipfile.ZipFile(staged_npz, "r") as staged_input:
+                        for name in staged_input.namelist():
+                            if name == "__metadata__.npy":
+                                continue
+                            if name in merged_names:
+                                continue
+                            with staged_input.open(name, "r") as source_handle:
+                                with output.open(name, "w") as target_handle:
+                                    shutil.copyfileobj(source_handle, target_handle)
+                            merged_names.append(name)
+                    metadata["arrays"] = [name[:-4] for name in merged_names if name.endswith(".npy")]
+                    metadata_bytes = io.BytesIO()
+                    np.lib.format.write_array(
+                        metadata_bytes,
+                        np.asarray(_json_text(metadata)),
+                        allow_pickle=False,
+                    )
+                    with output.open("__metadata__.npy", "w") as handle:
+                        handle.write(metadata_bytes.getvalue())
+                os.replace(merged_npz, staged_npz)
+                self._old_npz.close()
+                self._old_npz = None
+            elif no_op_resume:
+                # Every frame was restored from the verified checkpoint.  Do
+                # not decompress/recompress the existing native NPZ archive;
+                # the publication transaction will retain that exact target.
+                self._old_npz.close()
+                self._old_npz = None
+            for handle in self._handles.values():
+                handle.close()
+            staged_ellipse = self._stage / self._targets["ellipse_fit"].name
+            staged_jsonl = self._stage / self._targets["ellipse_fit_jsonl"].name
+            staged_ellipse.write_text(
+                json.dumps({"frames": self._ellipse_rows}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            with staged_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
+                for row in self._ellipse_rows:
+                    handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+            _write_evolution(self._stage / self._targets["evolution_png"].name, self._compact_results)
+            run = batch if isinstance(batch, BatchRunResult) else None
+            mode = run.mode if run is not None else "independent"
+            input_hash = run.input_hash if run is not None else None
+            config_hash = run.config_hash if run is not None else None
+            manifest = run.manifest if run is not None else None
+            created_at = datetime.now(timezone.utc).isoformat()
+            provenance = _provenance_payload(
+                created_at=created_at,
+                mode=mode,
+                input_hash=input_hash,
+                config_hash=config_hash,
+                source_count=len(self._compact_results),
+                user_provenance=self.provenance,
+                resolved_config=(run.resolved_config if run is not None else None),
+            )
+            staged_manifest = self._stage / self._targets["manifest"].name
+            staged_manifest.write_text(
+                json.dumps(
+                    {
+                        "created_at": created_at,
+                        "mode": mode,
+                        "input_hash": input_hash,
+                        "config_hash": config_hash,
+                        "frames": [_json_safe(item.frame.to_dict()) for item in self._compact_results],
+                        "user_manifest": _json_safe(manifest),
+                        "provenance": provenance,
+                        "resolved_config": provenance.get("resolved_batch_config"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                    allow_nan=False,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            staged_provenance = self._stage / self._targets["provenance"].name
+            staged_provenance.write_text(
+                json.dumps(provenance, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
+                encoding="utf-8",
+            )
+            outputs = _publish_staged_bundle(
+                self._stage,
+                self._targets,
+                force=self.force,
+                preserve_existing={"npz"} if no_op_resume else frozenset(),
+            )
+            self._stage = Path()
+            return outputs
+        except Exception:
+            self.abort()
+            raise
+
+    def abort(self) -> None:
+        try:
+            npz = getattr(self, "_npz", None)
+            if npz is not None:
+                npz.close()
+        except Exception:
+            pass
+        old_npz = getattr(self, "_old_npz", None)
+        if old_npz is not None:
+            try:
+                old_npz.close()
+            except Exception:
+                pass
+            self._old_npz = None
+        for handle in getattr(self, "_handles", {}).values():
+            try:
+                handle.close()
+            except Exception:
+                pass
+        stage = getattr(self, "_stage", None)
+        if stage and stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+
+
 @dataclass
 class ExportResult(dict[str, Path]):
     """Dictionary-like output index with a convenient output directory."""
@@ -669,6 +1370,19 @@ class ExportResult(dict[str, Path]):
 
     def __post_init__(self) -> None:
         dict.__init__(self)
+
+
+class _CompatExportMapping(dict[str, Path]):
+    """Mapping that keeps legacy iteration keys while exposing new files."""
+
+    def __init__(self, value: Mapping[str, Path], *, hidden: set[str] = frozenset()) -> None:
+        super().__init__(value)
+        self._hidden_iteration_keys = set(hidden)
+
+    def __iter__(self):
+        for key in super().__iter__():
+            if key not in self._hidden_iteration_keys:
+                yield key
 
 
 def _distribution_version(*names: str) -> str | None:
@@ -710,6 +1424,7 @@ def _provenance_payload(
     config_hash: str | None,
     source_count: int,
     user_provenance: Mapping[str, Any] | None,
+    resolved_config: Any = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "created_at": created_at,
@@ -723,6 +1438,19 @@ def _provenance_payload(
         safe = _json_safe(user_provenance)
         if isinstance(safe, Mapping):
             payload.update(safe)
+    if resolved_config is not None:
+        resolved = _config_with_file_fingerprints(resolved_config)
+        if isinstance(resolved, Mapping):
+            payload["resolved_batch_config"] = _json_safe(resolved)
+            # Keep the high-value calibration/mask and selector fields easy to
+            # discover without discarding the full canonical config below.
+            for name in (
+                "poni", "poni_path", "mask", "mask_path", "valid_mask",
+                "valid_mask_path", "qmap", "external_mask", "rois", "selection",
+                "stage", "full2d", "base_dir",
+            ):
+                if name in resolved:
+                    payload.setdefault(name, _json_safe(resolved[name]))
     user_versions = payload.get("versions")
     merged_versions = dict(user_versions) if isinstance(user_versions, Mapping) else {}
     # Auto-detected versions are authoritative for the audited package set;
@@ -738,23 +1466,66 @@ def export_batch(
     *,
     provenance: Mapping[str, Any] | None = None,
     prefix: str = "",
+    force: bool = False,
 ) -> dict[str, Path]:
     """Write CSV, JSON/JSONL, NPZ and evolution-plot exports.
 
     The returned mapping uses stable logical keys (``frame_summary``,
     ``parameters_long``, ``ridge_points``, ``ellipse_fit``, ``npz``, and
     ``evolution_png``) and points to the actual files.
+
+    Existing targets are rejected before any export is written unless
+    ``force=True`` is explicitly supplied.
     """
 
     # Also tolerate export_batch(output_dir, batch), a common notebook form.
     if isinstance(batch, (str, os.PathLike, Path)) and not isinstance(output_dir, (str, os.PathLike, Path)):
         batch, output_dir = output_dir, batch
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
     results = _frame_results(batch)
     stem = f"{prefix}" if prefix else ""
 
-    frame_summary = output / f"{stem}frame_summary.csv"
+    frame_summary_target = output / f"{stem}frame_summary.csv"
+    parameters_long_target = output / f"{stem}parameters_long.csv"
+    ridge_points_target = output / f"{stem}ridge_points.csv"
+    lobe_measurements_target = output / f"{stem}lobe_measurements.csv"
+    ellipse_fit_target = output / f"{stem}ellipse_fit.json"
+    ellipse_jsonl_target = output / f"{stem}ellipse_fit.jsonl"
+    manifest_target = output / f"{stem}manifest.json"
+    provenance_target = output / f"{stem}provenance.json"
+    npz_target = output / f"{stem}results.npz"
+    evolution_target = output / f"{stem}evolution.png"
+    targets = (
+        frame_summary_target,
+        parameters_long_target,
+        ridge_points_target,
+        lobe_measurements_target,
+        ellipse_fit_target,
+        ellipse_jsonl_target,
+        manifest_target,
+        provenance_target,
+        npz_target,
+        evolution_target,
+    )
+    existing_targets = [path for path in targets if path.exists()]
+    if existing_targets and not force:
+        paths = ", ".join(str(path) for path in existing_targets)
+        raise FileExistsError(
+            f"Export target(s) already exist; pass force=True to overwrite: {paths}"
+        )
+    output.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".export-", dir=output))
+    frame_summary = stage / frame_summary_target.name
+    parameters_long = stage / parameters_long_target.name
+    ridge_points = stage / ridge_points_target.name
+    lobe_measurements = stage / lobe_measurements_target.name
+    ellipse_fit = stage / ellipse_fit_target.name
+    ellipse_jsonl = stage / ellipse_jsonl_target.name
+    manifest_path = stage / manifest_target.name
+    provenance_path = stage / provenance_target.name
+    npz_path = stage / npz_target.name
+    evolution_path = stage / evolution_target.name
+
     _write_csv(
         frame_summary,
         _frame_summary_rows(results),
@@ -762,6 +1533,8 @@ def export_batch(
             "frame_index",
             "frame_id",
             "path",
+            "frame_selector",
+            "dataset",
             "time",
             "status",
             "error",
@@ -785,7 +1558,6 @@ def export_batch(
                 "scientific_flags": _json_text(result_flags),
             }
             parameter_rows.append(row)
-    parameters_long = output / f"{stem}parameters_long.csv"
     _write_csv(
         parameters_long,
         parameter_rows,
@@ -793,6 +1565,8 @@ def export_batch(
             "frame_index",
             "frame_id",
             "path",
+            "frame_selector",
+            "dataset",
             "time",
             "status",
             "parameter",
@@ -815,21 +1589,27 @@ def export_batch(
                 "point_index": point_index,
                 **point,
             })
-    ridge_points = output / f"{stem}ridge_points.csv"
     _write_csv(ridge_points, ridge_rows)
+
+    lobe_rows: list[dict[str, Any]] = []
+    for index, item in enumerate(results):
+        lobe_rows.extend(_lobe_measurement_rows(item, index))
+    _write_csv(lobe_measurements, lobe_rows, columns=StreamingBatchExporter._LOBE_COLUMNS)
 
     ellipse_rows = []
     for index, item in enumerate(results):
         ellipse_rows.append({
             **_frame_base(item, index),
             "ellipse_fit": _json_safe(_ellipse_fit(item.result)),
+            "fit_audit": _json_safe(_fit_audit(item.result)),
+            "lobe_angular": _json_safe(_lobe_angular(item.result)),
+            "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
+            "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
         })
-    ellipse_fit = output / f"{stem}ellipse_fit.json"
     ellipse_fit.write_text(
         json.dumps({"frames": ellipse_rows}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    ellipse_jsonl = output / f"{stem}ellipse_fit.jsonl"
     with ellipse_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
         for row in ellipse_rows:
             handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
@@ -852,6 +1632,7 @@ def export_batch(
         config_hash=config_hash,
         source_count=len(results),
         user_provenance=provenance,
+        resolved_config=(batch.resolved_config if isinstance(batch, BatchRunResult) else None),
     )
     manifest_value = {
         "created_at": created_at,
@@ -862,27 +1643,35 @@ def export_batch(
         "user_manifest": _json_safe(batch_manifest),
         "provenance": provenance_value,
     }
-    manifest_path = output / f"{stem}manifest.json"
     manifest_path.write_text(json.dumps(manifest_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
-    provenance_path = output / f"{stem}provenance.json"
     provenance_path.write_text(json.dumps(provenance_value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
-    npz_path = output / f"{stem}results.npz"
     _write_npz(npz_path, results)
-    evolution_path = output / f"{stem}evolution.png"
     _write_evolution(evolution_path, results)
-    return {
-        "frame_summary": frame_summary,
-        "parameters_long": parameters_long,
-        "ridge_points": ridge_points,
-        "ellipse_fit": ellipse_fit,
-        "ellipse_fit_jsonl": ellipse_jsonl,
-        "manifest": manifest_path,
-        "provenance": provenance_path,
-        "npz": npz_path,
-        "evolution_png": evolution_path,
-    }
+    published = _publish_staged_bundle(
+        stage,
+        {
+            "frame_summary": frame_summary_target,
+            "parameters_long": parameters_long_target,
+            "ridge_points": ridge_points_target,
+            "lobe_measurements": lobe_measurements_target,
+            "ellipse_fit": ellipse_fit_target,
+            "ellipse_fit_jsonl": ellipse_jsonl_target,
+            "manifest": manifest_target,
+            "provenance": provenance_target,
+            "npz": npz_target,
+            "evolution_png": evolution_target,
+        },
+        force=force,
+    )
+    # Keep the historical regular-export iteration stable.  The additional
+    # lobe CSV and commit marker remain addressable through mapping lookup and
+    # ``items()`` for new callers.
+    return _CompatExportMapping(
+        published,
+        hidden={"lobe_measurements", "commit_marker"},
+    )
 
 
 export_results = export_batch
@@ -892,6 +1681,7 @@ export_batch_results = export_batch
 
 __all__ = [
     "ExportResult",
+    "StreamingBatchExporter",
     "export_batch",
     "export_batch_results",
     "export_results",

@@ -1,0 +1,30 @@
+{
+  "schema_version": "lamellarsaxs2d.pilot_evidence.v1",
+  "status": "awaiting_pilot_review",
+  "frame_count": 8,
+  "blind_ids": [
+    "blind_001",
+    "blind_002",
+    "blind_003",
+    "blind_004",
+    "blind_005",
+    "blind_006",
+    "blind_007",
+    "blind_008"
+  ],
+  "annotation_status_sha256": null,
+  "consensus_sha256": null,
+  "frame_results": [
+    {"blind_id": "blind_001", "consensus_status": null},
+    {"blind_id": "blind_002", "consensus_status": null},
+    {"blind_id": "blind_003", "consensus_status": null},
+    {"blind_id": "blind_004", "consensus_status": null},
+    {"blind_id": "blind_005", "consensus_status": null},
+    {"blind_id": "blind_006", "consensus_status": null},
+    {"blind_id": "blind_007", "consensus_status": null},
+    {"blind_id": "blind_008", "consensus_status": null}
+  ],
+  "reviewed_by": null,
+  "reviewed_at": null,
+  "notes": "Complete only after binding all eight frame results to the finalized annotation status and consensus CSV hashes."
+}

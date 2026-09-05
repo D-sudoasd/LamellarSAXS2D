@@ -12,7 +12,7 @@ from butterfly_saxs.ellipse import (
     fit_symmetric_ellipses,
     symmetric_ellipse_points,
 )
-from butterfly_saxs.parameters import default_ellipse_parameters
+from butterfly_saxs.parameters import ParameterSpec, default_ellipse_parameters
 
 
 def test_single_ellipse_recovers_independent_synthetic_q_points() -> None:
@@ -67,6 +67,61 @@ def test_shared_symmetric_double_ellipse_recovers_pair() -> None:
     assert result.values["axis_ratio"] == pytest.approx(0.68, rel=1e-5)
     assert result.values["theta"] == pytest.approx(0.27, rel=1e-5)
     assert result.coverage.components == 2
+
+
+def test_symmetric_multistart_is_deterministic_and_auditable() -> None:
+    truth = default_ellipse_parameters(center=(0.1, -0.05), a=1.8, axis_ratio=0.58, theta=0.34)
+    phi = np.linspace(0.0, 2.0 * np.pi, 64, endpoint=False)
+    plus, minus = symmetric_ellipse_points(truth, phi)
+    points = np.vstack((plus, minus))
+    labels = np.r_[np.zeros(len(phi), dtype=int), np.ones(len(phi), dtype=int)]
+
+    first = fit_symmetric_ellipses(points, labels=labels, max_nfev=600)
+    second = fit_symmetric_ellipses(points, labels=labels, max_nfev=600)
+
+    assert first.multistart_count == 7
+    assert len(first.candidate_solutions) == 7
+    assert first.selected_start_index == second.selected_start_index
+    assert first.candidate_solutions == second.candidate_solutions
+    assert first.values == pytest.approx(second.values)
+    np.testing.assert_array_equal(first.branch_assignment, labels)
+
+
+def test_symmetric_multistart_recovers_from_poor_initial_guess() -> None:
+    truth = default_ellipse_parameters(center=(0.0, 0.0), a=2.0, axis_ratio=0.45, theta=0.4)
+    phi = np.r_[np.linspace(-0.6, 0.6, 30), np.linspace(2.5, 3.7, 30), np.linspace(5.6, 6.8, 30)]
+    plus, minus = symmetric_ellipse_points(truth, phi)
+    points = np.vstack((plus, minus))
+    bad_initial = {
+        "cx": ParameterSpec(0.0, min=-5.0, max=5.0),
+        "cy": ParameterSpec(0.0, min=-5.0, max=5.0),
+        "a": ParameterSpec(0.2, min=0.05, max=5.0),
+        "axis_ratio": ParameterSpec(0.95, min=0.05, max=1.0),
+        "theta": ParameterSpec(1.4, min=0.0, max=np.pi / 2.0),
+    }
+
+    result = fit_symmetric_ellipses(points, parameters=bad_initial, max_nfev=300)
+
+    assert result.success
+    assert result.selected_start_index == 1
+    assert result.cost < 1e-10
+    assert result.values["a"] == pytest.approx(2.0, rel=1e-5)
+    assert result.values["axis_ratio"] == pytest.approx(0.45, rel=1e-5)
+
+
+def test_symmetric_branch_assignment_is_nearest_branch_without_labels() -> None:
+    truth = default_ellipse_parameters(center=(0.0, 0.0), a=1.7, axis_ratio=0.62, theta=0.25)
+    phi = np.linspace(0.0, 2.0 * np.pi, 48, endpoint=False)
+    plus, minus = symmetric_ellipse_points(truth, phi)
+    points = np.vstack((plus, minus))
+
+    result = fit_symmetric_ellipses(points, multistart=1, max_nfev=500)
+
+    assert result.branch_assignment is not None
+    assert result.branch_assignment.shape == (points.shape[0],)
+    assert set(np.unique(result.branch_assignment)) <= {0, 1}
+    assert np.count_nonzero(result.branch_assignment == 0) > 0
+    assert np.count_nonzero(result.branch_assignment == 1) > 0
 
 
 def test_symmetric_pair_uses_nonnegative_canonical_tilt() -> None:

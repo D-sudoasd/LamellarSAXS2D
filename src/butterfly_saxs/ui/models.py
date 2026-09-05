@@ -15,7 +15,76 @@ import math
 from numbers import Real
 from typing import Any, Callable
 
+from .i18n import translate, validate_language
 from .qt_compat import QT_AVAILABLE, QtCore
+
+
+_HEADER_KEYS = (
+    "header.parameter",
+    "header.value",
+    "header.min",
+    "header.max",
+    "header.vary",
+    "header.expr",
+    "header.unit",
+    "header.stderr",
+)
+
+# Tooltip keys intentionally use the visible column names from the public
+# parameter-table contract (Parameter/Value/Min/Max/Vary/Expr/Unit/Stderr),
+# rather than the internal ``ParameterRow`` attribute names.  The latter are
+# implementation details and should not leak into the translation catalog.
+_HEADER_TOOLTIP_KEYS = (
+    "tooltip.header.parameter",
+    "tooltip.header.value",
+    "tooltip.header.minimum",
+    "tooltip.header.maximum",
+    "tooltip.header.vary",
+    "tooltip.header.expression",
+    "tooltip.header.unit",
+    "tooltip.header.stderr",
+)
+
+# These are the model parameters for which the application can state a
+# scientifically meaningful description.  Descriptions live in i18n so the
+# same table can be rendered in either supported language.  A parameter that
+# is not in this map deliberately uses the neutral ``unknown`` description;
+# the UI must not infer material meaning from an arbitrary model extension.
+_PARAMETER_TOOLTIP_KEYS = {
+    name: f"tooltip.parameter.{name}"
+    for name in (
+        "a",
+        "b",
+        "cx",
+        "cy",
+        "axis_ratio",
+        "theta",
+        "theta_deg",
+        "lobe_angle",
+        "lobe_angle_deg",
+        "angular_width",
+        "angular_width_deg",
+        "radial_sigma",
+        "radial_gamma",
+        "radial_fwhm",
+        "radial_width",
+        "eta",
+        "amplitude",
+        "amplitude_plus",
+        "amplitude_minus",
+        "background",
+        "background_slope",
+        "background_curvature",
+        "background_amplitude",
+        "background_width",
+        "q_center",
+        "q_major",
+        "q_minor",
+        "ellipticity",
+        "intensity",
+        "ridge_width",
+    )
+}
 
 
 def _read_value(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -166,9 +235,37 @@ if QT_AVAILABLE:
         COLUMN_WIDTHS = (128, 82, 72, 72, 58, 112, 70, 76)
         headers = HEADER_LABELS
 
-        def __init__(self, parameters: Any = None, parent: Any = None) -> None:
+        def __init__(
+            self,
+            parameters: Any = None,
+            parent: Any = None,
+            *,
+            language: str = "en",
+        ) -> None:
             super().__init__(parent)
+            self._language = validate_language(language)
             self._rows: list[ParameterRow] = coerce_parameter_rows(parameters)
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def set_language(self, language: str) -> None:
+            resolved = validate_language(language)
+            if resolved == self._language:
+                return
+            self._language = resolved
+            self.headerDataChanged.emit(
+                QtCore.Qt.Orientation.Horizontal,
+                0,
+                len(self.COLUMNS) - 1,
+            )
+            if self._rows:
+                self.dataChanged.emit(
+                    self.index(0, 0),
+                    self.index(len(self._rows) - 1, len(self.COLUMNS) - 1),
+                    [QtCore.Qt.ItemDataRole.ToolTipRole],
+                )
 
         @property
         def rows(self) -> list[ParameterRow]:
@@ -181,23 +278,51 @@ if QT_AVAILABLE:
             return 0 if parent is not None and parent.isValid() else len(self.COLUMNS)
 
         def headerData(self, section: int, orientation: Any, role: Any = None) -> Any:  # noqa: N802
+            if orientation == QtCore.Qt.Orientation.Horizontal:
+                if not 0 <= section < len(self.COLUMNS):
+                    return None
+                if role == QtCore.Qt.ItemDataRole.ToolTipRole:
+                    return translate(self._language, _HEADER_TOOLTIP_KEYS[section])
+                if role not in (None, QtCore.Qt.ItemDataRole.DisplayRole):
+                    return None
+                return translate(self._language, _HEADER_KEYS[section])
             if role not in (None, QtCore.Qt.ItemDataRole.DisplayRole):
                 return None
-            if orientation == QtCore.Qt.Orientation.Horizontal:
-                return self.COLUMNS[section][1]
             return str(section + 1)
 
         def _value_for(self, row: ParameterRow, key: str) -> Any:
             return getattr(row, key)
 
+        def _parameter_tooltip(self, row: ParameterRow, column: int) -> str:
+            """Build one localized cell tooltip without changing row data."""
+
+            description_key = _PARAMETER_TOOLTIP_KEYS.get(
+                row.name,
+                "tooltip.parameter.unknown",
+            )
+            description = translate(self._language, description_key, name=row.name)
+            field = translate(self._language, _HEADER_TOOLTIP_KEYS[column])
+            unit = row.unit or translate(self._language, "tooltip.parameter.unit_none")
+            return translate(
+                self._language,
+                "tooltip.parameter.cell",
+                description=description,
+                field=field,
+                unit=unit,
+            )
+
         def data(self, index: Any, role: Any = None) -> Any:  # noqa: N802 - Qt API
             if not index.isValid() or not (0 <= index.row() < len(self._rows)):
+                return None
+            if not 0 <= index.column() < len(self.COLUMNS):
                 return None
             row = self._rows[index.row()]
             key = self.COLUMNS[index.column()][0]
             value = self._value_for(row, key)
             if key == "vary" and role == QtCore.Qt.ItemDataRole.CheckStateRole:
                 return QtCore.Qt.CheckState.Checked if value else QtCore.Qt.CheckState.Unchecked
+            if role == QtCore.Qt.ItemDataRole.ToolTipRole:
+                return self._parameter_tooltip(row, index.column())
             if role in (None, QtCore.Qt.ItemDataRole.DisplayRole, QtCore.Qt.ItemDataRole.EditRole):
                 if key in {"value", "minimum", "maximum", "stderr"}:
                     return _format_number(value)
@@ -326,10 +451,24 @@ else:
         COLUMN_WIDTHS = (128, 82, 72, 72, 58, 112, 70, 76)
         headers = HEADER_LABELS
 
-        def __init__(self, parameters: Any = None, parent: Any = None) -> None:
+        def __init__(
+            self,
+            parameters: Any = None,
+            parent: Any = None,
+            *,
+            language: str = "en",
+        ) -> None:
             del parent
+            self._language = validate_language(language)
             self._rows = coerce_parameter_rows(parameters)
             self._callbacks: list[Callable[[str, str, Any], None]] = []
+
+        @property
+        def language(self) -> str:
+            return self._language
+
+        def set_language(self, language: str) -> None:
+            self._language = validate_language(language)
 
         @property
         def rows(self) -> list[ParameterRow]:

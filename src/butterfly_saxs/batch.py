@@ -24,6 +24,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal
 
+from .cancellation import AnalysisCancelled
+from .settings import strict_int
+from .path_utils import IMAGE_SUFFIXES, filter_supported_image_paths
+
 
 _NATURAL_PART = re.compile(r"(\d+)")
 _MISSING = object()
@@ -42,6 +46,8 @@ _INITIAL_NAMES = {
     "seed",
     "seed_result",
 }
+# Compatibility alias for callers that imported the old private registry.
+_IMAGE_SUFFIXES = IMAGE_SUFFIXES
 
 
 def _json_safe(value: Any) -> Any:
@@ -230,6 +236,182 @@ def _hash_json(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+_CONFIG_FILE_KEYS = frozenset(
+    {
+        "poni",
+        "poni_path",
+        "calibration",
+        "calibration_path",
+        "geometry",
+        "geometry_path",
+        "mask",
+        "mask_path",
+        "valid_mask",
+        "valid_mask_path",
+        "sigma",
+        "sigma_path",
+        "weights",
+        "weights_path",
+        "uncertainty",
+        "uncertainty_path",
+    }
+)
+
+
+def _file_content_fingerprint(value: Any) -> dict[str, Any] | None:
+    """Return an auditable content identity for one configured file path."""
+
+    if not isinstance(value, (str, os.PathLike, Path)):
+        return None
+    candidate = Path(value).expanduser()
+    record: dict[str, Any] = {"path": _canonical_path(candidate), "exists": candidate.is_file()}
+    if not candidate.is_file():
+        record["sha256"] = None
+        record["error"] = "missing_or_not_a_file"
+        return record
+    try:
+        stat = candidate.stat()
+        digest = hashlib.sha256()
+        with candidate.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        record.update({"size": stat.st_size, "sha256": digest.hexdigest()})
+    except OSError as exc:
+        record.update({"sha256": None, "error": f"unreadable:{type(exc).__name__}"})
+    return record
+
+
+def _config_with_file_fingerprints(value: Any, *, key: str | None = None) -> Any:
+    """Copy config while binding geometry/mask/uncertainty file contents."""
+
+    return _config_with_file_fingerprints_cached(value, key=key, cache={})
+
+
+def _config_with_file_fingerprints_cached(
+    value: Any,
+    *,
+    key: str | None = None,
+    cache: dict[str, dict[str, Any] | None],
+) -> Any:
+    """Recursive implementation with one bounded digest per canonical path."""
+
+    # Bind in-memory q maps/masks/weights by content as well as by shape.  A
+    # compact descriptor avoids copying a 2.48 Mpx detector array into every
+    # checkpoint while still making resume fail closed when its values change.
+    shape = getattr(value, "shape", None)
+    dtype = getattr(value, "dtype", None)
+    tobytes = getattr(value, "tobytes", None)
+    if shape is not None and dtype is not None and callable(tobytes):
+        try:
+            raw = tobytes(order="C")
+            digest = hashlib.sha256(raw).hexdigest()
+            return {
+                "array": True,
+                "shape": [int(item) for item in shape],
+                "dtype": str(dtype),
+                "sha256": digest,
+            }
+        except Exception:  # pragma: no cover - unusual array proxy
+            pass
+
+    if key is not None and key.casefold() in _CONFIG_FILE_KEYS:
+        candidate = value
+        if isinstance(value, Mapping):
+            candidate = value.get("path", value.get("file", value.get("source", value)))
+        cache_key = _canonical_path(candidate) if isinstance(candidate, (str, os.PathLike, Path)) else None
+        if cache_key is not None and cache_key in cache:
+            fingerprint = cache[cache_key]
+        else:
+            fingerprint = _file_content_fingerprint(candidate)
+            if cache_key is not None:
+                cache[cache_key] = fingerprint
+        if fingerprint is not None:
+            return {"value": _json_safe(value), "content": fingerprint}
+    if isinstance(value, Mapping):
+        return {
+            str(name): _config_with_file_fingerprints_cached(item, key=str(name), cache=cache)
+            for name, item in value.items()
+        }
+    if is_dataclass(value):
+        return _config_with_file_fingerprints_cached(
+            {item.name: getattr(value, item.name) for item in fields(value)}
+            , cache=cache
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_config_with_file_fingerprints_cached(item, cache=cache) for item in value]
+    return _json_safe(value)
+
+
+def _missing_config_files(value: Any, *, key: str | None = None) -> list[str]:
+    """Find configured file paths that cannot be read at batch start."""
+
+    if is_dataclass(value):
+        return _missing_config_files(
+            {item.name: getattr(value, item.name) for item in fields(value)}
+        )
+    if key is not None and key.casefold() in _CONFIG_FILE_KEYS:
+        candidate = value
+        if isinstance(value, Mapping):
+            candidate = value.get("path", value.get("file", value.get("source", value)))
+        if isinstance(candidate, (str, os.PathLike, Path)):
+            path = Path(candidate).expanduser()
+            if str(path).strip().casefold() in {"in-memory", "in_memory"}:
+                return []
+            if not path.is_file():
+                return [str(path)]
+        return []
+    if isinstance(value, Mapping):
+        missing: list[str] = []
+        for name, item in value.items():
+            missing.extend(_missing_config_files(item, key=str(name)))
+        return missing
+    if isinstance(value, (list, tuple, set, frozenset)):
+        missing: list[str] = []
+        for item in value:
+            missing.extend(_missing_config_files(item))
+        return missing
+    return []
+
+
+def _resolve_config_paths(value: Any, *, base_dir: Path | None = None, key: str | None = None) -> Any:
+    """Resolve direct mapping file controls before validation/fingerprinting."""
+
+    if is_dataclass(value):
+        return value
+    if isinstance(value, Mapping):
+        local_base = base_dir
+        declared = value.get("base_dir")
+        if declared is not None and isinstance(declared, (str, os.PathLike, Path)):
+            candidate = Path(declared).expanduser()
+            local_base = candidate if candidate.is_absolute() else Path.cwd() / candidate
+            local_base = local_base.resolve(strict=False)
+        return {
+            str(name): _resolve_config_paths(
+                item,
+                base_dir=local_base,
+                key=str(name),
+            )
+            for name, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        converted = [
+            _resolve_config_paths(item, base_dir=base_dir, key=key)
+            for item in value
+        ]
+        return type(value)(converted)
+    if (
+        key is not None
+        and key.casefold() in _CONFIG_FILE_KEYS
+        and base_dir is not None
+        and isinstance(value, (str, os.PathLike, Path))
+        and str(value).strip().casefold() not in {"in-memory", "in_memory"}
+    ):
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            return os.fspath((base_dir / path).resolve(strict=False))
+    return value
+
+
 def natural_sort_key(value: str | os.PathLike[str]) -> tuple[Any, ...]:
     """Build a case-insensitive natural-sort key (``frame2`` before ``frame10``)."""
 
@@ -255,7 +437,27 @@ def _canonical_path(value: str | os.PathLike[str] | Path) -> str:
     return os.path.normcase(path.as_posix()).replace("\\", "/")
 
 
-def _as_ref(value: Any, *, order: int | None = None) -> "FrameRef":
+def _coerce_order(value: Any | None) -> int | float | None:
+    """Convert an input order to a finite numeric value at the boundary."""
+
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    if isinstance(value, bool):
+        raise ValueError("order must be a finite number")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("order must be a finite number") from exc
+    if not math.isfinite(numeric):
+        raise ValueError("order must be a finite number")
+    if numeric.is_integer():
+        return int(numeric)
+    return numeric
+
+
+def _as_ref(value: Any, *, order: int | float | None = None) -> "FrameRef":
     if isinstance(value, FrameRef):
         if order is None or value.order is not None:
             return value
@@ -317,7 +519,7 @@ class FrameRef:
     time: float | int | str | None = None
     frame_id: str | None = None
     metadata: Mapping[str, Any] = field(default_factory=dict)
-    order: int | None = None
+    order: int | float | None = None
     source: str | None = None
     dataset: str | None = None
     frame: int | None = None
@@ -328,7 +530,7 @@ class FrameRef:
         time: float | int | str | None = None,
         frame_id: str | None = None,
         metadata: Mapping[str, Any] | None = None,
-        order: int | None = None,
+        order: int | float | str | None = None,
         source: str | None = None,
         dataset: str | None = None,
         frame: int | None = None,
@@ -351,6 +553,7 @@ class FrameRef:
             frame_id = id
         if order is None:
             order = index
+        order = _coerce_order(order)
         if frame is None:
             frame = frame_index
         if frame is not None:
@@ -398,7 +601,7 @@ class FrameRef:
         return str(self.frame_id)
 
     @property
-    def index(self) -> int | None:
+    def index(self) -> int | float | None:
         return self.order
 
     @property
@@ -496,13 +699,12 @@ def _manifest_rows(manifest: Any) -> list[Any]:
                 return list(manifest[key])
         # A mapping from filename to metadata is a convenient manifest form.
         rows: list[dict[str, Any]] = []
-        for index, (path, metadata) in enumerate(manifest.items()):
+        for path, metadata in manifest.items():
             if isinstance(metadata, Mapping):
                 row = dict(metadata)
             else:
                 row = {"time": metadata}
             row.setdefault("path", path)
-            row.setdefault("order", index)
             rows.append(row)
         return rows
     if isinstance(manifest, Sequence) and not isinstance(manifest, (str, bytes)):
@@ -514,11 +716,11 @@ def _expand_inputs(inputs: Any) -> list[Any]:
     if isinstance(inputs, (str, os.PathLike, Path)):
         path = Path(inputs)
         if path.is_dir():
-            return [item for item in path.iterdir() if item.is_file()]
+            return filter_supported_image_paths(path.iterdir())
         # A wildcard is useful for CLI callers; a literal missing path is kept
         # so a loader/analyser can report the failure per frame.
         if any(char in str(path) for char in "*?["):
-            return list(path.parent.glob(path.name))
+            return filter_supported_image_paths(path.parent.glob(path.name))
         return [path]
     paths: list[Any] = []
     for item in inputs or []:
@@ -533,9 +735,87 @@ def _expand_inputs(inputs: Any) -> list[Any]:
     return paths
 
 
+def select_frame_refs(
+    refs: Sequence[FrameRef],
+    *,
+    series: str | None = None,
+    start: int | None = None,
+    stop: int | None = None,
+    stride: int = 1,
+) -> list[FrameRef]:
+    """Apply explicit series and inclusive sequence-range selection.
+
+    ``start``/``stop`` index the already naturally ordered manifest sequence;
+    the stop value is inclusive so ``--range 60:120:2`` includes frame 120.
+    A manifest's container ``frame`` selector is left untouched.  This keeps
+    sequence selection independent from selecting a page inside a TIFF/HDF5
+    container.
+    """
+
+    step = strict_int(stride, "stride", minimum=1)
+    selected = list(refs)
+    if series is not None and str(series).strip():
+        wanted = str(series).strip().casefold()
+
+        def matches(ref: FrameRef) -> bool:
+            values = [
+                ref.source,
+                ref.metadata.get("series"),
+                ref.metadata.get("series_id"),
+                ref.metadata.get("group"),
+                ref.metadata.get("sample"),
+                ref.frame_id,
+            ]
+            return any(value is not None and str(value).strip().casefold() == wanted for value in values)
+
+        selected = [ref for ref in selected if matches(ref)]
+        if not selected:
+            raise ValueError(f"series selection matched no frames: {series!r}")
+    if start is None:
+        start_value = 0
+    else:
+        start_value = strict_int(start, "start", minimum=0)
+    if start_value < 0:
+        raise ValueError("start must be >= 0")
+    if stop is None:
+        stop_value = len(selected) - 1
+    else:
+        stop_value = strict_int(stop, "stop", minimum=0)
+    if stop_value < start_value:
+        raise ValueError("stop must be >= start")
+    result = selected[start_value : stop_value + 1 : step]
+    if (start is not None or stop is not None) and not result:
+        raise ValueError(
+            f"frame selection matched no frames (start={start_value}, stop={stop_value}, available={len(selected)})"
+        )
+    return result
+
+
+def parse_frame_range(value: Any) -> tuple[int, int, int]:
+    """Parse ``START:STOP[:STEP]`` with an inclusive stop bound."""
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        pieces = list(value)
+    else:
+        pieces = str(value).replace("-", ":").split(":")
+    if len(pieces) not in {2, 3}:
+        raise ValueError("frame range must be START:STOP[:STEP]")
+    try:
+        start = strict_int(pieces[0], "range start", minimum=0)
+        stop = strict_int(pieces[1], "range stop", minimum=0)
+        step = strict_int(pieces[2], "range step", minimum=1) if len(pieces) == 3 else 1
+    except ValueError as exc:
+        raise ValueError("frame range must be START:STOP[:STEP]") from exc
+    if start < 0 or stop < start or step <= 0:
+        raise ValueError("frame range requires 0 <= start <= stop and step > 0")
+    return start, stop, step
+
+
 def build_frame_refs(
     inputs: Iterable[Any] | Any,
     manifest: Any = None,
+    *,
+    allow_mixed_series: bool = False,
 ) -> list[FrameRef]:
     """Resolve frames using manifest order/time, otherwise natural filename order.
 
@@ -548,6 +828,8 @@ def build_frame_refs(
     """
 
     rows = _manifest_rows(manifest)
+    if manifest is not None and not rows:
+        raise ValueError("explicit manifest contains no frame entries")
     if rows:
         refs = [_as_ref(row, order=index) for index, row in enumerate(rows)]
 
@@ -568,7 +850,16 @@ def build_frame_refs(
         # time is the next strongest ordering signal.  ``order`` generated by
         # _as_ref is only the source position, not an explicit user order.
         has_explicit_order = any(
-            isinstance(row, Mapping) and row.get("order") is not None for row in rows
+            (
+                isinstance(row, Mapping)
+                and row.get("order") is not None
+                and not (
+                    isinstance(row.get("order"), str)
+                    and not str(row.get("order")).strip()
+                )
+            )
+            or (isinstance(row, FrameRef) and row.order is not None)
+            for row in rows
         )
         has_time = any(item.time is not None for item in refs)
         if has_explicit_order:
@@ -582,6 +873,22 @@ def build_frame_refs(
                     return (1, float("inf"), item.order or 0)
 
             refs.sort(key=time_key)
+        if not allow_mixed_series:
+            declared = {
+                str(value).strip().casefold()
+                for ref in refs
+                for value in (
+                    ref.source,
+                    ref.metadata.get("series"),
+                    ref.metadata.get("series_id"),
+                )
+                if value is not None and str(value).strip()
+            }
+            if len(declared) > 1:
+                raise ValueError(
+                    "manifest contains multiple declared series; select one with series= or "
+                    "set allow_mixed_series=True for an explicitly independent run"
+                )
         return refs
 
     refs: list[FrameRef] = []
@@ -592,6 +899,18 @@ def build_frame_refs(
         refs.append(_as_ref(item))
     refs.sort(key=lambda item: natural_sort_key(item.path.name))
     return refs
+
+
+def _reject_duplicate_selector_identities(refs: Sequence[FrameRef]) -> None:
+    seen: dict[str, int] = {}
+    for index, ref in enumerate(refs):
+        if ref.key in seen:
+            previous = seen[ref.key]
+            raise ValueError(
+                "duplicate frame selector identity at entries "
+                f"{previous} and {index}: {ref.key}"
+            )
+        seen[ref.key] = index
 
 
 # Public aliases used by the CLI and by older prototype notebooks.
@@ -635,11 +954,17 @@ def input_fingerprint(refs: Iterable[FrameRef]) -> str:
 
 
 def config_fingerprint(config: Any = None, *, mode: str = "independent") -> str:
-    return _hash_json({"mode": mode, "config": config})
+    return _hash_json(
+        {
+            "mode": mode,
+            "config": _config_with_file_fingerprints(config),
+        }
+    )
 
 
 _QUALITY_FAILURE_STATUSES = {
     "error",
+    "fail",
     "failed",
     "failure",
     "invalid",
@@ -779,6 +1104,18 @@ def _nested_quality_failure(name: str, result: Any) -> str | None:
     status = _named_value(result, "status")
     if _is_failure_status(status):
         return f"{name}.status={status}"
+    quality_status = _named_value(result, "quality_status")
+    if _is_failure_status(quality_status) or (
+        isinstance(quality_status, str) and quality_status.strip().casefold() == "fail"
+    ):
+        return f"{name}.quality_status={quality_status}"
+    quality = _named_value(result, "quality")
+    nested_quality_status = _named_value(quality, "status")
+    if _is_failure_status(nested_quality_status) or (
+        isinstance(nested_quality_status, str)
+        and nested_quality_status.strip().casefold() == "fail"
+    ):
+        return f"{name}.quality.status={nested_quality_status}"
     flag = _quality_failure_flag(_named_value(result, "flags"))
     if flag is not None:
         return f"{name}.flags={flag}"
@@ -962,6 +1299,12 @@ class BatchRunResult:
     config_hash: str | None = None
     checkpoint: Path | None = None
     manifest: Any = None
+    cancelled: bool = False
+    elapsed_s: float | None = None
+    processed_count: int = 0
+    total_count: int = 0
+    selection: Mapping[str, Any] = field(default_factory=dict)
+    resolved_config: Any = None
 
     # Sequence behaviour makes this object drop-in compatible with the early
     # prototype API, which returned ``list[FrameFitResult]``.
@@ -1101,7 +1444,13 @@ def _checkpoint_payload(
         "mode": run.mode,
         "input_hash": run.input_hash,
         "config_hash": run.config_hash,
-        "config": _json_safe(config),
+        "config": _config_with_file_fingerprints(config),
+        "config_file_fingerprints": _config_with_file_fingerprints(config),
+        "selection": _json_safe(run.selection),
+        "cancelled": bool(run.cancelled),
+        "processed_count": int(run.processed_count),
+        "total_count": int(run.total_count),
+        "elapsed_s": run.elapsed_s,
         "frames": frame_records,
         "frame_count": len(refs),
     }
@@ -1152,6 +1501,17 @@ def run_batch(
     checkpoint_path: str | os.PathLike[str] | None = None,
     resume: bool = False,
     strategy: Literal["independent", "warm_start"] | None = None,
+    series: str | None = None,
+    start: int | None = None,
+    stop: int | None = None,
+    stride: int = 1,
+    frame_range: str | Sequence[int] | None = None,
+    allow_mixed_series: bool = False,
+    cancel_event: Any = None,
+    progress: Callable[[Mapping[str, Any]], Any] | None = None,
+    on_progress: Callable[[Mapping[str, Any]], Any] | None = None,
+    result_sink: Callable[[FrameFitResult], Any] | None = None,
+    retain_results: bool = True,
 ) -> BatchRunResult:
     """Analyze a sequence of frames with failure isolation and optional resume."""
 
@@ -1168,10 +1528,61 @@ def run_batch(
     if checkpoint is not None and checkpoint_path is not None and Path(checkpoint) != Path(checkpoint_path):
         raise ValueError("checkpoint and checkpoint_path refer to different files")
     checkpoint_file = Path(checkpoint_path or checkpoint) if (checkpoint_path or checkpoint) else None
+    config = _resolve_config_paths(config)
+    missing_config_files = _missing_config_files(config)
+    if missing_config_files:
+        raise FileNotFoundError(
+            "configured analysis file(s) do not exist or are not regular files: "
+            + ", ".join(missing_config_files[:5])
+        )
 
-    refs = build_frame_refs(frames, manifest=manifest)
+    config_mapping = config if isinstance(config, Mapping) else {}
+    nested_config = config_mapping.get("analysis", {}) if isinstance(config_mapping, Mapping) else {}
+    if not isinstance(nested_config, Mapping):
+        nested_config = {}
+    if not nested_config:
+        candidate_analysis = getattr(config, "analysis", {})
+        if isinstance(candidate_analysis, Mapping):
+            nested_config = candidate_analysis
+    allow_mixed_series = bool(
+        allow_mixed_series
+        or config_mapping.get("allow_mixed_series", config_mapping.get("independent_series", False))
+        or nested_config.get("allow_mixed_series", nested_config.get("independent_series", False))
+    )
+    refs = build_frame_refs(
+        frames,
+        manifest=manifest,
+        allow_mixed_series=allow_mixed_series or series is not None,
+    )
+    if frame_range is not None:
+        range_start, range_stop, range_stride = parse_frame_range(frame_range)
+        if start is not None or stop is not None or stride != 1:
+            raise ValueError("frame_range cannot be combined with start/stop/stride")
+        start, stop, stride = range_start, range_stop, range_stride
+    refs = select_frame_refs(
+        refs,
+        series=series,
+        start=start,
+        stop=stop,
+        stride=stride,
+    )
+    _reject_duplicate_selector_identities(refs)
+    if not refs:
+        raise ValueError("batch selection matched no frames")
+    selection = {
+        "series": series,
+        "start": start,
+        "stop": stop,
+        "stride": stride,
+    }
+    fingerprint_config = (
+        {"config": config, "selection": selection}
+        if any(value not in (None, 1) for value in selection.values())
+        else config
+    )
     input_hash = input_fingerprint(refs)
-    config_hash = config_fingerprint(config, mode=mode)
+    config_hash = config_fingerprint(fingerprint_config, mode=mode)
+    started_batch = __import__("time").perf_counter()
     run = BatchRunResult(
         frame_results=[],
         mode=mode,
@@ -1179,7 +1590,48 @@ def run_batch(
         config_hash=config_hash,
         checkpoint=checkpoint_file,
         manifest=manifest,
+        total_count=len(refs),
+        selection=selection,
+        resolved_config=config,
     )
+
+    callback = progress if progress is not None else on_progress
+
+    def cancelled() -> bool:
+        if cancel_event is None:
+            return False
+        if callable(cancel_event):
+            return bool(cancel_event())
+        checker = getattr(cancel_event, "is_set", None)
+        if callable(checker):
+            return bool(checker())
+        return bool(getattr(cancel_event, "cancelled", False))
+
+    def emit_progress(index: int, item: FrameFitResult | None = None) -> None:
+        if callback is None:
+            return
+        payload = {
+            "index": index,
+            "completed": len(run.frame_results),
+            "total": len(refs),
+            "fraction": float(len(run.frame_results) / len(refs)) if refs else 1.0,
+            "frame": None if item is None else item.frame.to_dict(),
+            "status": None if item is None else item.status,
+            "elapsed_s": __import__("time").perf_counter() - started_batch,
+            "cancelled": cancelled(),
+        }
+        # Callback errors are deliberately visible to callers; in particular,
+        # a callback TypeError must not be mistaken for an analyzer signature
+        # mismatch or silently retried.
+        callback(payload)
+
+    def publish(item: FrameFitResult) -> None:
+        """Publish a frame before optional in-memory result compaction."""
+
+        if result_sink is not None:
+            result_sink(item)
+        if not retain_results:
+            item.result = _checkpoint_safe(item.result)
 
     prior_records: dict[str, Mapping[str, Any]] = {}
     if resume:
@@ -1211,6 +1663,10 @@ def run_batch(
     previous_result: Any = None
     previous_frame_key: str | None = None
     for frame in refs:
+        if cancelled():
+            run.cancelled = True
+            emit_progress(len(run.frame_results), None)
+            break
         restored = prior_records.get(frame.key)
         # Successful frames are safe to restore.  Failed frames are retried so
         # a transient detector/read error does not become permanent.
@@ -1227,6 +1683,8 @@ def run_batch(
                 if mode == "warm_start":
                     previous_result = _warm_start_seed(item.result)
                     previous_frame_key = frame.key
+                publish(item)
+                emit_progress(len(run.frame_results) - 1, item)
                 continue
 
         initial = previous_result if mode == "warm_start" else None
@@ -1240,6 +1698,10 @@ def run_batch(
                 warm_start=mode == "warm_start",
                 config=config,
             )
+        except AnalysisCancelled:
+            run.cancelled = True
+            emit_progress(len(run.frame_results), None)
+            break
         except Exception as exc:
             item = FrameFitResult(
                 frame=frame,
@@ -1265,12 +1727,17 @@ def run_batch(
                 previous_result = _warm_start_seed(result)
                 previous_frame_key = frame.key
         run.frame_results.append(item)
+        publish(item)
+        run.processed_count = len(run.frame_results)
+        emit_progress(len(run.frame_results) - 1, item)
         if checkpoint_file is not None:
             write_checkpoint(
                 checkpoint_file,
                 _checkpoint_payload(run, refs, config=config),
             )
 
+    run.processed_count = len(run.frame_results)
+    run.elapsed_s = __import__("time").perf_counter() - started_batch
     if checkpoint_file is not None:
         write_checkpoint(checkpoint_file, _checkpoint_payload(run, refs, config=config))
     return run
@@ -1317,8 +1784,10 @@ __all__ = [
     "input_fingerprint",
     "make_frame_refs",
     "natural_sort_key",
+    "parse_frame_range",
     "read_checkpoint",
     "resolve_frame_refs",
     "run_batch",
+    "select_frame_refs",
     "write_checkpoint",
 ]

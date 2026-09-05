@@ -31,3 +31,35 @@ def test_q_sector_handles_wraparound_and_shape_errors():
     np.testing.assert_array_equal(mask, np.array([[True, True, False]]))
     with pytest.raises(MaskSpecError, match="does not match"):
         combine_exclusion_masks((3, 3), masks=[np.zeros((2, 2), dtype=bool)])
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        ({"type": "rectangle", "x0": 4, "x1": 2, "y0": 1, "y1": 5}, "rectangle bounds"),
+        ({"type": "rectangle", "x0": "NaN", "x1": 2, "y0": 1, "y1": 5}, "finite"),
+        ({"type": "ellipse", "cx": np.nan, "cy": 4, "rx": 2, "ry": 3}, "finite"),
+        ({"type": "ellipse", "cx": 4, "cy": 4, "rx": 2, "ry": 3, "angle_deg": np.inf}, "finite"),
+        ({"type": "rectangle", "x0": 1, "x1": 2, "y0": 1}, "missing required"),
+        (["rectangle", 1, 2, 3, 4], "must be a mapping"),
+    ],
+)
+def test_pixel_rois_reject_nonfinite_reversed_and_incomplete_specs(spec, message):
+    with pytest.raises(MaskSpecError, match=message):
+        combine_exclusion_masks((10, 10), rois=[spec])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"q_min": np.nan},
+        {"q_max": np.inf},
+        {"q_min": 1.0, "q_max": 0.5},
+        {"q_min": -0.1},
+        {"chi_min_deg": np.nan},
+    ],
+)
+def test_q_sector_rejects_invalid_numeric_bounds(kwargs):
+    qx, qy = np.indices((4, 5), dtype=float)
+    with pytest.raises(MaskSpecError):
+        q_sector_mask(qx, qy, **kwargs)

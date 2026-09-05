@@ -17,7 +17,13 @@ directory = "results"
 # 没有专用 qmap 模块时，q_scale 用作像素到 q 的示例比例。
 q_scale = 1.0
 q_window = [0.0, 90.0]
-ridge_method = "radial_peak" # or "surface_curvature"
+ridge_method = "radial_peak" # radial_peak, azimuthal_peak, or surface_curvature
+# For butterfly wings, azimuthal_peak measures angular maxima in q annuli;
+# it is intentionally a different observable from radial_peak.
+# ridge_method = "azimuthal_peak"
+ridge_snr_threshold = 2.0
+ridge_min_peak_fraction = 0.0
+ridge_min_coverage = 0.0
 n_angles = 72
 n_angular_bins = 360
 n_radial_bins = 256
@@ -26,10 +32,39 @@ n_radial_bins = 256
 # frame = 0                                # required for a multi-frame source
 # dataset = "/entry/data/data"             # required for an ambiguous HDF5/NPZ source
 curvature = { sigma = 2.0, percentile = 25.0, normal_step = 1.0 }
+# Deterministic full2d alternatives are opt-in; this keeps large detector
+# previews responsive while allowing a difficult thin intensity ellipse to
+# be explored explicitly.
+# full2d_multistart = 3
+#
+# Measured very-flat ellipse preset.  All q-valued limits use the active q-map
+# unit.  0.005–0.35 is an editable prior for thin butterfly wings; replace
+# these bounds explicitly when the experiment supports a different range.
+# The measured fit receives these constraints; the full2d intensity table is
+# a separate empirical model.
+# [analysis.ellipse]
+# preset = "very_flat_ellipse"
+# axis_ratio_min = 0.005
+# axis_ratio_max = 0.35
+# a_min = 0.2
+# a_max = 4.0
+# fixed_center = true
+# center_qx = 0.0
+# center_qy = 0.0
+# theta_min_deg = 0.0
+# theta_max_deg = 90.0
+# residual = "geometric"
+# multistart = 7
 # batch_mode = "warm_start"
 # manifest = "data/manifest.csv"
 # checkpoint = "results/checkpoint.json"
 # resume = false
+# series = "hold_375C"
+# start = 60
+# stop = 120
+# stride = 1
+# frame_range = "60:120:1" # use either range or start/stop/stride
+# stream = true # CLI/UI option for bounded detector-array memory
 # 默认仅对软件自动生成的 full2d 初值估计幅度/背景尺度；输入强度不归一化。
 # auto_scale_initial = true # 仅在确实需要强制重估显式/warm-start 初值时启用
 

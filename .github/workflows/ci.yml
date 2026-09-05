@@ -23,6 +23,10 @@ jobs:
           - os: ubuntu-latest
             python-version: "3.13"
           - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.12"
+          - os: windows-latest
             python-version: "3.13"
 
     env:
@@ -51,24 +55,36 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install ".[all]"
+          python -m pip install -c constraints/validation-py311-313.txt ".[all]"
 
       - name: Check dependencies
         run: python -m pip check
 
       - name: Lint
-        run: python -m ruff check src tests
+        run: python -m ruff check src tests scripts
 
       - name: Compile
-        run: python -m compileall -q src tests
+        run: python -m compileall -q src tests scripts
 
       - name: Test
         run: python -m pytest -q --basetemp "${{ runner.temp }}/pytest" -p no:cacheprovider
 
-      - name: CLI smoke
+      - name: CLI and environment smoke
         run: |
           python -m butterfly_saxs --help
+          bsaxs preflight --help
+          bsaxs benchmark --help
+          bsaxs annotation-pack --help
+          bsaxs p3-status --help
           bsaxs synthetic --shape 16x16
+          bsaxs-doctor --json --require-ui
+
+      - name: Windows desktop-launcher smoke
+        if: runner.os == 'Windows'
+        run: >-
+          python -c "import subprocess, sys;
+          sys.exit(subprocess.call(
+          ['cmd', '/d', '/c', r'启动_LamellarSAXS2D.cmd', '--check']))"
 
   wheel-smoke:
     name: wheel smoke
@@ -98,3 +114,4 @@ jobs:
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pip check
           "$RUNNER_TEMP/wheel-venv/bin/python" -m butterfly_saxs --help
           "$RUNNER_TEMP/wheel-venv/bin/bsaxs" synthetic --shape 16x16
+          "$RUNNER_TEMP/wheel-venv/bin/bsaxs-doctor" --json

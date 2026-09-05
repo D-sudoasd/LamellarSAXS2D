@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 import numpy as np
 import pytest
@@ -8,8 +9,13 @@ import pytest
 pytest.importorskip("PySide6")
 pytest.importorskip("pyqtgraph")
 
-from butterfly_saxs.ui import MainWindow
+from butterfly_saxs.ui import MainWindow as _MainWindow
 from butterfly_saxs.ui.views import ViewGrid
+
+
+def MainWindow(*args, **kwargs):  # noqa: N802 - compact legacy-English test seam
+    kwargs.setdefault("language", "en")
+    return _MainWindow(*args, **kwargs)
 
 
 class _BatchEngine:
@@ -74,6 +80,36 @@ def test_overlay_has_observed_q_background_and_extent(qtbot) -> None:
         view_range = overlay.plot.viewRange()
         assert view_range[0][0] <= ridge[0]["qx"] <= view_range[0][1]
         assert view_range[1][0] <= ridge[0]["qy"] <= view_range[1][1]
+
+
+def test_pattern_views_force_row_major_for_rectangular_detector_arrays(qtbot) -> None:
+    grid = ViewGrid()
+    qtbot.addWidget(grid)
+    observed = np.arange(21, dtype=float).reshape(3, 7)
+    model = observed + 10.0
+    residual = observed - model
+    yy, xx = np.indices(observed.shape, dtype=float)
+    qx = (xx - 3.0) / 10.0
+    qy = (yy - 1.0) / 20.0
+
+    grid.set_images(observed, model, residual, qx=qx, qy=qy, q_unit="nm^-1")
+
+    expected = {
+        "observed": observed,
+        "model": model,
+        "residual": residual,
+        "overlay": observed,
+    }
+    for name, view in grid.views.items():
+        assert view.image_item is not None
+        assert view.image_item.axisOrder == "row-major"
+        np.testing.assert_array_equal(view.image_data, expected[name])
+
+    for name in ("observed", "model", "residual"):
+        rect = grid.views[name].image_item.boundingRect()
+        assert rect.width() == pytest.approx(observed.shape[1])
+        assert rect.height() == pytest.approx(observed.shape[0])
+    grid.close()
 
 
 def test_parameter_edit_invalidates_an_inflight_worker_result(qtbot) -> None:
@@ -175,6 +211,46 @@ def test_select_mask_without_observed_invalidates_old_worker(qtbot, tmp_path) ->
 
     assert window.select_mask(mask_path)
     assert not window._generation.is_current(old_generation)
+    window.close()
+
+
+def test_image_and_mask_selectors_are_independent(qtbot, tmp_path) -> None:
+    image_path = tmp_path / "images.npz"
+    mask_path = tmp_path / "masks.npz"
+    image_frames = np.stack(
+        [
+            np.ones((3, 4), dtype=np.float32),
+            np.full((3, 4), 2.0, dtype=np.float32),
+        ]
+    )
+    mask_frames = np.zeros((2, 3, 4), dtype=np.uint8)
+    mask_frames[0, 0, 0] = 1
+    mask_frames[1, 0, 1] = 1
+    np.savez(image_path, image_series=image_frames)
+    np.savez(mask_path, mask_series=mask_frames)
+
+    window = MainWindow(mask_frame=0, mask_dataset="mask_series", auto_preview=False)
+    qtbot.addWidget(window)
+    assert window.open_image(
+        image_path,
+        frame=1,
+        dataset="image_series",
+        external_mask=mask_path,
+        mask_frame=1,
+        mask_dataset="mask_series",
+    )
+
+    assert window._frame == 1
+    assert window._dataset == "image_series"
+    assert window._mask_frame == 1
+    assert window._mask_dataset == "mask_series"
+    assert np.asarray(window._observed)[0, 0] == pytest.approx(2.0)
+    assert bool(window._external_mask[0, 1])
+    assert not bool(window._external_mask[0, 0])
+    assert window._loaded_input_records["source"]["frame"] == 1
+    assert window._loaded_input_records["source"]["dataset"] == "image_series"
+    assert window._loaded_input_records["mask"]["frame"] == 1
+    assert window._loaded_input_records["mask"]["dataset"] == "mask_series"
     window.close()
 
 
@@ -432,6 +508,15 @@ class _MeasurementPageEngine:
                     "n_points": 1,
                     "success": True,
                     "flags": ["apparent_geometry_only"],
+                    "symmetry": {
+                        "symmetry_status": "PASS",
+                        "reference_axis_deg": 95.0,
+                        "quadrant_counts": {"QI": 1, "QII": 1, "QIII": 1, "QIV": 1},
+                        "branch_quadrant_counts": {"0": {"QI": 1, "QIII": 1}},
+                        "paired_support": {"ellipse_a": {"fraction": 1.0}},
+                        "branch_leaks": 0,
+                        "unassigned_count": 0,
+                    },
                 },
                 "phi_app_deg": 12.0,
                 "alpha_candidate_deg": None,
@@ -476,6 +561,14 @@ def test_measurement_controls_payload_profiles_page_and_project_roundtrip(qtbot,
     assert window.lobe_table.rowCount() == 1
     assert window.ridge_table.rowCount() == 2
     assert window.ellipse_table.rowCount() > 0
+    assert window.profile_summary_label.text()
+    assert "Symmetry" in window.profile_summary_label.text()
+    assert "Samples" in window.profile_summary_label.accessibleDescription()
+    assert "Symmetry" in window.profile_summary_label.accessibleDescription()
+    if window.angular_plot is not None:
+        assert window.angular_plot.plotItem.legend is not None
+        assert window.coverage_plot.plotItem.legend is not None
+        assert window.ridge_plot.plotItem.legend is not None
     assert window.cancel_button.text() == "Cancel"
     assert window.ignore_late_result_button.text() == "Ignore late result"
 
@@ -509,3 +602,406 @@ def test_q_overlay_keeps_pixel_roi_out_of_q_space_and_shows_mask(qtbot) -> None:
         assert grid.overlay.plot.getAxis("left").labelText == "qy (1/nm)"
         assert grid.residual.image_item.getColorMap() is not None
     grid.close()
+
+
+def test_editable_model_ellipses_are_separate_and_follow_parameters(qtbot) -> None:
+    engine = _StateEngine()
+    parameters = {
+        "a": {"value": 0.8, "unit": "unknown"},
+        "axis_ratio": {"value": 0.5, "unit": ""},
+        "theta_deg": {"value": 15.0, "unit": "degree"},
+    }
+    window = MainWindow(engine=engine, parameters=parameters, auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((4, 4)))
+    measured = {"a": 0.7, "b": 0.4, "angle_deg": 12.0, "source": "measured"}
+    window.set_fit_overlay([], [measured])
+
+    assert window.views.overlay.ellipses == [measured]
+    assert len(window.views.overlay.model_ellipses) == 2
+    assert {curve["source"] for curve in window.views.overlay.model_ellipses} == {"model"}
+    old_angles = [curve["angle_deg"] for curve in window.views.overlay.model_ellipses]
+    assert window.set_parameter("a", 1.0)
+    assert window.set_parameter("axis_ratio", 0.25)
+    assert window.set_parameter("theta_deg", 30.0)
+    updated = window.views.overlay.model_ellipses
+    assert [curve["a"] for curve in updated] == [1.0, 1.0]
+    assert [curve["b"] for curve in updated] == [0.25, 0.25]
+    assert [curve["angle_deg"] for curve in updated] != old_angles
+    assert window.views.overlay.ellipses == [measured]
+    window.close()
+
+
+def test_project_load_rejects_reversed_roi_instead_of_applying_empty_mask(qtbot, tmp_path) -> None:
+    image_path = tmp_path / "frame.npy"
+    np.save(image_path, np.ones((8, 9), dtype=np.float32))
+    project_path = tmp_path / "invalid-roi.json"
+    project_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "input": str(image_path),
+                "parameters": {},
+                "analysis": {},
+                "rois": [
+                    {"type": "rectangle", "x0": 6, "x1": 2, "y0": 1, "y1": 5}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    window = MainWindow(auto_preview=False)
+    qtbot.addWidget(window)
+    assert not window.load_project(project_path)
+    assert "could not apply project ROIs" in window.status_message.text()
+    window.close()
+
+
+def test_poni_refreshes_physical_q_units_and_partial_failure_clears_images(qtbot) -> None:
+    engine = _PoniEngine()
+    engine.parameters.update({
+        "a": {"value": 0.8, "unit": "unknown"},
+        "b": {"value": 0.4, "unit": "unknown"},
+        "radial_sigma": {"value": 0.04, "unit": "unknown"},
+    })
+    window = MainWindow(engine=engine, parameters=engine.parameters, auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.ones((4, 5))
+    window.set_observed_data(observed)
+    window._apply_result({"observed": observed, "model": observed, "residual": np.zeros_like(observed)})
+    assert window.views.model.image_data is not None
+    assert window.views.residual.image_data is not None
+    assert window.set_poni("example.poni")
+    units = {row.name: row.unit for row in window.parameter_model.rows}
+    assert units["a"] == "nm^-1"
+    assert units["b"] == "nm^-1"
+    window._apply_result({"observed": observed, "flags": ["analysis_failed:ValueError"]})
+    assert window.views.model.image_data is None
+    assert window.views.residual.image_data is None
+    assert window.status_message.text() != "Optimize complete"
+    window.close()
+
+
+def test_invalid_q_bounds_do_not_start_worker_or_fall_back_to_auto(qtbot) -> None:
+    engine = _MeasurementPageEngine()
+    window = MainWindow(engine=engine, auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((4, 5)))
+    window.q_min_edit.setText("not-a-number")
+    generation = window.request_preview()
+    assert generation > 0
+    assert engine.payloads == []
+    assert "invalid_analysis" in window.flags_label.text()
+    window.close()
+
+
+def test_programmatic_analysis_change_rejects_an_older_worker_result(qtbot) -> None:
+    window = MainWindow(engine=_StateEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.ones((4, 5), dtype=float)
+    model = observed * 0.8
+    window.set_observed_data(observed)
+    old_generation = window._generation.next()
+
+    window.set_analysis_settings({"q_min": 0.2}, trigger_preview=False)
+    assert not window._generation.is_current(old_generation)
+    window._on_worker_finished(
+        old_generation,
+        "preview",
+        {
+            "observed": observed,
+            "model": model,
+            "residual": observed - model,
+            "parameters": window.parameter_model.parameter_dict(),
+        },
+    )
+
+    assert window._last_result is None
+    assert not window._current_result_is_reviewable()
+    window.close()
+
+
+def test_optimize_pre_snapshot_is_detached_and_stale_result_cannot_change_candidate(qtbot) -> None:
+    class _SlowOptimizeEngine(_StateEngine):
+        def __init__(self):
+            super().__init__()
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.saw_cancel = False
+
+        def optimize(self, *, parameters, payload):
+            del parameters
+            self.started.set()
+            self.release.wait(2.0)
+            cancel_event = payload.get("cancel_event") if isinstance(payload, dict) else None
+            self.saw_cancel = bool(cancel_event is not None and cancel_event.is_set())
+            return {"parameters": {"theta_deg": {"value": 5.0, "unit": "degree"}}}
+
+    engine = _SlowOptimizeEngine()
+    window = MainWindow(engine=engine, auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.arange(12, dtype=float).reshape(3, 4)
+    window.set_observed_data(observed)
+    window.request_optimize()
+    qtbot.waitUntil(engine.started.is_set, timeout=2_000)
+    before = window._fit_session["optimize_before"]
+
+    assert before["parameters"]["theta_deg"]["value"] == pytest.approx(10.0)
+    # The GUI snapshot retains selectors/configuration only; detector-sized
+    # arrays remain owned by the loaded frame/service and are never copied on
+    # the event thread.
+    assert "data" not in before["input"]
+    observed[0, 0] = 999.0
+    assert before["input"].get("path") is None or before["input"].get("path") == window._source_path
+
+    window.cancel_jobs()
+    engine.release.set()
+    qtbot.waitUntil(lambda: not window._workers, timeout=2_000)
+    assert engine.saw_cancel is True
+    assert window.parameters["theta_deg"] == pytest.approx(10.0)
+    assert window._fit_session["optimize_after"] is None
+    window.close()
+
+
+def test_optimize_review_requires_explicit_reviewer_and_edit_invalidates_status(qtbot) -> None:
+    window = MainWindow(engine=_StateEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.ones((4, 5), dtype=float)
+    model = observed * 0.8
+    window.set_observed_data(observed)
+    window._fit_session["optimize_before"] = window._capture_fit_context()
+    generation = window._generation.next()
+    window._on_worker_finished(
+        generation,
+        "optimize",
+        {
+            "observed": observed,
+            "model": model,
+            "residual": observed - model,
+            "parameters": {"theta_deg": {"value": 15.0, "unit": "degree"}},
+        },
+    )
+
+    after = window._fit_session["optimize_after"]
+    assert after is not None
+    assert "data" not in after["input"]
+    assert "qmap" not in after
+    assert "file" not in after["mask"]
+    assert after["result_summary"]["shape"] == [4, 5]
+    assert window.fit_session["manual_status"] == "unreviewed"
+    assert not window.accept_current()
+    window.reviewer_edit.setText("Dr. Reviewer")
+    window.review_notes_edit.setText("clear four-lobe frame")
+    assert window.accept_current()
+    assert window.fit_session["manual_status"] == "accepted"
+    assert window.fit_session["reviewed_by"] == "Dr. Reviewer"
+    assert window.fit_session["reviewed_at"]
+    assert window.fit_session["accepted_parameters"]["theta_deg"]["value"] == pytest.approx(15.0)
+
+    assert window.set_parameter("theta_deg", 20.0)
+    assert window.fit_session["manual_status"] == "unreviewed"
+    assert window.fit_session["accepted_parameters"] is None
+    window.close()
+
+
+def test_multiple_snapshots_preserve_notes_order_and_exact_parameter_fields(qtbot) -> None:
+    parameters = {
+        "a": {"value": 0.8, "min": 0.2, "max": 1.2, "vary": True, "expr": "", "unit": "nm^-1", "stderr": 0.01},
+        "axis_ratio": {"value": 0.5, "min": 0.1, "max": 1.0, "vary": False, "expr": "", "unit": "", "stderr": None},
+        "theta_deg": {"value": 15.0, "min": -90.0, "max": 90.0, "vary": True, "expr": "", "unit": "degree", "stderr": 0.2},
+    }
+    window = MainWindow(engine=_StateEngine(), parameters=parameters, auto_preview=False)
+    qtbot.addWidget(window)
+    window.snapshot_note_edit.setText("initial manual state")
+    assert window.save_snapshot()
+    first = window.fit_session["snapshots"][0]
+
+    assert window.set_parameter("a", 1.1)
+    window.snapshot_note_edit.setText("wider ellipse")
+    assert window.save_snapshot()
+    assert [item["note"] for item in window.fit_session["snapshots"]] == ["initial manual state", "wider ellipse"]
+    assert [window.snapshot_combo.itemData(i) for i in range(window.snapshot_combo.count())] == [0, 1]
+
+    window._apply_result({"model": np.ones((3, 3)), "residual": np.zeros((3, 3)), "ellipses": [{"a": 1.0, "b": 0.5}]})
+    assert window.restore_snapshot(0)
+    assert window.parameter_model.parameter_dict() == first["parameters"]
+    assert window.views.model.image_data is None
+    assert window.views.residual.image_data is None
+    assert window.views.overlay.ellipses == []
+    window.close()
+
+
+def test_project_schema_two_roundtrip_restores_fit_session_without_detector_arrays(qtbot, tmp_path) -> None:
+    window = MainWindow(engine=_StateEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((5, 6), dtype=float))
+    window._fit_session["optimize_before"] = window._capture_fit_context()
+    generation = window._generation.next()
+    window._on_worker_finished(
+        generation,
+        "optimize",
+        {
+            "observed": np.ones((5, 6), dtype=float),
+            "model": np.full((5, 6), 0.9, dtype=float),
+            "residual": np.full((5, 6), 0.1, dtype=float),
+            "parameters": {"theta_deg": {"value": 17.0, "unit": "degree"}},
+        },
+    )
+    window.reviewer_edit.setText("Reviewer A")
+    window.review_notes_edit.setText("accepted for manual comparison")
+    assert window.accept_current()
+    window.snapshot_note_edit.setText("accepted candidate")
+    assert window.save_snapshot()
+
+    project_path = tmp_path / "fit-session-v2.json"
+    assert window.save_project(project_path)
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    assert project["schema_version"] == 2
+    assert project["fit_session"]["manual_status"] == "accepted"
+    assert project["fit_session"]["snapshots"][0]["parameters"]["theta_deg"]["value"] == pytest.approx(17.0)
+
+    def _contains_detector_array(value):
+        if isinstance(value, dict):
+            return any(_contains_detector_array(item) for item in value.values())
+        if isinstance(value, list):
+            return any(_contains_detector_array(item) for item in value)
+        return False
+
+    # The persisted fit context keeps selectors and settings, not observed/q/mask arrays.
+    assert "data" not in project["fit_session"]["optimize_before"]["input"]
+    assert "qmap" not in project["fit_session"]["optimize_before"]
+    assert "external" not in project["fit_session"]["optimize_before"].get("mask", {})
+    assert not _contains_detector_array(project["fit_session"]["optimize_before"].get("input", {}).get("data"))
+
+    restored = MainWindow(engine=_StateEngine(), auto_preview=False)
+    qtbot.addWidget(restored)
+    assert restored.load_project(project_path)
+    assert restored.fit_session["manual_status"] == "accepted"
+    assert restored.fit_session["reviewed_by"] == "Reviewer A"
+    assert len(restored.fit_session["snapshots"]) == 1
+    assert restored.parameter_model.parameter_dict()["theta_deg"]["value"] == pytest.approx(17.0)
+    restored.close()
+    window.close()
+
+
+def test_preview_can_be_reviewed_and_exported_but_parameter_edit_blocks_stale_result(
+    qtbot,
+    tmp_path,
+) -> None:
+    window = MainWindow(engine=_StateEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.arange(20, dtype=float).reshape(4, 5) + 1.0
+    model = observed * 0.75
+    yy, xx = np.indices(observed.shape, dtype=float)
+    window.set_observed_data(
+        observed,
+        qmap={
+            "qx": xx / 10.0,
+            "qy": yy / 10.0,
+            "metadata": {"q_unit": "nm^-1"},
+        },
+    )
+
+    generation = window._generation.next()
+    window._on_worker_finished(
+        generation,
+        "preview",
+        {
+            "observed": observed,
+            "model": model,
+            "residual": observed - model,
+            "parameters": window.parameter_model.parameter_dict(),
+        },
+    )
+
+    assert window.accept_current_button.isEnabled()
+    assert window.export_evidence_action.isEnabled()
+    assert not window.accept_current()
+    window.reviewer_edit.setText("Reviewer Preview")
+    window.review_notes_edit.setText("manual parameters match the visible lobes")
+    assert window.accept_current()
+
+    evidence_dir = tmp_path / "preview-evidence"
+    assert window.export_manual_evidence(evidence_dir)
+    assert {path.name for path in evidence_dir.iterdir()} == {
+        "observed.png",
+        "model.png",
+        "residual.png",
+        "overlay.png",
+        "parameters.csv",
+        "fit_session.json",
+        "provenance.json",
+    }
+    exported_session = json.loads((evidence_dir / "fit_session.json").read_text(encoding="utf-8"))
+    assert exported_session["manual_status"] == "accepted"
+    assert exported_session["reviewed_by"] == "Reviewer Preview"
+    assert exported_session["analysis"]["q_unit"] == "nm^-1"
+
+    assert window.set_parameter("theta_deg", 18.0)
+    assert not window.export_manual_evidence(tmp_path / "stale-evidence")
+    assert not (tmp_path / "stale-evidence").exists()
+    assert "evidence_stale" in window.flags_label.text()
+    window.close()
+
+
+def test_manual_evidence_rejects_source_replaced_after_preview(qtbot, tmp_path) -> None:
+    image_path = tmp_path / "frame.npy"
+    observed = np.arange(20, dtype=float).reshape(4, 5) + 1.0
+    np.save(image_path, observed)
+    window = MainWindow(auto_preview=False)
+    qtbot.addWidget(window)
+    assert window.open_image(image_path)
+
+    generation = window._generation.next()
+    window._on_worker_finished(
+        generation,
+        "preview",
+        {
+            "observed": observed,
+            "model": observed * 0.9,
+            "residual": observed * 0.1,
+            "parameters": window.parameter_model.parameter_dict(),
+        },
+    )
+    assert window._current_result_is_reviewable()
+
+    np.save(image_path, np.full_like(observed, 99.0))
+    evidence_dir = tmp_path / "replaced-input-evidence"
+    assert not window.export_manual_evidence(evidence_dir)
+    assert not evidence_dir.exists()
+    assert "evidence_error" in window.flags_label.text()
+    window.close()
+
+
+def test_current_preview_can_be_explicitly_rejected_and_exported(qtbot, tmp_path) -> None:
+    window = MainWindow(engine=_StateEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    observed = np.ones((3, 4), dtype=float)
+    model = np.zeros_like(observed)
+    window.set_observed_data(observed)
+    generation = window._generation.next()
+    window._on_worker_finished(
+        generation,
+        "preview",
+        {
+            "observed": observed,
+            "model": model,
+            "residual": observed - model,
+            "parameters": window.parameter_model.parameter_dict(),
+            "flags": ["apparent_geometry_only", "nonunique_inverse_problem"],
+        },
+    )
+
+    window.reviewer_edit.setText("Reviewer Negative")
+    window.review_notes_edit.setText("current empirical model is not suitable for this frame")
+    assert window.reject_current()
+    assert window.fit_session["manual_status"] == "rejected"
+    assert window.fit_session["accepted_parameters"] is None
+
+    evidence_dir = tmp_path / "rejected-evidence"
+    assert window.export_manual_evidence(evidence_dir)
+    exported_session = json.loads((evidence_dir / "fit_session.json").read_text(encoding="utf-8"))
+    assert exported_session["manual_status"] == "rejected"
+    assert exported_session["reviewed_by"] == "Reviewer Negative"
+    window.close()

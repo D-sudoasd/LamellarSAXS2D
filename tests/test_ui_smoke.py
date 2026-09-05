@@ -36,7 +36,7 @@ class _Engine:
 
 def test_workbench_offscreen_smoke(qtbot, tmp_path):
     engine = _Engine()
-    window = MainWindow(engine=engine, auto_preview=False)
+    window = MainWindow(engine=engine, auto_preview=False, language="en")
     qtbot.addWidget(window)
     window.set_observed_data(np.ones((12, 12)))
 
@@ -74,7 +74,12 @@ def test_workbench_offscreen_smoke(qtbot, tmp_path):
 
 def test_parameter_change_is_debounced(qtbot):
     engine = _Engine()
-    window = MainWindow(engine=engine, auto_preview=True, debounce_ms=35)
+    window = MainWindow(
+        engine=engine,
+        auto_preview=True,
+        debounce_ms=35,
+        language="en",
+    )
     qtbot.addWidget(window)
     window.set_observed_data(np.ones((4, 4)))
     assert window.set_parameter("theta_deg", 10.0)

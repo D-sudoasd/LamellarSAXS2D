@@ -18,6 +18,23 @@ class MaskSpecError(ValueError):
     """An exclusion ROI is malformed or incompatible with the image."""
 
 
+def _finite_float(value: Any, name: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MaskSpecError(f"{name} must be a finite number") from exc
+    if not np.isfinite(number):
+        raise MaskSpecError(f"{name} must be a finite number")
+    return number
+
+
+def _required(spec: Mapping[str, Any], name: str) -> Any:
+    try:
+        return spec[name]
+    except KeyError as exc:
+        raise MaskSpecError(f"ROI is missing required field {name!r}") from exc
+
+
 def _shape(value: Any) -> tuple[int, int]:
     try:
         height, width = (int(item) for item in value)
@@ -39,8 +56,12 @@ def rectangle_mask(
     """Return a pixel-space rectangular exclusion mask."""
 
     height, width = _shape(shape)
-    left, right = sorted((float(x0), float(x1)))
-    top, bottom = sorted((float(y0), float(y1)))
+    left = _finite_float(x0, "x0")
+    right = _finite_float(x1, "x1")
+    top = _finite_float(y0, "y0")
+    bottom = _finite_float(y1, "y1")
+    if right < left or bottom < top:
+        raise MaskSpecError("rectangle bounds must satisfy x1 >= x0 and y1 >= y0")
     yy, xx = np.indices((height, width), dtype=float)
     return (xx >= left) & (xx <= right) & (yy >= top) & (yy <= bottom)
 
@@ -57,13 +78,17 @@ def ellipse_mask(
     """Return a rotated pixel-space elliptical exclusion mask."""
 
     height, width = _shape(shape)
-    rx, ry = float(rx), float(ry)
-    if not np.isfinite(rx) or not np.isfinite(ry) or rx <= 0 or ry <= 0:
+    cx = _finite_float(cx, "cx")
+    cy = _finite_float(cy, "cy")
+    rx = _finite_float(rx, "rx")
+    ry = _finite_float(ry, "ry")
+    angle_deg = _finite_float(angle_deg, "angle_deg")
+    if rx <= 0 or ry <= 0:
         raise MaskSpecError("ellipse radii must be finite and positive")
     yy, xx = np.indices((height, width), dtype=float)
-    angle = np.deg2rad(float(angle_deg))
+    angle = np.deg2rad(angle_deg)
     cos_a, sin_a = np.cos(angle), np.sin(angle)
-    dx, dy = xx - float(cx), yy - float(cy)
+    dx, dy = xx - cx, yy - cy
     local_x = cos_a * dx + sin_a * dy
     local_y = -sin_a * dx + cos_a * dy
     return (local_x / rx) ** 2 + (local_y / ry) ** 2 <= 1.0
@@ -83,20 +108,35 @@ def q_sector_mask(
     Azimuth limits may cross the -180/180 boundary (for example 170 to -170).
     """
 
-    qx_array, qy_array = np.broadcast_arrays(np.asarray(qx, dtype=float), np.asarray(qy, dtype=float))
+    try:
+        qx_array, qy_array = np.broadcast_arrays(
+            np.asarray(qx, dtype=float), np.asarray(qy, dtype=float)
+        )
+    except ValueError as exc:
+        raise MaskSpecError("qx/qy shapes are not broadcast-compatible") from exc
     if qx_array.ndim != 2:
         raise MaskSpecError("qx/qy must be two-dimensional")
+    lower = None if q_min is None else _finite_float(q_min, "q_min")
+    upper = None if q_max is None else _finite_float(q_max, "q_max")
+    if lower is not None and lower < 0:
+        raise MaskSpecError("q_min must be non-negative")
+    if upper is not None and upper < 0:
+        raise MaskSpecError("q_max must be non-negative")
+    if lower is not None and upper is not None and upper < lower:
+        raise MaskSpecError("q bounds must satisfy q_max >= q_min")
+    chi_min = _finite_float(chi_min_deg, "chi_min_deg")
+    chi_max = _finite_float(chi_max_deg, "chi_max_deg")
     q = np.hypot(qx_array, qy_array)
     chi = (np.degrees(np.arctan2(qy_array, qx_array)) + 180.0) % 360.0 - 180.0
     selected = np.isfinite(q) & np.isfinite(chi)
-    if q_min is not None:
-        selected &= q >= float(q_min)
-    if q_max is not None:
-        selected &= q <= float(q_max)
-    lo = (float(chi_min_deg) + 180.0) % 360.0 - 180.0
-    hi = (float(chi_max_deg) + 180.0) % 360.0 - 180.0
-    if np.isclose((float(chi_max_deg) - float(chi_min_deg)) % 360.0, 0.0) and not np.isclose(
-        float(chi_max_deg), float(chi_min_deg)
+    if lower is not None:
+        selected &= q >= lower
+    if upper is not None:
+        selected &= q <= upper
+    lo = (chi_min + 180.0) % 360.0 - 180.0
+    hi = (chi_max + 180.0) % 360.0 - 180.0
+    if np.isclose((chi_max - chi_min) % 360.0, 0.0) and not np.isclose(
+        chi_max, chi_min
     ):
         angular = np.ones_like(selected)
     elif lo <= hi:
@@ -115,22 +155,24 @@ def mask_from_roi(
 ) -> np.ndarray:
     """Build one exclusion mask from a serializable ROI specification."""
 
+    if not isinstance(spec, Mapping):
+        raise MaskSpecError("ROI specification must be a mapping")
     kind = str(spec.get("type", spec.get("kind", ""))).strip().lower().replace("-", "_")
     if kind in {"rectangle", "rect", "box"}:
         return rectangle_mask(
             shape,
-            x0=spec["x0"],
-            x1=spec["x1"],
-            y0=spec["y0"],
-            y1=spec["y1"],
+            x0=_required(spec, "x0"),
+            x1=_required(spec, "x1"),
+            y0=_required(spec, "y0"),
+            y1=_required(spec, "y1"),
         )
     if kind in {"ellipse", "elliptical"}:
         return ellipse_mask(
             shape,
-            cx=spec["cx"],
-            cy=spec["cy"],
-            rx=spec["rx"],
-            ry=spec["ry"],
+            cx=_required(spec, "cx"),
+            cy=_required(spec, "cy"),
+            rx=_required(spec, "rx"),
+            ry=_required(spec, "ry"),
             angle_deg=spec.get("angle_deg", 0.0),
         )
     if kind in {"q_sector", "sector", "annular_sector"}:

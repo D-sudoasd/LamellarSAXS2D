@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import dataclasses
+import math
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -24,6 +25,7 @@ except Exception:  # pragma: no cover - only for incomplete installations
 
 from .observables import APPARENT_FLAGS, _extract_maps, _get_field, _q_limits
 from .parameters import ParameterSet, ParameterSpec
+from .cancellation import raise_if_cancelled
 
 
 MODEL_FLAGS = APPARENT_FLAGS + ("empirical_model_only",)
@@ -74,6 +76,12 @@ class IntensityFitResult(_MappingResult):
     sampled_n: int = 0
     sample_rmse: float = float("nan")
     reference_axis_deg: float = 0.0
+    candidate_solutions: tuple[dict[str, Any], ...] = ()
+    selected_start_index: int = 0
+    multistart_count: int = 1
+    sample_cost: float = float("nan")
+    full_cost: float = float("nan")
+    selection_objective: str = "full_valid_weighted_robust_cost"
 
     @property
     def values(self) -> Any:
@@ -612,6 +620,107 @@ def deterministic_pixel_sample(indices: Sequence[int] | np.ndarray, max_pixels: 
     return np.sort(np.asarray(selected, dtype=int))
 
 
+def _validate_multistart_count(multistart: Any) -> int:
+    if isinstance(multistart, (bool, np.bool_)) or not isinstance(multistart, (int, np.integer)):
+        raise TypeError("multistart must be an integer >= 1")
+    count = int(multistart)
+    if count < 1:
+        raise ValueError("multistart must be an integer >= 1")
+    return count
+
+
+def _multistart_vectors(
+    names: Sequence[str],
+    base: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    count: int,
+) -> tuple[np.ndarray, ...]:
+    """Build deterministic bounded starts for the full-pixel optimizer."""
+
+    if count == 1:
+        return (np.asarray(base, dtype=float).copy(),)
+    fractions = (0.20, 0.80, 0.35, 0.65, 0.50, 0.10, 0.90)
+    offsets = (-1.5, 1.5, -0.75, 0.75, 0.0, -2.0, 2.0)
+    # Geometry-only starts are deliberately first.  A poor full-pixel start
+    # can be trapped in a broad, nearly circular intensity basin; changing
+    # only the ellipse scale/ratio/orientation gives that basin a physically
+    # meaningful alternative while retaining the user's widths, amplitudes,
+    # eta, and background values.  The original start remains index 0.
+    geometry_seeds = (
+        {"theta": np.pi / 4.0, "axis_ratio": 0.05},
+        {"theta": -np.pi / 4.0, "axis_ratio": 0.05},
+        {"theta": 0.0, "axis_ratio": 0.10},
+        {"theta": np.pi / 4.0, "axis_ratio": 0.20},
+        {"theta": -np.pi / 4.0, "axis_ratio": 0.35},
+    )
+
+    def bounded_value(name: str, value: float, lo: float, hi: float) -> float:
+        if name == "axis_ratio" and lo > 0.0 and hi > 0.0:
+            value = max(float(value), 0.005 * float(hi))
+        if np.isfinite(lo):
+            value = max(float(value), float(np.nextafter(lo, hi)))
+        if np.isfinite(hi):
+            value = min(float(value), float(np.nextafter(hi, lo)))
+        return float(value)
+
+    starts: list[np.ndarray] = [np.asarray(base, dtype=float).copy()]
+    for start_index in range(1, count):
+        if start_index <= len(geometry_seeds):
+            vector = np.asarray(base, dtype=float).copy()
+            seed = geometry_seeds[start_index - 1]
+            for index, (name, _value, lo, hi) in enumerate(zip(names, base, lower, upper)):
+                if name in seed:
+                    vector[index] = bounded_value(name, float(seed[name]), lo, hi)
+            starts.append(vector)
+            continue
+        fraction = fractions[(start_index - 1) % len(fractions)]
+        offset = offsets[(start_index - 1) % len(offsets)]
+        vector = np.asarray(base, dtype=float).copy()
+        for index, (name, value, lo, hi) in enumerate(zip(names, base, lower, upper)):
+            # Bounds that came from the generic +/-1e12 fallback are
+            # effectively unbounded.  Keep those starts local to the current
+            # estimate rather than placing them at absurd absolute values.
+            bounded = np.isfinite(lo) and np.isfinite(hi) and abs(lo) < 1.0e6 and abs(hi) < 1.0e6
+            if bounded:
+                if name in {"a", "axis_ratio", "radial_sigma", "radial_gamma", "angular_width", "background_width"} and lo > 0.0 and hi > 0.0:
+                    log_lo = math.log(max(float(lo), 0.005 * float(hi)))
+                    log_hi = math.log(float(hi))
+                    vector[index] = math.exp(log_lo + fraction * (log_hi - log_lo))
+                else:
+                    vector[index] = lo + fraction * (hi - lo)
+            else:
+                scale = max(abs(float(value)), 1.0)
+                vector[index] = float(value) + offset * scale
+            vector[index] = bounded_value(name, float(vector[index]), lo, hi)
+        starts.append(vector)
+    return tuple(starts)
+
+
+def _robust_cost(residual: np.ndarray, loss: str, f_scale: float) -> float:
+    """Return scipy least-squares' robust objective for weighted residuals."""
+
+    residual = np.asarray(residual, dtype=float)
+    if not np.all(np.isfinite(residual)):
+        return float("inf")
+    scale = max(float(f_scale), np.finfo(float).eps)
+    z = np.square(residual / scale)
+    kind = str(loss).lower()
+    if kind == "linear":
+        rho = z
+    elif kind == "soft_l1":
+        rho = 2.0 * (np.sqrt(1.0 + z) - 1.0)
+    elif kind == "huber":
+        rho = np.where(z <= 1.0, z, 2.0 * np.sqrt(z) - 1.0)
+    elif kind == "cauchy":
+        rho = np.log1p(z)
+    elif kind == "arctan":
+        rho = np.arctan(z)
+    else:
+        raise ValueError("robust_loss must be one of linear, soft_l1, huber, cauchy, arctan")
+    return float(0.5 * scale * scale * np.sum(rho))
+
+
 def _fit_arrays(frame: Any, qmap: Any, q_window: Any = None, q_range: Any = None, mask: Any = None) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[int, ...]]:
     values, q, angle, valid = _extract_maps(frame, qmap, mask)
     shape = np.asarray(_get_field(frame, ("data", "intensity", "image", "values"))).shape
@@ -730,6 +839,9 @@ def fit_intensity_model(
     weights: Any = None,
     reference_axis_deg: float = 0.0,
     auto_scale_initial: bool = False,
+    multistart: int = 1,
+    full2d_multistart: int | None = None,
+    cancel_event: Any = None,
 ) -> IntensityFitResult:
     """Fit the empirical model on all valid pixels by default.
 
@@ -738,10 +850,19 @@ def fit_intensity_model(
     explicit arguments take precedence.  ``max_pixels`` enables deterministic
     per-scale subsets when explicitly supplied; otherwise one full-pixel
     optimization is performed even when multiple scales were requested.
+    ``multistart`` (or its ``full2d_multistart`` alias) adds deterministic
+    bounded candidate fits; one start remains the backwards-compatible
+    default.
     """
 
+    raise_if_cancelled(cancel_event, "intensity:start")
     if least_squares is None:
         raise RuntimeError("scipy.optimize.least_squares is required for refinement")
+    if full2d_multistart is not None:
+        if multistart != 1:
+            raise ValueError("supply only one of multistart or full2d_multistart")
+        multistart = full2d_multistart
+    multistart = _validate_multistart_count(multistart)
     if sigma is not None and weights is not None:
         raise ValueError("supply either sigma or weights, not both")
     values_obs, qx, qy, valid, shape = _fit_arrays(frame, qmap, q_window, q_range, mask)
@@ -793,9 +914,10 @@ def fit_intensity_model(
         )
         residual = prediction - values_obs
         weighted = scaled_residual(residual[all_indices], all_indices)
+        no_free_cost = 0.5 * float(np.sum(weighted**2))
         return IntensityFitResult(
             _restore_parameters(initial, values), initial, True, "no free parameters",
-            0.5 * float(np.sum(weighted**2)),
+            no_free_cost,
             float(np.sqrt(np.mean(residual[all_indices] ** 2))),
             0, all_indices, prediction, residual, shape, tuple(),
             flags=MODEL_FLAGS
@@ -809,6 +931,8 @@ def fit_intensity_model(
             sampled_n=int(len(all_indices)),
             sample_rmse=float(np.sqrt(np.mean(residual[all_indices] ** 2))),
             reference_axis_deg=float(reference_axis_deg),
+            sample_cost=no_free_cost,
+            full_cost=no_free_cost,
         )
 
     lower = []
@@ -827,8 +951,10 @@ def fit_intensity_model(
     current = np.asarray([float(values[name]) for name in names], dtype=float)
     current = np.clip(current, lower_arr + 1e-12, upper_arr - 1e-12)
     history: list[dict[str, Any]] = []
+    candidate_solutions: list[dict[str, Any]] = []
     best_result = None
     best_indices = all_indices
+    selected_start_index = 0
     scales = tuple(float(scale) for scale in scales)
     if not scales or any(scale <= 0 for scale in scales):
         raise ValueError("scales must contain positive values")
@@ -842,6 +968,7 @@ def fit_intensity_model(
         xsel, ysel = qx[selected], qy[selected]
 
         def residual_fn(vector: np.ndarray) -> np.ndarray:
+            raise_if_cancelled(cancel_event, "intensity:residual")
             candidate = _candidate_parameter_values(initial, values, names, vector)
             predicted = np.asarray(
                 double_ellipse_intensity(
@@ -856,17 +983,83 @@ def fit_intensity_model(
             # deterministic weighting remains stable across repeated runs.
             return scaled_residual(predicted - obs, selected)
 
-        result = least_squares(
-            residual_fn,
-            current,
-            bounds=(lower_arr, upper_arr),
-            loss=robust_loss,
-            f_scale=max(float(f_scale), np.finfo(float).eps),
-            max_nfev=int(max_nfev),
+        starts = _multistart_vectors(names, current, lower_arr, upper_arr, multistart)
+        scale_candidates: list[tuple[int, Any, np.ndarray, dict[str, Any], float]] = []
+        for start_index, start_vector in enumerate(starts):
+            raise_if_cancelled(cancel_event, "intensity:multistart")
+            result = least_squares(
+                residual_fn,
+                start_vector,
+                bounds=(lower_arr, upper_arr),
+                loss=robust_loss,
+                f_scale=max(float(f_scale), np.finfo(float).eps),
+                # Geometry, angular widths, and flat axis ratios live on
+                # different numerical scales.  Jacobian scaling is safe for
+                # both the default single start and explicit multistart.
+                x_scale="jac",
+                max_nfev=int(max_nfev),
+            )
+            raise_if_cancelled(cancel_event, "intensity:complete")
+            candidate_values = _candidate_parameter_values(initial, values, names, result.x)
+            candidate_full_prediction = np.asarray(
+                double_ellipse_intensity(
+                    qx[all_indices],
+                    qy[all_indices],
+                    candidate_values,
+                    reference_axis_deg=reference_axis_deg,
+                ),
+                dtype=float,
+            )
+            candidate_full_weighted = scaled_residual(
+                candidate_full_prediction - values_obs[all_indices],
+                all_indices,
+            )
+            full_cost = _robust_cost(candidate_full_weighted, robust_loss, f_scale)
+            record = {
+                "scale": float(scale),
+                "start_index": int(start_index),
+                "start_values": {name: float(value) for name, value in zip(names, start_vector)},
+                "values": {
+                    name: float(value)
+                    for name, value in candidate_values.items()
+                    if np.isscalar(value) and not isinstance(value, (str, bytes))
+                },
+                "success": bool(result.success),
+                "finite_cost": bool(np.isfinite(result.cost)),
+                "cost": float(result.cost),
+                "sample_cost": float(result.cost),
+                "full_cost": float(full_cost),
+                "nfev": int(result.nfev),
+                "message": str(result.message),
+            }
+            scale_candidates.append(
+                (start_index, result, np.asarray(result.x, dtype=float), record, full_cost)
+            )
+            candidate_solutions.append(record)
+        selected_start_index, result, result_vector, selected_record, selected_full_cost = min(
+            scale_candidates,
+            key=lambda item: (
+                not bool(item[1].success),
+                not bool(np.isfinite(item[4])),
+                float(item[4]) if np.isfinite(item[4]) else float("inf"),
+                item[0],
+            ),
         )
-        current = np.asarray(result.x, dtype=float)
+        selected_record["selected_for_full_objective"] = True
+        selected_sample_cost = float(result.cost)
+        current = result_vector
         values = _candidate_parameter_values(initial, values, names, current)
-        history.append({"scale": scale, "n_pixels": int(len(selected)), "cost": float(result.cost), "nfev": int(result.nfev), "seed": int(seed) + level * 1_000_003})
+        history.append({
+            "scale": scale,
+            "n_pixels": int(len(selected)),
+            "cost": float(selected_full_cost),
+            "sample_cost": selected_sample_cost,
+            "full_cost": float(selected_full_cost),
+            "nfev": int(sum(item[1].nfev for item in scale_candidates)),
+            "seed": int(seed) + level * 1_000_003,
+            "selected_start_index": int(selected_start_index),
+            "multistart_count": int(multistart),
+        })
         best_result = result
 
     prediction = np.asarray(
@@ -878,7 +1071,9 @@ def fit_intensity_model(
     full_weighted = scaled_residual(full_residual, all_indices)
     sampled_residual = residual[best_indices]
     sampled_weighted = scaled_residual(sampled_residual, best_indices)
-    cost = 0.5 * float(np.sum(sampled_weighted**2))
+    sample_cost = _robust_cost(sampled_weighted, robust_loss, f_scale)
+    full_cost = _robust_cost(full_weighted, robust_loss, f_scale)
+    cost = full_cost
     covariance: np.ndarray | None = None
     condition = float("nan")
     stderr = {name: float("nan") for name in values}
@@ -904,10 +1099,26 @@ def fit_intensity_model(
             (np.isfinite(lo) and abs(float(value) - float(lo)) <= tolerance * scale_value)
             or (np.isfinite(hi) and abs(float(value) - float(hi)) <= tolerance * scale_value)
         )
+    candidate_success = [bool(record["success"]) for record in candidate_solutions]
+    candidate_failure_flags: tuple[str, ...] = ()
+    if multistart > 1 and any(not success for success in candidate_success):
+        candidate_failure_flags = (
+            ("all_candidates_failed",)
+            if not any(candidate_success)
+            else ("multistart_candidate_failures",)
+        )
     result_flags = (
         MODEL_FLAGS
         + (("initial_intensity_scale_estimated",) if scale_estimated else ())
         + ("covariance_local_linear_approximation",)
+        + (("deterministic_multistart",) if multistart > 1 else ())
+        + candidate_failure_flags
+        + (
+            ("solver_failed",)
+            if best_result is None or not bool(best_result.success)
+            else ()
+        )
+        + (("full_objective_candidate_selection",) if multistart > 1 else ())
     )
     return IntensityFitResult(
         parameters=_restore_parameters(initial, values),
@@ -934,6 +1145,12 @@ def fit_intensity_model(
         sampled_n=int(len(best_indices)),
         sample_rmse=float(np.sqrt(np.mean(sampled_residual * sampled_residual))) if len(sampled_residual) else float("nan"),
         reference_axis_deg=float(reference_axis_deg),
+        candidate_solutions=tuple(candidate_solutions),
+        selected_start_index=int(selected_start_index),
+        multistart_count=int(multistart),
+        sample_cost=float(sample_cost),
+        full_cost=float(full_cost),
+        selection_objective="full_valid_weighted_robust_cost",
     )
 
 

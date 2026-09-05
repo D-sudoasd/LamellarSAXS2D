@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 import pytest
 
-from butterfly_saxs.cli import build_parser, main
+from butterfly_saxs.cli import _print_json, build_parser, main
 from butterfly_saxs.intensity import default_intensity_parameters, double_ellipse_intensity
 from butterfly_saxs.pipeline import (
     PipelineError,
+    PipelineResult,
+    _configured_external_mask,
     _loaded_frame,
     _coerce_qmap,
     _public_angles,
@@ -17,6 +21,7 @@ from butterfly_saxs.pipeline import (
     export_result,
     fit_full2d,
     inspect_frame,
+    run_project,
     synthetic_butterfly,
 )
 from butterfly_saxs.project import ProjectConfig, load_project, save_project
@@ -31,6 +36,20 @@ def test_cli_help_has_public_vertical_slice() -> None:
     with pytest.raises(SystemExit) as error:
         main(["--help"])
     assert error.value.code == 0
+
+
+def test_cli_json_stdout_is_safe_for_windows_gbk(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp936", errors="strict")
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    _print_json({"q_unit": "Å^-1", "message": "拟合完成"})
+    stream.flush()
+
+    assert json.loads(raw.getvalue().decode("cp936")) == {
+        "q_unit": "Å^-1",
+        "message": "拟合完成",
+    }
 
 
 def test_cli_synthetic_writes_array(tmp_path: Path) -> None:
@@ -68,6 +87,18 @@ def test_single_frame_pipeline_accepts_qmap_fixture(tmp_path: Path) -> None:
         summary = json.load(handle)
     assert summary["flags"]["nonunique_inverse_problem"] is True
     assert "NaN" not in paths[0].read_text(encoding="utf-8")
+    arrays_path = next(path for path in paths if path.suffix == ".npz")
+    with np.load(arrays_path) as arrays:
+        assert {
+            "finite_mask",
+            "detector_valid_mask",
+            "external_valid_mask",
+            "q_window_mask",
+            "roi_exclusion_mask",
+            "weight_valid_mask",
+            "fit_valid_mask",
+            "sampled_valid_mask",
+        } <= set(arrays.files)
 
 
 def test_analyze_reuses_measured_ridge_instead_of_extracting_twice(monkeypatch) -> None:
@@ -182,6 +213,46 @@ def test_project_config_round_trip(tmp_path: Path) -> None:
         save_project(source, path)
 
 
+def test_project_promotes_independent_mask_selectors_from_inputs_group() -> None:
+    config = ProjectConfig.from_mapping(
+        {
+            "inputs": {
+                "files": ["data/image.h5"],
+                "frame": 2,
+                "dataset": "images/series",
+                "mask": "geometry/mask.h5",
+                "mask_frame": 1,
+                "mask_dataset": "masks/series",
+            }
+        }
+    )
+
+    assert config.analysis["frame"] == 2
+    assert config.analysis["dataset"] == "images/series"
+    assert config.analysis["mask"] == "geometry/mask.h5"
+    assert config.analysis["mask_frame"] == 1
+    assert config.analysis["mask_dataset"] == "masks/series"
+
+
+def test_low_level_configured_mask_uses_its_own_frame_and_dataset(
+    tmp_path: Path,
+) -> None:
+    masks = np.zeros((2, 3, 4), dtype=np.uint8)
+    masks[1, 1, 2] = 1
+    source = tmp_path / "mask.npz"
+    np.savez(source, mask_series=masks)
+
+    exclusion = _configured_external_mask(
+        source,
+        (3, 4),
+        config={"analysis": {"mask_frame": 1, "mask_dataset": "mask_series"}},
+    )
+
+    expected = np.zeros((3, 4), dtype=bool)
+    expected[1, 2] = True
+    np.testing.assert_array_equal(exclusion, expected)
+
+
 def test_project_resolves_analysis_paths_beside_toml(tmp_path: Path) -> None:
     source = ProjectConfig(
         inputs=["data/a.cbf"],
@@ -265,6 +336,24 @@ def test_public_angle_names_and_analysis_options_are_preserved() -> None:
     assert result.ellipse_fit.get("alpha_candidate_deg") is None
 
 
+def test_pipeline_and_service_share_mixed_q_window_precedence() -> None:
+    from butterfly_saxs.pipeline import _analysis_options
+    from butterfly_saxs.service import _validated_analysis_settings
+
+    image = np.zeros((3, 3), dtype=float)
+    qx, qy = np.meshgrid(np.arange(3, dtype=float), np.arange(3, dtype=float))
+    qmap = {"qx": qx, "qy": qy, "q": np.hypot(qx, qy), "q_unit": "nm^-1"}
+    settings = {"q_window": [1.0, 3.0], "q_min": 0.0}
+
+    pipeline_window = _analysis_options(image, qmap, settings)["q_window"]
+    service_settings = _validated_analysis_settings(settings)
+
+    assert tuple(float(value) for value in pipeline_window) == pytest.approx((0.0, 3.0))
+    assert (service_settings["q_min"], service_settings["q_max"]) == pytest.approx(
+        (0.0, 3.0)
+    )
+
+
 def test_pipeline_ellipse_uses_draw_axis_reference_and_exposes_spacing_aliases() -> None:
     from butterfly_saxs.pipeline import fit_symmetric_ellipses
 
@@ -306,12 +395,34 @@ def test_coerce_qmap_skips_none_attributes_and_requires_exact_2d_arrays() -> Non
 
     coerced = _coerce_qmap(OptionalQMap(), shape)
     assert set(coerced) >= {"qx", "qy", "object"}
-    assert "q" not in coerced
+    np.testing.assert_allclose(coerced["q"], 1.0)
+    assert coerced["q_unit"] == "unknown"
     assert "mask" not in coerced
     assert "valid_mask" not in coerced
 
     with pytest.raises(PipelineError, match="形状"):
         _coerce_qmap({"qx": np.zeros((shape[0],)), "qy": np.zeros(shape)}, shape)
+
+
+def test_coerce_qmap_rejects_q_only_and_inconsistent_coordinates() -> None:
+    shape = (4, 5)
+    qx = np.zeros(shape)
+    qy = np.ones(shape)
+
+    with pytest.raises(PipelineError, match="不能仅使用 q/radius"):
+        _coerce_qmap({"q": np.ones(shape), "q_unit": "nm^-1"}, shape)
+
+    with pytest.raises(PipelineError, match="qmap 坐标不一致"):
+        _coerce_qmap(
+            {"qx": qx, "qy": qy, "q": np.full(shape, 2.0), "q_unit": "nm^-1"},
+            shape,
+        )
+
+    with pytest.raises(PipelineError, match="qmap 坐标不一致"):
+        _coerce_qmap(
+            {"q_x": qx, "q_y": qy, "q_abs": np.full(shape, 2.0)},
+            shape,
+        )
 
 
 def test_pipeline_combines_source_config_and_embedded_qmap_masks() -> None:
@@ -338,8 +449,11 @@ def test_pipeline_combines_source_config_and_embedded_qmap_masks() -> None:
         config={"analysis": {"valid_mask": config_valid, "mask": config_mask}},
     )
     expected = source_valid & config_valid & ~source_mask & ~config_mask & ~qmap_mask
+    expected_detector = source_valid & config_valid & ~qmap_mask
     assert np.array_equal(result.valid_mask, expected)
-    assert np.array_equal(result.qmap["valid_mask"], expected)
+    assert np.array_equal(result.qmap["valid_mask"], expected_detector)
+    assert result.analysis_domain is not None
+    assert result.analysis_domain.counts["external_mask_excluded_count"] == 2
     assert bool(result.qmap["mask"][2, 2])
 
 
@@ -550,3 +664,125 @@ def test_cli_analyze_returns_nonzero_for_an_explicit_fit_failure(
     assert main(["analyze", "frame.npy", "--full2d"]) == 1
     report = json.loads(capsys.readouterr().out)
     assert report["full2d"]["status"] == "failed"
+
+
+def test_run_project_isolates_exceptions_and_quality_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import butterfly_saxs.pipeline as pipeline_module
+
+    inputs = [tmp_path / name for name in ("frame1.npy", "frame2.npy", "frame3.npy", "frame4.npy")]
+    for path in inputs:
+        path.write_bytes(path.name.encode("ascii"))
+    checkpoint = tmp_path / "checkpoint.json"
+    calls: list[tuple[str, object]] = []
+
+    def fake_analyze(source, *, initial_parameters=None, **kwargs):
+        del kwargs
+        path = Path(source)
+        calls.append((path.name, initial_parameters))
+        if path.name == "frame2.npy":
+            raise OSError("simulated read failure")
+        success = path.name != "frame3.npy"
+        return PipelineResult(
+            image=np.ones((2, 2), dtype=float),
+            qmap={"qx": np.zeros((2, 2)), "qy": np.zeros((2, 2)), "q": np.zeros((2, 2))},
+            observables={},
+            ridges=[],
+            ellipse_fit={
+                "status": "ok" if success else "failed",
+                "success": success,
+                "parameters": {"a": 1.25},
+            },
+            metadata={"path": str(path)},
+        )
+
+    monkeypatch.setattr(pipeline_module, "analyze_frame", fake_analyze)
+    run = run_project(
+        ProjectConfig(
+            inputs=inputs,
+            output=tmp_path / "results",
+            analysis={"batch_mode": "warm_start", "checkpoint": str(checkpoint)},
+        )
+    )
+
+    assert [item.status for item in run.frame_results] == ["ok", "failed", "failed", "ok"]
+    assert [name for name, _ in calls] == [path.name for path in inputs]
+    assert calls[1][1] == {"a": 1.25}
+    assert calls[2][1] == {"a": 1.25}
+    assert calls[3][1] == {"a": 1.25}
+    assert "OSError: simulated read failure" in (run.frame_results[1].error or "")
+    assert "ellipse_fit" in (run.frame_results[2].error or "")
+    assert checkpoint.exists()
+    assert (tmp_path / "results" / "frame1.json").exists()
+    assert (tmp_path / "results" / "frame3.json").exists()
+    assert (tmp_path / "results" / "frame4.npz").exists()
+
+
+def test_run_project_resume_toggle_does_not_change_scientific_config_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import butterfly_saxs.pipeline as pipeline_module
+
+    source = tmp_path / "frame.npy"
+    source.write_bytes(b"stable frame")
+    checkpoint = tmp_path / "checkpoint.json"
+    output = tmp_path / "results"
+    calls = 0
+
+    def fake_analyze(path, **kwargs):
+        nonlocal calls
+        del kwargs
+        calls += 1
+        return PipelineResult(
+            image=np.ones((2, 2), dtype=float),
+            qmap={"qx": np.zeros((2, 2)), "qy": np.zeros((2, 2)), "q": np.zeros((2, 2))},
+            observables={},
+            ridges=[],
+            ellipse_fit={"status": "ok", "success": True, "parameters": {"a": 1.0}},
+            metadata={"path": str(path)},
+        )
+
+    monkeypatch.setattr(pipeline_module, "analyze_frame", fake_analyze)
+
+    def project(*, resume: bool) -> ProjectConfig:
+        return ProjectConfig(
+            inputs=[source],
+            output=output,
+            analysis={
+                "batch_mode": "independent",
+                "checkpoint": str(checkpoint),
+                "resume": resume,
+            },
+        )
+
+    first = run_project(project(resume=False))
+    resumed = run_project(project(resume=True))
+
+    assert calls == 1
+    assert first.config_hash == resumed.config_hash
+    assert resumed.frame_results[0].resumed is True
+
+
+def test_cli_project_reports_counts_and_returns_nonzero_for_partial_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import butterfly_saxs.cli as cli_module
+    from butterfly_saxs.batch import BatchRunResult, FrameFitResult
+
+    run = BatchRunResult(
+        [
+            FrameFitResult("good.npy", result={"status": "ok"}),
+            FrameFitResult("bad.npy", status="failed", error="simulated failure"),
+        ],
+        mode="independent",
+        input_hash="input-hash",
+        config_hash="config-hash",
+    )
+    monkeypatch.setattr(cli_module, "run_project", lambda *args, **kwargs: run)
+
+    assert main(["project", "project.toml"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["n_frames"] == 2
+    assert report["n_success"] == 1
+    assert report["n_failed"] == 1

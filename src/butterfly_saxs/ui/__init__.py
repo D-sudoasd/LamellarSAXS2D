@@ -30,6 +30,7 @@ __all__ = [
     "create_app",
     "launch",
     "symmetric_ellipses",
+    "upgrade_window",
 ]
 
 
@@ -37,9 +38,21 @@ def __getattr__(name: str):
     if name in {"AnalysisService", "ButterflyAnalysisService"}:
         from ..service import AnalysisService, ButterflyAnalysisService
 
-        return {"AnalysisService": AnalysisService, "ButterflyAnalysisService": ButterflyAnalysisService}[name]
-    if name in {"ParameterRow", "ParameterTableModel", "ParameterModel", "coerce_parameter_rows"}:
-        from .models import ParameterRow, ParameterTableModel, coerce_parameter_rows
+        return {
+            "AnalysisService": AnalysisService,
+            "ButterflyAnalysisService": ButterflyAnalysisService,
+        }[name]
+    if name in {
+        "ParameterRow",
+        "ParameterTableModel",
+        "ParameterModel",
+        "coerce_parameter_rows",
+    }:
+        from .models import (
+            ParameterRow,
+            ParameterTableModel,
+            coerce_parameter_rows,
+        )
 
         return {
             "ParameterRow": ParameterRow,
@@ -50,11 +63,18 @@ def __getattr__(name: str):
     if name in {"AnalysisWorker", "GenerationGuard"}:
         from .workers import AnalysisWorker, GenerationGuard
 
-        return {"AnalysisWorker": AnalysisWorker, "GenerationGuard": GenerationGuard}[name]
+        return {
+            "AnalysisWorker": AnalysisWorker,
+            "GenerationGuard": GenerationGuard,
+        }[name]
     if name in {"PatternView", "OverlayView", "ViewGrid"}:
         from .views import OverlayView, PatternView, ViewGrid
 
-        return {"PatternView": PatternView, "OverlayView": OverlayView, "ViewGrid": ViewGrid}[name]
+        return {
+            "PatternView": PatternView,
+            "OverlayView": OverlayView,
+            "ViewGrid": ViewGrid,
+        }[name]
     if name in {
         "MainWindow",
         "RefinementMainWindow",
@@ -64,8 +84,9 @@ def __getattr__(name: str):
         "create_app",
         "launch",
         "symmetric_ellipses",
+        "upgrade_window",
     }:
-        from .main_window import (
+        from .workbench import (
             MainWindow,
             RefinementMainWindow,
             RefinementWindow,
@@ -74,6 +95,7 @@ def __getattr__(name: str):
             create_app,
             launch,
             symmetric_ellipses,
+            upgrade_window,
         )
 
         return {
@@ -85,5 +107,6 @@ def __getattr__(name: str):
             "create_app": create_app,
             "launch": launch,
             "symmetric_ellipses": symmetric_ellipses,
+            "upgrade_window": upgrade_window,
         }[name]
     raise AttributeError(name)

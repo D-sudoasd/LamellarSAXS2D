@@ -7,7 +7,7 @@ name = "butterfly-saxs"
 version = "0.1.0"
 description = "Quantitative refinement and in-situ analysis of anisotropic lamellar 2D SAXS patterns"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = "MIT"
 license-files = ["LICENSE"]
 keywords = [
@@ -33,10 +33,11 @@ dependencies = [
   "fabio>=2024.4",
   "pyFAI>=2024.5",
   "tifffile>=2024.5",
+  "PyYAML>=6.0",
 ]
 
 [project.optional-dependencies]
-ui = ["PySide6>=6.8", "pyqtgraph>=0.13.7"]
+ui = ["PySide6>=6.8,<6.11", "pyqtgraph>=0.13.7"]
 hdf5 = ["h5py>=3.10"]
 dev = [
   "pytest>=8",
@@ -45,7 +46,7 @@ dev = [
   "build>=1.4,<2",
 ]
 all = [
-  "PySide6>=6.8",
+  "PySide6>=6.8,<6.11",
   "pyqtgraph>=0.13.7",
   "h5py>=3.10",
   "pytest>=8",
@@ -62,6 +63,8 @@ Documentation = "https://github.com/D-sudoasd/LamellarSAXS2D/tree/main/docs"
 
 [project.scripts]
 bsaxs = "butterfly_saxs.cli:main"
+bsaxs-doctor = "butterfly_saxs.doctor:main"
+bsaxs-gui = "butterfly_saxs.ui.launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
