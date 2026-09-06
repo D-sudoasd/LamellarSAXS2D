@@ -26,6 +26,44 @@ def _frame(shape: tuple[int, int] = (8, 8)) -> tuple[np.ndarray, np.ndarray, np.
     return observed, xx / 10.0, yy / 10.0
 
 
+def test_loaded_analysis_controls_match_recipe_and_preserve_other_fields_on_edit(qtbot):
+    window = MainWindow(
+        engine=_IdleEngine(),
+        auto_preview=False,
+        language="en",
+        analysis_settings={
+            "q_window": [0.1, 0.5],
+            "draw_axis_deg": 95.0,
+            "ridge_method": "butterfly_curvature",
+            "butterfly": {"stage": "trace", "resamples": 0, "sensitivity": False},
+        },
+    )
+    qtbot.addWidget(window)
+    page = window.butterfly_workbench
+    assert float(page.q_min_edit.text()) == pytest.approx(0.1)
+    assert float(page.q_max_edit.text()) == pytest.approx(0.5)
+    assert page.reference_axis_spin.value() == pytest.approx(5.0)
+
+    # Editing one visible control must not replace the other configured values.
+    page.reference_axis_spin.setValue(7.0)
+    assert window.analysis_settings["q_min"] == pytest.approx(0.1)
+    assert window.analysis_settings["q_max"] == pytest.approx(0.5)
+    assert window.analysis_settings["draw_axis_deg"] == pytest.approx(97.0)
+    assert page.butterfly_settings["sensitivity"] is False
+
+    # Programmatic changes without a butterfly recipe still synchronize controls.
+    window.set_analysis_settings({"q_window": [0.2, 0.6]}, trigger_preview=False)
+    assert float(page.q_min_edit.text()) == pytest.approx(0.2)
+    assert float(page.q_max_edit.text()) == pytest.approx(0.6)
+    assert page.reference_axis_spin.value() == pytest.approx(7.0)
+    page.q_min_edit.setText("0.25")
+    page.q_min_edit.editingFinished.emit()
+    assert window.analysis_settings["q_min"] == pytest.approx(0.25)
+    assert window.analysis_settings["q_max"] == pytest.approx(0.6)
+    assert window.analysis_settings["draw_axis_deg"] == pytest.approx(97.0)
+    window.close()
+
+
 def test_new_frame_clears_butterfly_overlay_and_selection(qtbot):
     window = MainWindow(engine=_IdleEngine(), auto_preview=False, language="en")
     qtbot.addWidget(window)

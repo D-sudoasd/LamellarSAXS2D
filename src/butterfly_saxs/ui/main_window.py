@@ -3185,6 +3185,12 @@ if QT_AVAILABLE:
             )
             self._display_percentile = float(self.display_percentile_spin.value())
             if hasattr(self, "butterfly_workbench"):
+                # General controls belong to the resolved analysis, outside the
+                # nested butterfly recipe. Keep them synchronized even when a
+                # partial update supplies no butterfly settings.
+                self.butterfly_workbench.set_analysis_settings(
+                    {key: merged.get(key) for key in ("q_min", "q_max", "draw_axis_deg")}
+                )
                 butterfly_settings = merged.get("butterfly")
                 if butterfly_supplied and isinstance(butterfly_settings, Mapping):
                     self.butterfly_workbench.set_analysis_settings(
