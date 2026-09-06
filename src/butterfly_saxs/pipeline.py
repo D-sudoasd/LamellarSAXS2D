@@ -987,6 +987,12 @@ def _analysis_options(image: np.ndarray, qmap: Any, config: Any = None) -> dict[
         "q_window": _q_window(image, qmap, canonical),
         "mask": raw.get("mask"),
         "ridge_method": method,
+        # ``butterfly`` is the canonical replay recipe.  The adapter-shaped
+        # ``butterfly_options`` value is kept separately for the observable
+        # call below and is deliberately removed at the public result seam.
+        "butterfly": canonical.get("butterfly"),
+        "butterfly_options": ({"max_nfev": canonical["max_nfev"], **(canonical.get("butterfly") or {})}
+                              if method == "butterfly_curvature" else None),
         "ridge_snr_threshold": canonical["ridge_snr_threshold"],
         "ridge_min_peak_fraction": canonical["ridge_min_peak_fraction"],
         "ridge_min_coverage": canonical["ridge_min_coverage"],
@@ -1185,7 +1191,8 @@ def measure_observables(
         n_ridge_angles=options["n_angles"],
         n_radial_bins=options["n_radial_bins"],
         fit_ellipse=bool(fit_ellipse),
-        mask=~domain.fit_valid_mask,
+        mask=~(domain.non_window_valid_mask if options["ridge_method"] == "butterfly_curvature"
+               else domain.fit_valid_mask),
         ridge_method=options["ridge_method"],
         ridge_snr_threshold=options["ridge_snr_threshold"],
         ridge_min_peak_fraction=options["ridge_min_peak_fraction"],
@@ -1195,6 +1202,7 @@ def measure_observables(
         curvature_percentile=options["curvature_percentile"],
         curvature_normal_step=options["curvature_normal_step"],
         p4_quality_thresholds=_config_value(config, "p4_quality_thresholds", None),
+        butterfly_options=options.get("butterfly_options"),
         ellipse_parameters=ellipse_parameters,
         ellipse_residual=options["ellipse_residual"],
         ellipse_multistart=options["ellipse_multistart"],
@@ -1228,6 +1236,10 @@ def extract_ridges(
     options = _analysis_options(image, qmap, config)
     domain = analysis_domain or _analysis_domain(image, qmap, config=config)
     frame = _loaded_frame(image)
+    if options["ridge_method"] == "butterfly_curvature":
+        bundle = measure_observables(image, qmap, config=config, frame=frame,
+                                     fit_ellipse=False, analysis_domain=domain)
+        return _ridges_from_observable_bundle(bundle) or []
     track = _call_supported(
         observable_module.measure_radial_ridges,
         frame,
@@ -1267,7 +1279,7 @@ def extract_ridges(
         point = {str(key): _jsonable(value, array_summary=False) for key, value in point.items()}
         # Invalid sectors are retained as records for coverage diagnostics but
         # do not contribute artificial (0, 0) coordinates to the ellipse fit.
-        if point.get("valid") is False:
+        if point.get("valid") is False and not point.get("point_id"):
             point.pop("qx", None)
             point.pop("qy", None)
             point.pop("q", None)
@@ -1354,7 +1366,7 @@ def _ridges_from_observable_bundle(observables: Any) -> list[dict[str, Any]] | N
             point.setdefault("symmetry_flags", [])
         except (TypeError, ValueError, OverflowError):
             pass
-        if point.get("valid") is False:
+        if point.get("valid") is False and not point.get("point_id"):
             point.pop("qx", None)
             point.pop("qy", None)
             point.pop("q", None)
@@ -1798,6 +1810,10 @@ class PipelineResult:
         return self.ellipse_fit
 
     @property
+    def butterfly(self) -> dict[str, Any] | None:
+        return self.observables.get("butterfly")
+
+    @property
     def parameters(self) -> Any:
         """Preferred longitudinal parameter source for batch exporters."""
 
@@ -1832,6 +1848,7 @@ class PipelineResult:
             "observables": self.observables,
             "ridges": self.ridges,
             "ellipse_fit": self.ellipse_fit,
+            "butterfly": self.butterfly,
             # Batch/checkpoint consumers resume from this stable top-level
             # parameter source rather than knowing which fit stage produced it.
             "parameters": self.parameters,
@@ -2124,6 +2141,9 @@ def analyze_frame(
     )
     if isinstance(full2d_result, Mapping) and full2d_result.get("sampled_indices") is not None:
         domain = domain.with_sampled_indices(full2d_result["sampled_indices"])
+    public_analysis = {
+        key: value for key, value in options.items() if key != "butterfly_options"
+    }
     result = PipelineResult(
         image=image,
         qmap=qmap_obj,
@@ -2142,7 +2162,7 @@ def analyze_frame(
         valid_mask=domain.fit_valid_mask,
         analysis_domain=domain,
         analysis={
-            **options,
+            **public_analysis,
             "q_window": list(domain.q_window),
         },
     )
@@ -2339,6 +2359,15 @@ def export_result(
             )
             np.savez_compressed(path, **arrays)
         elif path.suffix.lower() == ".csv":
+            if result.butterfly is not None:
+                from .export import _parameters, _write_csv
+
+                _write_csv(path, _parameters(result), columns=(
+                    "parameter", "value", "candidate_value", "identifiability_status",
+                    "identifiability_reason", "unit", "interval_low", "interval_high", "interval_kind",
+                ))
+                written.append(path)
+                continue
             with path.open("w", newline="", encoding="utf-8") as handle:
                 writer = csv.writer(handle)
                 writer.writerow(("parameter", "value"))

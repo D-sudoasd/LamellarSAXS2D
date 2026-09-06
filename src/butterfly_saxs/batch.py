@@ -27,6 +27,7 @@ from typing import Any, Callable, Literal
 from .cancellation import AnalysisCancelled
 from .settings import strict_int
 from .path_utils import IMAGE_SUFFIXES, filter_supported_image_paths
+from .serialization import json_safe as _canonical_json_safe
 
 
 _NATURAL_PART = re.compile(r"(\d+)")
@@ -52,61 +53,7 @@ _IMAGE_SUFFIXES = IMAGE_SUFFIXES
 
 def _json_safe(value: Any) -> Any:
     """Return a JSON-compatible copy without losing nested scientific flags."""
-
-    if value is None or isinstance(value, (str, bool, int)):
-        return value
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, Path):
-        return str(value)
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set, frozenset)):
-        return [_json_safe(item) for item in value]
-    if is_dataclass(value):
-        return {
-            item.name: _json_safe(getattr(value, item.name))
-            for item in fields(value)
-        }
-    # numpy is an optional import for the batch layer.  Duck typing keeps the
-    # module useful in lightweight CLI environments and for test doubles.
-    tolist = getattr(value, "tolist", None)
-    if callable(tolist):
-        try:
-            return _json_safe(tolist())
-        except Exception:  # pragma: no cover - defensive for unusual arrays
-            pass
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return _json_safe(item())
-        except Exception:  # pragma: no cover
-            pass
-    for method_name in ("to_dict", "as_dict", "to_mapping"):
-        method = getattr(value, method_name, None)
-        if callable(method):
-            try:
-                try:
-                    converted = method(include_specs=True)
-                except TypeError:
-                    converted = method()
-            except TypeError:
-                try:
-                    converted = method(resolved=False)
-                except Exception:  # pragma: no cover
-                    continue
-            except Exception:  # pragma: no cover
-                continue
-            if converted is not value:
-                return _json_safe(converted)
-    if hasattr(value, "__dict__"):
-        try:
-            return _json_safe(
-                {key: item for key, item in vars(value).items() if not key.startswith("_")}
-            )
-        except Exception:  # pragma: no cover
-            pass
-    return repr(value)
+    return _canonical_json_safe(value)
 
 
 def _named_value(value: Any, name: str) -> Any:
@@ -1125,11 +1072,116 @@ def _nested_quality_failure(name: str, result: Any) -> str | None:
     return None
 
 
+_BUTTERFLY_WARM_PARAMETER_NAMES = ("a", "b", "axis_ratio", "theta_deg")
+
+
+def _butterfly_payload(result: Any) -> Any:
+    """Return a new-method payload from either wrapped or root result shapes."""
+
+    explicit_nested: list[Any] = []
+    nested = _named_value(result, "butterfly")
+    if nested is not _MISSING and nested is not None:
+        explicit_nested.append(nested)
+    observables = _named_value(result, "observables")
+    nested = _named_value(observables, "butterfly")
+    if nested is not _MISSING and nested is not None:
+        explicit_nested.append(nested)
+    # A public ``butterfly`` field is itself the new-method discriminator,
+    # even when a lightweight adapter omits method/settings metadata.
+    for candidate in explicit_nested:
+        if isinstance(candidate, Mapping) or hasattr(candidate, "__dict__"):
+            return candidate
+    candidates = [result]
+    seen: set[int] = set()
+    for candidate in candidates:
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        settings = _named_value(candidate, "settings")
+        stage = _named_value(settings, "stage")
+        method_version = _named_value(candidate, "method_version")
+        points = _named_value(candidate, "points")
+        candidate_fit = _named_value(candidate, "candidate_fit")
+        if (
+            isinstance(stage, str)
+            and stage.strip().casefold() in {"trace", "evaluate"}
+        ) or (
+            isinstance(method_version, str)
+            and method_version.startswith("butterfly-")
+        ) or (
+            isinstance(points, (list, tuple))
+            and candidate_fit is not _MISSING
+        ):
+            return candidate
+    return None
+
+
+def _numeric_butterfly_seed(payload: Any) -> dict[str, float] | None:
+    """Validate the explicit geometry candidate used by a new-method seed."""
+
+    if _named_value(payload, "warm_start_eligible") is not True:
+        return None
+    candidate = _named_value(payload, "candidate_fit")
+    if candidate is _MISSING or candidate is None:
+        candidate = payload
+    parameters = _named_value(candidate, "parameters")
+    if parameters is _MISSING or not isinstance(parameters, Mapping):
+        parameters = _named_value(candidate, "parameter_values")
+    if not isinstance(parameters, Mapping) and isinstance(candidate, Mapping):
+        # Lightweight adapters may expose the public candidate fields directly
+        # instead of repeating a nested ``parameters`` mapping.
+        parameters = candidate
+    if not isinstance(parameters, Mapping):
+        return None
+    seed: dict[str, float] = {}
+    for name in _BUTTERFLY_WARM_PARAMETER_NAMES:
+        value = parameters.get(name, _MISSING)
+        if value is _MISSING or isinstance(value, bool):
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(numeric):
+            return None
+        seed[name] = numeric
+    for name in ("center_qx", "center_qy"):
+        value = parameters.get(name, _MISSING)
+        if value is _MISSING or isinstance(value, bool):
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(numeric):
+            seed[name] = numeric
+    return seed
+
+
 def _quality_failure_reason(result: Any) -> str | None:
     """Return an explicit result failure, without inventing numeric cutoffs."""
 
     if result is None:
         return "result=None"
+    butterfly = _butterfly_payload(result)
+    if butterfly is None:
+        butterfly = _named_value(result, "butterfly")
+    recipe = _named_value(butterfly, "settings")
+    if _named_value(recipe, "stage") == "trace":
+        points = _named_value(butterfly, "points")
+        if isinstance(points, (list, tuple)) and any(
+            _named_value(point, "accepted") is True for point in points
+        ):
+            # An explicitly requested trace has no ellipse optimizer result.
+            # It is usable for correction, never as a quantitative warm start.
+            return None
+        return "butterfly.trace has no supported observed points"
+    if butterfly is not None:
+        candidate_failure = _nested_quality_failure(
+            "butterfly.candidate_fit", _named_value(butterfly, "candidate_fit")
+        )
+        if candidate_failure is not None:
+            return candidate_failure
     success = _named_value(result, "success")
     if _is_explicit_false(success):
         return "success=False"
@@ -1153,6 +1205,16 @@ def _quality_failure_reason(result: Any) -> str | None:
 def _warm_start_seed(result: Any) -> Any:
     """Extract the parameter state expected by an analyzer when available."""
 
+    butterfly = _butterfly_payload(result)
+    if butterfly is not None:
+        # New butterfly results are correction/evidence envelopes.  They may
+        # seed a later frame only when the payload explicitly certifies the
+        # candidate and all required geometry values are finite numbers.
+        return _numeric_butterfly_seed(butterfly)
+
+    ellipse = _named_value(result, "ellipse_fit")
+    if _named_value(ellipse, "warm_start_eligible") is False:
+        return None
     for name in ("parameters", "params"):
         parameters = _named_value(result, name)
         if parameters is not _MISSING and parameters is not None:
@@ -1682,7 +1744,7 @@ def run_batch(
                 run.frame_results.append(item)
                 if mode == "warm_start":
                     previous_result = _warm_start_seed(item.result)
-                    previous_frame_key = frame.key
+                    previous_frame_key = frame.key if previous_result is not None else None
                 publish(item)
                 emit_progress(len(run.frame_results) - 1, item)
                 continue
@@ -1725,7 +1787,7 @@ def run_batch(
             )
             if mode == "warm_start" and quality_error is None:
                 previous_result = _warm_start_seed(result)
-                previous_frame_key = frame.key
+                previous_frame_key = frame.key if previous_result is not None else None
         run.frame_results.append(item)
         publish(item)
         run.processed_count = len(run.frame_results)

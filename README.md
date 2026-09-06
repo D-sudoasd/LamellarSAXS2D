@@ -14,6 +14,8 @@ The screenshot uses synthetic data and demonstrates the observed, model, residua
 
 ## Features
 
+- Observed butterfly arc workflow (`butterfly_curvature`) with separately identified ellipse sides, restricted arc projection and parameter-level evidence. See the [butterfly arc guide](docs/butterfly_arcs_zh.md). Older projects retain their saved ridge method.
+
 - CBF, EDF, TIF/TIFF, NPY, NPZ, HDF5, CSV, and TXT input, including explicit frame/dataset selection.
 - PONI-calibrated reciprocal-space maps and explicit masks or exclusion regions.
 - Read-only package preflight for manifests, geometry, masks, units, correction state, uncertainty state, and SHA-256 evidence.

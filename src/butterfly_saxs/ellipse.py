@@ -107,14 +107,45 @@ class CoverageMetrics:
     radial_rms: float
     convex_hull_area: float
     components: int = 1
+    # ``angular_span`` is the extent of the smallest circular interval that
+    # contains every assigned point.  It is intentionally retained because it
+    # is useful for describing the envelope of a track, but it can be very
+    # misleading for disconnected arcs (two short opposite arcs have a span
+    # close to pi).  The fields below describe the locally connected support
+    # used by ``angular_coverage``.  They have defaults so older callers that
+    # construct ``CoverageMetrics`` positionally remain compatible.
+    observed_angular_length: float = 0.0
+    support_components: int = 0
+    branch_coverage: tuple[float, ...] = ()
+    branch_spans: tuple[float, ...] = ()
+    support_intervals: tuple[tuple[float, float], ...] = ()
+    # Older external ``CoverageMetrics(...)`` constructions retain the legacy
+    # span interpretation through these defaults.  Canonical fits below set
+    # the explicit connected-support definition and version.
+    definition: str = "legacy_span"
+    version: str = "legacy_span_v0"
+    radial_rms_definition: str = "fit_residual_units"
+    radial_rms_units: str = "unknown"
 
-    def __getitem__(self, key: str) -> float | int:
+    def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
 
-    def as_dict(self) -> dict[str, float | int]:
+    @property
+    def angular_support(self) -> float:
+        """Alias for the connected observed angular length."""
+
+        return self.observed_angular_length
+
+    @property
+    def support_length(self) -> float:
+        """Compatibility alias for callers using a length-oriented name."""
+
+        return self.observed_angular_length
+
+    def as_dict(self) -> dict[str, Any]:
         return {
             "n_points": self.n_points,
             "angular_span": self.angular_span,
@@ -122,6 +153,16 @@ class CoverageMetrics:
             "radial_rms": self.radial_rms,
             "convex_hull_area": self.convex_hull_area,
             "components": self.components,
+            "observed_angular_length": self.observed_angular_length,
+            "angular_support": self.observed_angular_length,
+            "support_components": self.support_components,
+            "branch_coverage": self.branch_coverage,
+            "branch_spans": self.branch_spans,
+            "support_intervals": self.support_intervals,
+            "definition": self.definition,
+            "version": self.version,
+            "radial_rms_definition": self.radial_rms_definition,
+            "radial_rms_units": self.radial_rms_units,
         }
 
 
@@ -751,9 +792,67 @@ def _residual_function(kind: str) -> Callable[..., np.ndarray]:
     raise ValueError("residual must be 'sampson' or 'geometric'")
 
 
+def _connected_angular_support(angles: np.ndarray) -> tuple[
+    float, float, tuple[tuple[float, float], ...]
+]:
+    """Return circular span and conservative locally connected support.
+
+    The former coverage diagnostic used only ``2*pi - largest_gap``.  That is
+    an envelope (span), not the amount of observed track: two narrow arcs on
+    opposite sides of an ellipse can therefore look like half a revolution.
+    A local spacing scale connects only neighbouring samples and sums the
+    resulting intervals.  The threshold is capped at a quadrant so a pair of
+    isolated points cannot create a full-circle support estimate.
+    """
+
+    values = np.asarray(angles, dtype=float).ravel()
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return 0.0, 0.0, ()
+    sorted_angles = np.sort(np.mod(values, 2 * math.pi))
+    if sorted_angles.size == 1:
+        return 0.0, 0.0, ()
+    gaps = np.diff(np.concatenate((sorted_angles, sorted_angles[:1] + 2 * math.pi)))
+    span = 2 * math.pi - float(np.max(gaps))
+    if sorted_angles.size == 2:
+        # There is no measured interval with only one point in each end of an
+        # arc.  The envelope remains meaningful, while support is zero unless
+        # more points establish a connected local interval.
+        threshold = math.pi / 2.0
+    else:
+        local_spacing = np.minimum(gaps, np.roll(gaps, 1))
+        typical = float(np.median(local_spacing[np.isfinite(local_spacing)]))
+        if not np.isfinite(typical) or typical <= 0.0:
+            typical = float(np.min(gaps))
+        threshold = min(math.pi / 2.0, max(4.0 * typical, 1.0e-12))
+    connected = gaps <= threshold * (1.0 + 1.0e-12)
+    if bool(np.all(connected)):
+        return float(span), 2 * math.pi, ((0.0, 2 * math.pi),)
+
+    # Rotate after the first disconnected gap.  This lets an arc crossing the
+    # 0/2*pi seam remain a single interval in the diagnostic representation.
+    breaks = np.flatnonzero(~connected)
+    start_index = int((breaks[0] + 1) % sorted_angles.size)
+    ordered = np.concatenate(
+        (sorted_angles[start_index:], sorted_angles[:start_index] + 2 * math.pi)
+    )
+    ordered_gaps = np.diff(ordered)
+    intervals: list[tuple[float, float]] = []
+    run_start = 0
+    for index, gap in enumerate(ordered_gaps):
+        if gap > threshold * (1.0 + 1.0e-12):
+            intervals.append((float(ordered[run_start]), float(ordered[index])))
+            run_start = index + 1
+    intervals.append((float(ordered[run_start]), float(ordered[-1])))
+    support = float(sum(max(0.0, end - begin) for begin, end in intervals))
+    return float(span), support, tuple(intervals)
+
+
 def _coverage(points: np.ndarray, residuals: np.ndarray, parameters: ParameterSet,
               *, components: int = 1, labels: np.ndarray | None = None,
-              reference_axis: float = 0.0) -> CoverageMetrics:
+              reference_axis: float = 0.0,
+              radial_rms_definition: str = "fit_residual_units",
+              radial_rms_units: str = "unknown") -> CoverageMetrics:
     values = parameters.resolve()
     geometry = EllipseGeometry.from_values(values)
     dx, dy = points[:, 0] - geometry.cx, points[:, 1] - geometry.cy
@@ -773,29 +872,52 @@ def _coverage(points: np.ndarray, residuals: np.ndarray, parameters: ParameterSe
             geometry.cx, geometry.cy, geometry.a, geometry.axis_ratio,
             float(reference_axis) - geometry.theta,
         )
-        r_plus = ellipse_sampson_residuals(points, plus_geometry)
-        r_minus = ellipse_sampson_residuals(points, minus_geometry)
-        selected = np.abs(r_plus) <= np.abs(r_minus) if labels is None else labels == 0
+        if points.shape[0] == 0:
+            selected = np.empty((0,), dtype=bool)
+        else:
+            r_plus = ellipse_sampson_residuals(points, plus_geometry)
+            r_minus = ellipse_sampson_residuals(points, minus_geometry)
+            selected = np.abs(r_plus) <= np.abs(r_minus) if labels is None else labels == 0
         for sign, selected_mask in ((1.0, selected), (-1.0, ~selected)):
+            g = EllipseGeometry(
+                geometry.cx,
+                geometry.cy,
+                geometry.a,
+                geometry.axis_ratio,
+                float(reference_axis) + sign * geometry.theta,
+            )
             if np.any(selected_mask):
-                g = EllipseGeometry(
-                    geometry.cx,
-                    geometry.cy,
-                    geometry.a,
-                    geometry.axis_ratio,
-                    float(reference_axis) + sign * geometry.theta,
-                )
                 ddx, ddy = points[selected_mask, 0] - g.cx, points[selected_mask, 1] - g.cy
                 cc, ss = math.cos(g.theta), math.sin(g.theta)
                 uu, vv = cc * ddx + ss * ddy, -ss * ddx + cc * ddy
                 angles.append(np.arctan2(vv / g.b, uu / g.a))
+            else:
+                angles.append(np.empty(0, dtype=float))
+    branch_support: list[tuple[float, float, tuple[tuple[float, float], ...]]] = [
+        _connected_angular_support(item) for item in angles
+    ]
     if angles:
         angle_array = np.concatenate(angles)
-        sorted_angles = np.sort(np.mod(angle_array, 2 * math.pi))
-        gaps = np.diff(np.concatenate((sorted_angles, sorted_angles[:1] + 2 * math.pi)))
-        span = 2 * math.pi - float(np.max(gaps)) if gaps.size else 0.0
+        span, _, _ = _connected_angular_support(angle_array)
     else:
         span = 0.0
+    observed_length = float(sum(item[1] for item in branch_support))
+    branch_coverage = tuple(
+        float(np.clip(item[1] / (2 * math.pi), 0.0, 1.0)) for item in branch_support
+    )
+    branch_spans = tuple(float(item[0]) for item in branch_support)
+    support_intervals = tuple(
+        interval for _, _, intervals in branch_support for interval in intervals
+    )
+    # A pair must be supported on each assigned branch.  The union of
+    # complementary half-arcs can cover the full circle even when neither
+    # branch individually supports more than half of it, so the public scalar
+    # deliberately uses the weakest branch.  ``observed_angular_length`` and
+    # ``branch_coverage`` retain the additive and per-branch views.
+    angular_coverage = (
+        float(min(branch_coverage)) if components > 1 and branch_coverage else
+        float(branch_coverage[0]) if branch_coverage else 0.0
+    )
     if points.shape[0] >= 3:
         try:
             area = float(ConvexHull(points).volume)
@@ -806,10 +928,19 @@ def _coverage(points: np.ndarray, residuals: np.ndarray, parameters: ParameterSe
     return CoverageMetrics(
         n_points=int(points.shape[0]),
         angular_span=float(span),
-        angular_coverage=float(np.clip(span / (2 * math.pi), 0.0, 1.0)),
+        angular_coverage=angular_coverage,
         radial_rms=float(np.sqrt(np.mean(np.square(residuals)))) if residuals.size else float("nan"),
         convex_hull_area=area,
         components=components,
+        observed_angular_length=observed_length,
+        support_components=int(sum(len(item[2]) for item in branch_support)),
+        branch_coverage=branch_coverage,
+        branch_spans=branch_spans,
+        support_intervals=support_intervals,
+        definition="connected_arc_support_v1",
+        version="connected_arc_support_v1",
+        radial_rms_definition=str(radial_rms_definition),
+        radial_rms_units=str(radial_rms_units),
     )
 
 

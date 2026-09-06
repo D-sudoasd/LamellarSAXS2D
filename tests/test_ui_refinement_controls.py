@@ -100,6 +100,7 @@ def test_flat_controls_round_trip_and_fit_tabs_are_compact(qtbot) -> None:
     qtbot.addWidget(window)
     window.resize(1280, 800)
     window.show()
+    window.pages.setCurrentWidget(window.refinement_page)
     qtbot.wait(50)
 
     assert isinstance(window.parameters_dock.widget(), QtWidgets.QScrollArea)
@@ -337,8 +338,9 @@ def test_busy_state_tracks_all_live_workers_and_cancel_event(qtbot) -> None:
 def test_chinese_locale_retranslates_public_tabs_controls_and_geometry_hint(qtbot) -> None:
     window = MainWindow(engine=_Engine(), auto_preview=False, language="zh_CN")
     qtbot.addWidget(window)
-    assert window.pages.tabText(0) == "精修"
-    assert window.pages.tabText(1) == "测量 / 剖面"
+    assert window.pages.tabText(0) == "蝴蝶分析"
+    assert window.pages.tabText(window.pages.indexOf(window.refinement_page)) == "高级强度"
+    assert window.pages.tabText(window.pages.indexOf(window.measurements_page)) == "测量 / 剖面"
     assert window.parameters_dock.windowTitle() == "参数"
     assert window.preview_button.text() == "预览"
     assert window.analysis_group.title() == "分析 / 测量"
@@ -350,7 +352,8 @@ def test_chinese_locale_retranslates_public_tabs_controls_and_geometry_hint(qtbo
     assert "快照" in window.snapshot_note_edit.accessibleName()
     assert window.cancel_button.shortcut().toString() == "Esc"
     window.set_language("en", persist=False)
-    assert window.pages.tabText(0) == "Refinement"
+    assert window.pages.tabText(0) == "Butterfly analysis"
+    assert window.pages.tabText(window.pages.indexOf(window.refinement_page)) == "Advanced intensity"
     assert window.parameters_dock.windowTitle() == "Parameters"
     assert window.preview_button.text() == "Preview"
     assert window.analysis_group.title() == "Analysis / Measurement"

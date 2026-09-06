@@ -111,7 +111,11 @@ def test_observable_ellipse_adapter_exposes_canonical_diagnostics_and_units():
     assert result.ellipticity == pytest.approx(result.eccentricity)
     assert result.covariance is not None
     assert np.isfinite(result.condition_number)
-    assert result.coverage.angular_coverage > 0.8
+    # Each ellipse contributes one observed half. Complementary support from
+    # the other branch must not make either ellipse appear fully observed.
+    assert result.coverage.definition == "connected_arc_support_v1"
+    assert result.coverage.angular_coverage == pytest.approx(0.5, abs=0.03)
+    assert len(result.coverage.branch_coverage) == 2
     assert set(("cx", "cy", "a", "axis_ratio", "theta")).issubset(result.bound_flags)
     assert "theta_deg" in result.stderr
     assert result.branch_counts == (48, 48)

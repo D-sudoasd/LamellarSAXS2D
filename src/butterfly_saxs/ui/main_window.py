@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from datetime import datetime, timezone
+import hashlib
 import inspect
 import json
 import math
@@ -25,6 +26,7 @@ from .i18n import DEFAULT_LANGUAGE, LANGUAGE_SETTING_KEY, translate, validate_la
 from .models import ParameterRow, ParameterTableModel
 from .project_document import ProjectDocumentController
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
+from .butterfly_workbench import ButterflyWorkbench
 from .views import PLOT_AVAILABLE, ViewGrid, _disable_auto_si_prefix
 from .workers import AnalysisWorker, GenerationGuard
 from ..service import DEFAULT_ANALYSIS_SETTINGS
@@ -336,6 +338,17 @@ def model_ellipse_pair(parameters: Mapping[str, Any], *, reference_axis_deg: flo
 def _result_has_failure(result: Any) -> bool:
     """Return whether a result carries an explicit failure condition."""
 
+    if _is_butterfly_trace_result(result):
+        # Trace deliberately has no fitted ellipse/uncertainty candidate yet;
+        # its ``not_fitted``/quality fields are NOT_EVALUATED state, not a job
+        # failure.  Preserve explicit transport/input failures below.
+        flags = _read(_read(result, ("metrics", "statistics", "summary"), {}), ("flags", "flag"), _read(result, ("flags", "flag"), []))
+        flags = [flags] if isinstance(flags, str) else list(flags or ())
+        return any(
+            any(token in str(flag).lower() for token in ("no_engine", "exception", "input_failed", "observables_failed"))
+            for flag in flags
+        )
+
     try:
         # Batch and interactive review must agree on explicit failure signals
         # (including success=False, nested full2d/ellipse failures, and empty
@@ -411,6 +424,61 @@ def _sequence(value: Any) -> list[Any]:
         return [value]
 
 
+def _ensure_ui_font() -> Any:
+    """Register a Windows CJK font for offscreen/portable Qt runtimes.
+
+    Some Qt deployments do not expose the host font database to the offscreen
+    platform plugin.  Registering an installed system font keeps Chinese UI
+    labels readable in both QA screenshots and the desktop launcher without
+    shipping a font file in the repository.
+    """
+
+    if not QT_AVAILABLE:
+        return None
+    try:
+        families = set(QtGui.QFontDatabase.families())
+    except Exception:
+        families = set()
+    preferred = ("Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", "SimHei")
+    for family in preferred:
+        if family in families:
+            return family
+    candidates = (
+        Path("C:/Windows/Fonts/msyh.ttc"),
+        Path("C:/Windows/Fonts/NotoSansSC-VF.ttf"),
+        Path("C:/Windows/Fonts/simhei.ttf"),
+    )
+
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            font_id = QtGui.QFontDatabase.addApplicationFont(str(candidate))
+            if font_id >= 0:
+                registered = QtGui.QFontDatabase.applicationFontFamilies(font_id)
+                if registered:
+                    return str(registered[0])
+        except Exception:
+            continue
+    return None
+
+
+def _is_butterfly_trace_result(result: Any) -> bool:
+    """Recognize successful arc tracing before ellipse evaluation."""
+
+    analysis = _read(result, ("analysis",), {})
+    butterfly = _read(result, ("butterfly",), None)
+    if not isinstance(butterfly, Mapping):
+        observables = _read(result, ("observables", "measurements"), None)
+        butterfly = _read(observables, ("butterfly",), None)
+    settings = _read(butterfly, ("settings",), {})
+    nested = _read(analysis, ("butterfly",), {})
+    stage = _read(settings, ("stage",), _read(nested, ("stage",), None))
+    method = str(_read(analysis, ("ridge_method",), "") or "").strip().lower().replace("-", "_")
+    points = _read(butterfly, ("points",), None)
+    return method == "butterfly_curvature" and str(stage or "").lower() == "trace" and isinstance(points, list)
+
+
 if QT_AVAILABLE:
 
     class CompactDoubleSpinBox(QtWidgets.QDoubleSpinBox):
@@ -454,6 +522,9 @@ if QT_AVAILABLE:
             settings: Any = None,
         ) -> None:
             super().__init__(parent)
+            ui_font_family = _ensure_ui_font()
+            if ui_font_family:
+                self.setFont(QtGui.QFont(ui_font_family, 10))
             self._settings = (
                 settings
                 if settings is not None
@@ -545,11 +616,16 @@ if QT_AVAILABLE:
             self.evolution_y_key = "rmse"
             self.batch_frames: list[Any] = []
             self._batch_cancel_event: Any = None
+            self._busy_focus_widget: Any = None
             self._fit_session: dict[str, Any] = _new_fit_session()
             # Project loading and programmatic restoration update several
             # widgets in sequence.  The flag keeps those internal updates
             # from being interpreted as a new manual review action.
             self._fit_session_restore_active = False
+            # A blank window presents the butterfly page as the new workflow;
+            # legacy-method warnings are reserved for an explicitly supplied
+            # analysis/project configuration.
+            self._blank_butterfly_workflow = analysis_settings is None
 
             source_parameters = parameters
             if source_parameters is None:
@@ -565,10 +641,13 @@ if QT_AVAILABLE:
             self._build_actions()
             self._build_central_pages()
             self._build_parameter_dock()
+            self.pages.currentChanged.connect(self._on_main_page_changed)
+            self._on_main_page_changed(self.pages.currentIndex())
             self._build_batch_page()
             self._build_evolution_page()
             self._build_status_bar()
-            self.set_analysis_settings(analysis_settings or self._analysis_settings, trigger_preview=False)
+            initial_analysis = dict(analysis_settings or self._analysis_settings)
+            self.set_analysis_settings(initial_analysis, trigger_preview=False)
 
             self._debounce_timer = QtCore.QTimer(self)
             self._debounce_timer.setSingleShot(True)
@@ -585,6 +664,17 @@ if QT_AVAILABLE:
             )
             self._retranslate_ui()
             self._set_status("status.ready")
+
+        def _on_main_page_changed(self, index: int) -> None:
+            """Give the butterfly page the full central window while active."""
+
+            if not hasattr(self, "parameters_dock"):
+                return
+            page = self.pages.widget(int(index))
+            if page is getattr(self, "butterfly_page", None):
+                self.parameters_dock.hide()
+            else:
+                self.parameters_dock.show()
 
         # ----- UI construction -------------------------------------------------
 
@@ -658,15 +748,191 @@ if QT_AVAILABLE:
         def _build_central_pages(self) -> None:
             self.pages = QtWidgets.QTabWidget(self)
             self.pages.setObjectName("mainPages")
+            # The butterfly workflow is the default first page.  It delegates
+            # computation to this window's existing GenerationGuard/worker
+            # seam, so the established refinement API remains the authority
+            # for Preview/Optimize/batch jobs.
+            self.butterfly_page = QtWidgets.QWidget(self.pages)
+            butterfly_layout = QtWidgets.QVBoxLayout(self.butterfly_page)
+            butterfly_layout.setContentsMargins(0, 0, 0, 0)
+            self.butterfly_workbench = ButterflyWorkbench(
+                self.butterfly_page,
+                language=self._language,
+            )
+            butterfly_layout.addWidget(self.butterfly_workbench, 1)
+            self.butterfly_workbench.identifyRequested.connect(self._on_butterfly_identify)
+            self.butterfly_workbench.evaluateRequested.connect(self._on_butterfly_evaluate)
+            self.butterfly_workbench.editChanged.connect(self._on_butterfly_edit_changed)
+            self.butterfly_workbench.displayChanged.connect(self._on_butterfly_display_changed)
+            self.butterfly_workbench.analysisChanged.connect(self._on_butterfly_analysis_changed)
+            self.butterfly_workbench.exportRequested.connect(self._on_butterfly_export_requested)
+            self.butterfly_workbench.applyToBatchRequested.connect(self._on_butterfly_apply_batch)
+            self.butterfly_workbench.cancelRequested.connect(self.cancel_jobs)
+            self.butterfly_workbench.frameSelected.connect(self._on_butterfly_frame_selected)
+            self.pages.addTab(self.butterfly_page, "蝴蝶分析 / Butterfly analysis")
             self.refinement_page = QtWidgets.QWidget(self.pages)
             refinement_layout = QtWidgets.QVBoxLayout(self.refinement_page)
             refinement_layout.setContentsMargins(4, 4, 4, 4)
             self.views = ViewGrid(self.refinement_page, language=self._language)
             self.views.setObjectName("viewGrid")
             refinement_layout.addWidget(self.views, 1)
-            self.pages.addTab(self.refinement_page, "Refinement")
+            self.pages.addTab(self.refinement_page, "Advanced intensity / Refinement")
             self._build_measurements_page()
             self.setCentralWidget(self.pages)
+
+        def _on_butterfly_identify(self, settings: Any) -> None:
+            """Commit trace settings, then reuse the existing geometry worker."""
+
+            self.set_analysis_settings(
+                {"ridge_method": "butterfly_curvature", "butterfly": settings},
+                trigger_preview=False,
+            )
+            self.request_geometry_measure()
+
+        def _on_butterfly_evaluate(self, settings: Any) -> None:
+            """Commit evaluate settings, then reuse the existing refine worker."""
+
+            self.set_analysis_settings(
+                {"ridge_method": "butterfly_curvature", "butterfly": settings},
+                trigger_preview=False,
+            )
+            self.request_geometry_refine()
+
+        def _on_butterfly_edit_changed(self, settings: Any) -> None:
+            # Edits change request identity immediately and invalidate the
+            # displayed derived result.  A late worker result is harmless via
+            # the same GenerationGuard used by the legacy workbench.
+            self._invalidate_pending_work(clear_fit=True)
+            if isinstance(settings, Mapping):
+                self._analysis_settings["butterfly"] = deepcopy(dict(settings))
+            self._mark_manual_unreviewed()
+
+        def _on_butterfly_display_changed(self, scale: str, percentile: float) -> None:
+            """Update display contrast only; this never starts an analysis job."""
+
+            self._display_scale = str(scale or "linear")
+            self._display_percentile = float(percentile)
+            self.display_scale_combo.blockSignals(True)
+            self.display_percentile_spin.blockSignals(True)
+            try:
+                index = self.display_scale_combo.findData(self._display_scale)
+                self.display_scale_combo.setCurrentIndex(max(0, index))
+                self.display_percentile_spin.setValue(self._display_percentile)
+            finally:
+                self.display_scale_combo.blockSignals(False)
+                self.display_percentile_spin.blockSignals(False)
+            self.views.set_display_settings(self._display_scale, self._display_percentile)
+
+        def _on_butterfly_analysis_changed(self, settings: Any) -> None:
+            if isinstance(settings, Mapping):
+                payload = dict(settings)
+                payload["butterfly"] = self.butterfly_workbench.butterfly_settings
+                self.set_analysis_settings(payload, trigger_preview=False)
+
+        @staticmethod
+        def _export_array_summary(value: Any, *, polarity: str) -> dict[str, Any] | None:
+            if _np is None or value is None:
+                return None
+            try:
+                array = _np.asarray(value)
+                raw = _np.ascontiguousarray(array)
+                bool_array = _np.asarray(array, dtype=bool)
+                return {
+                    "shape": [int(item) for item in array.shape],
+                    "dtype": str(array.dtype),
+                    "count": int(array.size),
+                    "true_count": int(bool_array.sum()),
+                    "false_count": int(bool_array.size - bool_array.sum()),
+                    "polarity": polarity,
+                    "sha256": hashlib.sha256(raw.tobytes()).hexdigest(),
+                }
+            except (TypeError, ValueError):
+                return None
+
+        def _butterfly_export_context(self) -> dict[str, Any]:
+            result = self._last_result if isinstance(self._last_result, Mapping) else {}
+            valid_mask = _result_value(
+                result,
+                ("valid_mask",),
+                _read(self._qmap, ("valid_mask", "valid"), None),
+            )
+            external_mask = _result_value(
+                result,
+                ("external_mask",),
+                self._external_mask,
+            )
+            result_mask = _result_value(result, ("mask",), None)
+            return {
+                "source": self._source_path,
+                "frame": self._frame,
+                "dataset": self._dataset,
+                "poni": self._poni_path,
+                "mask": self._mask_path,
+                "mask_frame": self._mask_frame,
+                "mask_dataset": self._mask_dataset,
+                "input_records": deepcopy(self._loaded_input_records),
+                "rois": deepcopy(self._roi_specs),
+                "valid_domain": self._export_array_summary(valid_mask, polarity="true=valid"),
+                "external_mask": self._export_array_summary(external_mask, polarity="true=excluded"),
+                "result_mask": self._export_array_summary(result_mask, polarity="true=excluded"),
+                "analysis": deepcopy(self.analysis_settings),
+                "display": deepcopy(self.display_settings),
+                "q_unit": self._active_q_unit(),
+            }
+
+        @staticmethod
+        def _butterfly_export_target(parent: str | Path) -> Path:
+            """Choose a clearly named, non-existing child bundle directory."""
+
+            root = Path(parent).expanduser().resolve()
+            candidate = root / "butterfly-analysis"
+            index = 2
+            while candidate.exists():
+                candidate = root / f"butterfly-analysis-{index}"
+                index += 1
+            return candidate
+
+        def _on_butterfly_export_requested(self) -> None:
+            parent = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                self._tr("dialog.export_butterfly"),
+                "",
+            )
+            if not parent:
+                return
+            chosen = self._butterfly_export_target(parent)
+            try:
+                self.butterfly_workbench.set_export_context(self._butterfly_export_context())
+                written = self.butterfly_workbench.export_analysis(chosen)
+            except (OSError, TypeError, ValueError, FileExistsError) as exc:
+                self._set_status("status.evidence_failed", flags="butterfly_export_error", error=exc)
+                return
+            self._last_evidence_paths = dict(written)
+            self._set_status("status.evidence_exported", flags="butterfly_exported", path=chosen)
+
+        def _on_butterfly_apply_batch(self, payload: Any) -> None:
+            """Apply the page recipe to the existing batch flow."""
+
+            analysis = _read(payload, ("analysis",), {})
+            if isinstance(analysis, Mapping):
+                self.set_analysis_settings(analysis, trigger_preview=False)
+            if not self.batch_frames:
+                self.butterfly_workbench.set_batch_feedback(
+                    (),
+                    ("no selected frames; add frames in the existing Batch page",),
+                )
+                return
+            self.run_batch()
+
+        def _on_butterfly_frame_selected(self, frame: Any) -> None:
+            """Keep frame-list selection connected to the existing input API."""
+
+            if frame is None or self._source_path is None or str(frame) == str(self._source_path):
+                return
+            # Selecting a batch entry is intentionally a normal load action;
+            # no second butterfly compute path is introduced here.
+            if isinstance(frame, (str, Path)) and Path(frame).is_file():
+                self.open_image(frame)
 
         def _build_parameter_dock(self) -> None:
             self.parameters_dock = QtWidgets.QDockWidget("Parameters", self)
@@ -1177,6 +1443,7 @@ if QT_AVAILABLE:
             self.ridge_method_combo.addItem("Radial peak", "radial_peak")
             self.ridge_method_combo.addItem("Azimuthal peak", "azimuthal_peak")
             self.ridge_method_combo.addItem("Surface curvature", "surface_curvature")
+            self.ridge_method_combo.addItem("Butterfly curvature", "butterfly_curvature")
             form.addRow("ridge method", self.ridge_method_combo)
 
             self.ridge_snr_threshold_spin = QtWidgets.QDoubleSpinBox(self.analysis_group)
@@ -1775,6 +2042,7 @@ if QT_AVAILABLE:
                 action.setToolTip(self._tr(key))
 
             for page, key in (
+                (self.butterfly_page, "tooltip.tab.butterfly"),
                 (self.refinement_page, "tooltip.tab.refinement"),
                 (self.measurements_page, "tooltip.tab.measurements"),
                 (self.batch_page, "tooltip.tab.batch"),
@@ -1929,6 +2197,7 @@ if QT_AVAILABLE:
                     "tooltip.combo.surface_curvature",
                 ),
                 (self.ridge_method_combo, "azimuthal_peak", "tooltip.combo.azimuthal_peak"),
+                (self.ridge_method_combo, "butterfly_curvature", "tooltip.combo.butterfly_curvature"),
                 (self.display_scale_combo, "linear", "tooltip.combo.display_linear"),
                 (self.display_scale_combo, "log1p", "tooltip.combo.display_log1p"),
                 (self.display_scale_combo, "asinh", "tooltip.combo.display_asinh"),
@@ -2137,12 +2406,15 @@ if QT_AVAILABLE:
             self.file_toolbar.setWindowTitle(self._tr("toolbar.project"))
 
             for page, key in (
-                (self.refinement_page, "tab.refinement"),
+                (self.butterfly_page, "tab.butterfly"),
+                (self.refinement_page, "tab.advanced_intensity"),
                 (self.measurements_page, "tab.measurements"),
                 (self.batch_page, "tab.batch"),
                 (self.evolution_page, "tab.evolution"),
             ):
                 self.pages.setTabText(self.pages.indexOf(page), self._tr(key))
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_language(self._language)
             self.parameters_dock.setWindowTitle(self._tr("dock.parameters"))
             self.parameter_table_title.setText(self._tr("label.parameter_table_title"))
             self.parameter_table_title.setAccessibleName(
@@ -2243,6 +2515,11 @@ if QT_AVAILABLE:
                 self.ridge_method_combo,
                 "azimuthal_peak",
                 "combo.azimuthal_peak",
+            )
+            self._set_combo_text(
+                self.ridge_method_combo,
+                "butterfly_curvature",
+                "combo.butterfly_curvature",
             )
             self._set_combo_text(self.display_scale_combo, "linear", "combo.display_linear")
             self._set_combo_text(self.display_scale_combo, "log1p", "combo.display_log1p")
@@ -2607,6 +2884,11 @@ if QT_AVAILABLE:
                 )
             if len(ellipse) > 1 or preset != "standard":
                 result["ellipse"] = ellipse
+            # The butterfly page keeps its nested recipe separate from the
+            # legacy intensity controls.  It is included in the same root
+            # analysis mapping sent to service/pipeline validation.
+            if hasattr(self, "butterfly_workbench"):
+                result["butterfly"] = self.butterfly_workbench.butterfly_settings
             return result
 
         def _validate_analysis_controls(self) -> None:
@@ -2659,6 +2941,7 @@ if QT_AVAILABLE:
             settings: Mapping[str, Any] | None,
             *,
             trigger_preview: bool = True,
+            reset_butterfly_if_missing: bool = False,
         ) -> None:
             """Restore analysis controls from a project/config mapping."""
 
@@ -2691,9 +2974,21 @@ if QT_AVAILABLE:
                 "ellipse_preset",
                 "ellipse_residual",
                 "ellipse_multistart",
+                "butterfly",
             ):
                 if key in settings:
                     merged[key] = settings[key]
+            if isinstance(nested, Mapping) and "butterfly" in nested:
+                merged["butterfly"] = nested["butterfly"]
+            butterfly_supplied = "butterfly" in settings or (
+                isinstance(nested, Mapping) and "butterfly" in nested
+            )
+            if reset_butterfly_if_missing and not butterfly_supplied:
+                # Legacy project documents have no butterfly recipe.  Remove
+                # the previous document's nested state before any final UI
+                # synchronization; partial settings updates elsewhere still
+                # retain the current recipe by default.
+                merged.pop("butterfly", None)
             configured_window = merged.get("q_window", merged.get("q_range"))
             window_explicit = "q_window" in settings or "q_range" in settings
             if isinstance(nested, Mapping):
@@ -2889,10 +3184,38 @@ if QT_AVAILABLE:
                 self.display_scale_combo.currentData() or "linear"
             )
             self._display_percentile = float(self.display_percentile_spin.value())
+            if hasattr(self, "butterfly_workbench"):
+                butterfly_settings = merged.get("butterfly")
+                if butterfly_supplied and isinstance(butterfly_settings, Mapping):
+                    self.butterfly_workbench.set_analysis_settings(
+                        butterfly_settings,
+                        replace=bool(reset_butterfly_if_missing),
+                    )
+                elif reset_butterfly_if_missing and not getattr(self, "_blank_butterfly_workflow", False):
+                    # A legacy document has no serialized butterfly edits;
+                    # do not leak edits from the document that was open before
+                    # it was loaded.
+                    self.butterfly_workbench.reset_analysis_settings()
+                if getattr(self, "_blank_butterfly_workflow", False):
+                    self.butterfly_workbench.set_legacy_method("butterfly_curvature")
+                    self._blank_butterfly_workflow = False
+                else:
+                    self.butterfly_workbench.set_legacy_method(merged.get("ridge_method", "radial_peak"))
             self.views.set_display_settings(
                 self._display_scale,
                 self._display_percentile,
             )
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_display_settings(
+                    self._display_scale,
+                    self._display_percentile,
+                )
+                q_min = merged.get("q_min")
+                q_max = merged.get("q_max")
+                if q_min is not None and q_max is not None:
+                    self.butterfly_workbench.set_q_window((q_min, q_max))
+                else:
+                    self.butterfly_workbench.set_q_window(None)
             setter = getattr(self.engine, "set_analysis_settings", None)
             if callable(setter):
                 try:
@@ -2917,6 +3240,8 @@ if QT_AVAILABLE:
             self._pending_input_records.clear()
             self._debounce_timer.stop()
             self._set_busy(False)
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.invalidate_result()
             if clear_fit:
                 self.views.clear_fit()
                 self._fit_ridge_points = []
@@ -3658,6 +3983,23 @@ if QT_AVAILABLE:
             )
             if self._roi_specs or self._file_mask is not None:
                 self._recompute_external_mask(update_widgets=False)
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_data(
+                    data,
+                    qx=self._qx,
+                    qy=self._qy,
+                    valid_mask=_read(self._qmap, ("valid_mask", "valid"), None),
+                    q_unit=self._active_q_unit(),
+                    source=self._source_path,
+                )
+                self.butterfly_workbench.set_export_context(self._butterfly_export_context())
+                analysis = self.analysis_settings
+                if analysis.get("q_min") is not None and analysis.get("q_max") is not None:
+                    self.butterfly_workbench.set_q_window(
+                        (analysis["q_min"], analysis["q_max"])
+                    )
+                else:
+                    self.butterfly_workbench.set_q_window(None)
             if mask_cleared_for_shape:
                 self._set_status(
                     "status.mask_shape_changed",
@@ -4096,11 +4438,15 @@ if QT_AVAILABLE:
                     except (TypeError, ValueError):
                         q_window = None
             self.views.set_q_view(q_window)
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_q_window(q_window)
 
         def reset_q_view(self) -> None:
             """Restore the full detector/q-map extent in the overlay."""
 
             self.views.set_q_view(full=True)
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_q_window(None)
 
         def _on_q_view_setting_changed(self, enabled: bool) -> None:
             if enabled:
@@ -4150,6 +4496,11 @@ if QT_AVAILABLE:
                 self._display_scale,
                 self._display_percentile,
             )
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_display_settings(
+                    self._display_scale,
+                    self._display_percentile,
+                )
 
         def _refresh_model_overlay(self) -> None:
             self._model_ellipses = model_ellipse_pair(
@@ -4188,6 +4539,8 @@ if QT_AVAILABLE:
             # debounced preview starts.  A result from the preceding values
             # must never overwrite the user's new table state.
             self._generation.next()
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.invalidate_result()
             if name in {"amplitude", "amplitude_plus", "amplitude_minus", "background"}:
                 self._auto_scale_initial = False
             setter = getattr(self.engine, "set_parameters", None)
@@ -4223,6 +4576,9 @@ if QT_AVAILABLE:
                 return
             self._generation.next()
             self._analysis_settings = self.analysis_settings
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.invalidate_result()
+                self.butterfly_workbench.set_analysis_settings(self._analysis_settings)
             setter = getattr(self.engine, "set_analysis_settings", None)
             if callable(setter):
                 try:
@@ -4292,6 +4648,8 @@ if QT_AVAILABLE:
                 self._pending_input_records[generation] = deepcopy(
                     self._loaded_input_records
                 )
+                if hasattr(self, "butterfly_workbench") and kind in {"measure_geometry", "refine_geometry"}:
+                    self.butterfly_workbench.invalidate_result()
             if kind == "optimize":
                 # Freeze every editable field and the complete current input
                 # context before handing work to QThreadPool.  The worker must
@@ -4385,6 +4743,8 @@ if QT_AVAILABLE:
             self._sync_fit_session_controls()
             active = next(iter(self._workers.values()), None)
             self._set_busy(bool(active), getattr(active, "kind", "cancelled"))
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_job_status("cancelled", "analysis")
             self._set_status("status.cancelled_late")
 
         def ignore_late_result(self) -> None:
@@ -4452,6 +4812,20 @@ if QT_AVAILABLE:
                 if records:
                     self.plot_evolution(records)
                     self._update_batch_rows(records)
+                    if hasattr(self, "butterfly_workbench"):
+                        successful = []
+                        failures = []
+                        for record in records:
+                            mapping = record if isinstance(record, Mapping) else {"value": record}
+                            status = str(mapping.get("status", "ok")).casefold()
+                            if status in {"ok", "success", "completed"}:
+                                successful.append(mapping.get("frame", mapping.get("path", "frame")))
+                            else:
+                                failures.append(
+                                    f"{mapping.get('frame', mapping.get('path', 'frame'))}: "
+                                    f"{mapping.get('reason', mapping.get('error', status))}"
+                                )
+                        self.butterfly_workbench.set_batch_feedback(successful, failures)
                 self._batch_cancel_event = None
             else:
                 self._last_result = result
@@ -4519,6 +4893,8 @@ if QT_AVAILABLE:
                 self._set_busy(True, active_kind)
             else:
                 self._set_busy(False, kind)
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_job_status("error", kind, error=error)
             self._set_status(
                 "status.job_error",
                 flags="error",
@@ -4651,6 +5027,25 @@ if QT_AVAILABLE:
                 valid_mask=result_valid_mask,
                 external_mask=result_external_mask,
             )
+            if hasattr(self, "butterfly_workbench"):
+                observables = _result_value(result, ("observables", "measurements"), None)
+                butterfly_payload = _result_value(result, ("butterfly",), None)
+                if butterfly_payload is None:
+                    butterfly_payload = _read(observables, ("butterfly",), None)
+                self.butterfly_workbench.set_data(
+                    observed,
+                    qx=result_qx,
+                    qy=result_qy,
+                    valid_mask=result_valid_mask,
+                    q_unit=result_q_unit,
+                    source=self._source_path,
+                )
+                self.butterfly_workbench.set_result(butterfly_payload)
+                self.butterfly_workbench.set_export_context(self._butterfly_export_context())
+                if self.focus_q_window_check.isChecked():
+                    self.focus_q_window()
+                else:
+                    self.butterfly_workbench.set_q_window(None)
             ridge_points = _result_value(result, ("ridge_points", "ridges", "ridge"), [])
             ellipse_result = _result_value(result, ("ellipse_fit", "ellipse", "ellipse_result"), None)
             ellipses = _result_value(result, ("ellipses", "ellipse_fits"), None)
@@ -5178,6 +5573,9 @@ if QT_AVAILABLE:
                 ("quality_status", "status"),
                 _read(_result_value(ellipse_result, ("quality",), {}), ("status",), None),
             )
+            trace_result = _is_butterfly_trace_result(result)
+            if trace_result:
+                geometry_quality = "NOT_EVALUATED"
             if geometry_only:
                 # Geometry refinement has no valid image residual.  Surface
                 # the ellipse fit residual and point support instead of the
@@ -5237,7 +5635,9 @@ if QT_AVAILABLE:
                     "intensity_fit_not_run",
                     f"q_unit={q_unit}",
                 ))
-                if geometry_quality:
+                if trace_result:
+                    flags.append("butterfly_trace")
+                elif geometry_quality:
                     flags.append(f"quality={geometry_quality}")
             if isinstance(flags, str):
                 flags_text = flags
@@ -5658,7 +6058,11 @@ if QT_AVAILABLE:
             self.parameter_model.set_rows(data.get("parameters", {}))
             analysis = data.get("analysis", data.get("measurement", data.get("analysis_settings", {})))
             if isinstance(analysis, Mapping):
-                self.set_analysis_settings(analysis, trigger_preview=False)
+                self.set_analysis_settings(
+                    analysis,
+                    trigger_preview=False,
+                    reset_butterfly_if_missing=True,
+                )
             display = data.get("display")
             if isinstance(display, Mapping):
                 self.set_display_settings(display)
@@ -5824,6 +6228,11 @@ if QT_AVAILABLE:
                 status_item.setData(QtCore.Qt.ItemDataRole.UserRole, "ready")
                 self.batch_table.setItem(row, 1, status_item)
                 self.batch_table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_frames(
+                    self.batch_frames,
+                    current=self._source_path,
+                )
 
         def run_batch(self, frames: Iterable[Any] | bool | None = None) -> int:
             if frames is not None and not isinstance(frames, bool):
@@ -5942,6 +6351,12 @@ if QT_AVAILABLE:
 
         # ----- status and lifetime ---------------------------------------------
 
+        def _restore_busy_focus(self) -> None:
+            focus_target = self._busy_focus_widget
+            self._busy_focus_widget = None
+            if focus_target is not None and focus_target.isVisible() and focus_target.isEnabled():
+                QtCore.QTimer.singleShot(0, focus_target.setFocus)
+
         def _set_busy(self, busy: bool, kind: str = "", *, result_ok: bool | None = None) -> None:
             self.preview_button.setEnabled(not busy)
             self.optimize_button.setEnabled(not busy)
@@ -5950,18 +6365,52 @@ if QT_AVAILABLE:
             self.batch_run_button.setEnabled(not busy)
             self.cancel_button.setEnabled(bool(busy))
             self.ignore_late_result_button.setEnabled(bool(busy))
+            if hasattr(self, "butterfly_workbench"):
+                self.butterfly_workbench.set_busy(bool(busy))
             self.batch_progress.setVisible(busy and kind == "batch")
             self.batch_progress_label.setVisible(busy and kind == "batch")
             if busy:
-                QtCore.QTimer.singleShot(0, self.cancel_button.setFocus)
+                if self._busy_focus_widget is None:
+                    self._busy_focus_widget = self.focusWidget()
+                page_is_butterfly = (
+                    hasattr(self, "pages")
+                    and hasattr(self, "butterfly_page")
+                    and self.pages.currentWidget() is self.butterfly_page
+                )
+                focus_target = (
+                    self.butterfly_workbench.cancel_button
+                    if page_is_butterfly and self.butterfly_workbench.cancel_button.isVisible()
+                    else self.cancel_button
+                )
+                QtCore.QTimer.singleShot(0, focus_target.setFocus)
+                if hasattr(self, "butterfly_workbench"):
+                    self.butterfly_workbench.set_job_status("running", kind)
                 self._set_status("status.running", kind_key=f"job.{kind}")
             elif kind:
+                if hasattr(self, "butterfly_workbench"):
+                    if kind in {"cancelled", "canceled"}:
+                        self.butterfly_workbench.set_job_status("cancelled", kind)
+                    elif result_ok is False:
+                        self.butterfly_workbench.set_job_status("error", kind)
+                    elif kind not in {"edited", "ignored"}:
+                        self.butterfly_workbench.set_job_status("completed", kind, result_ok=result_ok)
+                if kind in {"measure_geometry", "refine_geometry"} and _is_butterfly_trace_result(self._last_result):
+                    butterfly = _result_value(self._last_result, ("butterfly",), {})
+                    points = _read(butterfly, ("points",), [])
+                    self._set_status(
+                        "status.butterfly_trace_complete",
+                        q_unit=self._active_q_unit(self._last_result),
+                        points=len(points) if isinstance(points, list) else 0,
+                    )
+                    self._restore_busy_focus()
+                    return
                 if result_ok is False:
                     self._set_status(
                         "status.job_failed",
                         flags="result_failed",
                         kind_key=f"job.{kind}",
                     )
+                    self._restore_busy_focus()
                     return
                 status_key = {
                     "preview": "status.preview_complete",
@@ -5995,6 +6444,8 @@ if QT_AVAILABLE:
                     )
                 else:
                     self._set_status(status_key)
+            if not busy:
+                self._restore_busy_focus()
 
         def _set_status(
             self,

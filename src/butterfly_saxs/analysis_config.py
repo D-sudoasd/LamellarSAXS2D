@@ -45,6 +45,7 @@ DEFAULT_ANALYSIS_SETTINGS: dict[str, Any] = {
     "ellipse_residual": "sampson",
     "ellipse_multistart": 7,
     "full2d_multistart": 1,
+    "butterfly": None,
 }
 
 def _optional_float(value: Any, name: str) -> float | None:
@@ -416,11 +417,15 @@ def validate_analysis_settings(
         method = "surface_curvature"
     if method in {"azimuthal", "azimuthal_max", "angular_peak", "azimuth_peak"}:
         method = "azimuthal_peak"
-    if method not in {"radial_peak", "surface_curvature", "azimuthal_peak"}:
+    if method not in {"radial_peak", "surface_curvature", "azimuthal_peak", "butterfly_curvature"}:
         raise ValueError(
-            "ridge_method must be 'radial_peak', 'azimuthal_peak', or 'surface_curvature'"
+            "ridge_method must be 'radial_peak', 'azimuthal_peak', 'surface_curvature', or 'butterfly_curvature'"
         )
     merged["ridge_method"] = method
+    if merged.get("butterfly") is not None or method == "butterfly_curvature":
+        from .butterfly_settings import normalize_butterfly_settings
+
+        merged["butterfly"] = normalize_butterfly_settings(merged.get("butterfly"))
 
     integer_rules = {
         "n_angular_bins": 8,

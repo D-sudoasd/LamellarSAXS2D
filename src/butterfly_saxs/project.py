@@ -361,16 +361,40 @@ def load_project(path: str | os.PathLike[str]) -> ProjectConfig:
     return ProjectConfig.from_mapping(data)
 
 
+def _toml_key(value: Any) -> str:
+    """Return a deterministic TOML key for inline tables."""
+
+    key = str(value)
+    if key and all(char.isalnum() or char in "-_" for char in key):
+        return key
+    escaped = key.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return repr(value)
+    if isinstance(value, os.PathLike):
+        return _toml_value(os.fspath(value))
     if isinstance(value, str):
         escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
         return f'"{escaped}"'
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(_toml_value(item) for item in value) + "]"
+    if isinstance(value, Mapping):
+        # TOML has no null value.  Table emitters already omit ``None`` scalar
+        # fields; apply the same lossless-for-valid-recipes convention inside
+        # inline mapping rows so a list of edit records remains writable.
+        items = [
+            (_toml_key(key), item)
+            for key, item in value.items()
+            if item is not None
+        ]
+        return "{" + ", ".join(
+            f"{key} = {_toml_value(item)}" for key, item in items
+        ) + "}"
     raise ProjectConfigError(f"不支持写入 TOML 的值类型：{type(value).__name__}")
 
 

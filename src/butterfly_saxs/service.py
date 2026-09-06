@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from dataclasses import asdict, is_dataclass
 import inspect
 import os
 from pathlib import Path
@@ -21,7 +20,7 @@ from typing import Any
 
 import numpy as np
 
-from .batch import run_batch
+from .batch import _warm_start_seed, run_batch
 from .cancellation import AnalysisCancelled
 from .geometry import build_geometry
 from .intensity import (
@@ -52,6 +51,7 @@ from .analysis_config import (
     normalize_ellipse_settings as _ellipse_settings,
     validate_analysis_settings as _validated_analysis_settings,
 )
+from .serialization import json_safe as _canonical_json_safe
 
 DEFAULT_MEASUREMENT_SETTINGS = DEFAULT_ANALYSIS_SETTINGS
 
@@ -106,22 +106,7 @@ def _as_public_scalar(value: Any) -> Any:
 
 def _json_safe(value: Any) -> Any:
     """Return a JSON-safe value, converting non-finite numbers to ``None``."""
-
-    if isinstance(value, Mapping):
-        return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_json_safe(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return _json_safe(value.tolist())
-    if isinstance(value, np.generic):
-        return _json_safe(value.item())
-    if is_dataclass(value):
-        return _json_safe(asdict(value))
-    if isinstance(value, (float, np.floating)):
-        return float(value) if np.isfinite(value) else None
-    if isinstance(value, (int, str, bool)) or value is None:
-        return value
-    return str(value)
+    return _canonical_json_safe(value)
 
 
 def _fit_audit(value: Any) -> dict[str, Any]:
@@ -915,6 +900,15 @@ def _public_ridges(observables: Any) -> list[dict[str, Any]]:
             }
         except (TypeError, ValueError):
             continue
+        for key in ("point_id", "arc_id", "side", "localization_sigma_q", "normal_fwhm_q",
+                    "normal_qx", "normal_qy", "topology_flags", "scale_stability",
+                    "projection_qx", "projection_qy", "normal_residual_q",
+                    "curvature_seed_qx", "curvature_seed_qy", "curvature_seed_pixel_x",
+                    "curvature_seed_pixel_y", "profile_shift_q", "profile_shift_pixel",
+                    "profile_refinement_applied", "profile_refinement_reason", "uncertainty_source"):
+            value = _read(point, (key,), None)
+            if value is not None:
+                row[key] = value
         result.append(_json_safe(row))
     return result
 
@@ -1340,7 +1334,9 @@ class ButterflyAnalysisService:
                 "n_angular_bins": settings["n_angular_bins"],
                 "n_ridge_angles": settings["n_ridge_angles"],
                 "n_radial_bins": settings["n_radial_bins"],
-                "mask": ~analysis_domain.fit_valid_mask,
+                "mask": ~(analysis_domain.non_window_valid_mask
+                           if settings["ridge_method"] == "butterfly_curvature"
+                           else analysis_domain.fit_valid_mask),
                 "ridge_method": settings["ridge_method"],
                 "ridge_snr_threshold": settings["ridge_snr_threshold"],
                 "ridge_min_peak_fraction": settings["ridge_min_peak_fraction"],
@@ -1353,6 +1349,8 @@ class ButterflyAnalysisService:
                 "ellipse_parameters": ellipse_parameters,
                 "ellipse_residual": settings["ellipse_residual"],
                 "ellipse_multistart": settings["ellipse_multistart"],
+                "butterfly_options": ({"max_nfev": settings["max_nfev"], **(settings.get("butterfly") or {})}
+                                      if settings["ridge_method"] == "butterfly_curvature" else None),
                 "cancel_event": cancel_event,
             }
             return _call_supported(
@@ -1502,6 +1500,7 @@ class ButterflyAnalysisService:
             "ellipse_fit": ellipse,
             "ellipses": [] if ellipse is None else ellipse.get("ellipses", []),
             "observables": observables,
+            "butterfly": _json_safe(_read(observables, ("butterfly",), None)),
             "parameters": public_parameters,
             "analysis": _json_safe(analysis_settings),
             "analysis_domain": (
@@ -1970,9 +1969,15 @@ class ButterflyAnalysisService:
         path = _read(frame, ("path", "input_path"), frame)
         frame_selector, dataset = _frame_selectors(frame)
         payload = self.load_image(path, frame=frame_selector, dataset=dataset)
-        params = initial if warm_start and initial is not None else self.parameters
-        if isinstance(initial, Mapping):
-            params = initial.get("parameters", initial)
+        params = self.parameters
+        if warm_start and initial is not None:
+            # Batch normally sanitizes this state before reaching the service,
+            # but direct callers use the same public seam.  In particular,
+            # trace envelopes remain correction evidence and cannot be passed
+            # to the intensity optimizer as a parameter mapping.
+            seed = _warm_start_seed(initial)
+            if seed is not None:
+                params = seed
         config_analysis = _analysis_payload(config)
         result = self.optimize(
             parameters=params,
@@ -2110,9 +2115,12 @@ class ButterflyAnalysisService:
                 mask_dataset=payload_mapping.get("mask_dataset"),
                 poni=original_poni,
             )
-            selected = initial if warm_start and initial is not None else specs
-            if isinstance(initial, Mapping):
-                selected = initial.get("parameters", initial)
+            selected = specs
+            initial_seed = initial
+            if warm_start and initial is not None:
+                initial_seed = _warm_start_seed(initial)
+                if initial_seed is not None:
+                    selected = initial_seed
             frame_payload = dict(state)
             # Keep this frame's loaded image, mask, and q-map in the worker
             # payload.  Do not let optimize() reconstruct them from the
@@ -2134,7 +2142,7 @@ class ButterflyAnalysisService:
                 frame_payload["valid_mask"] = state.get("valid_mask")
             if original_rois:
                 frame_payload["rois"] = original_rois
-            frame_payload["analysis"] = geometry_seed_analysis(initial) if stage == "geometry" else dict(original_analysis)
+            frame_payload["analysis"] = geometry_seed_analysis(initial_seed) if stage == "geometry" else dict(original_analysis)
             frame_payload["commit_parameters"] = False
             frame_payload["stage"] = stage
             frame_payload["cancel_event"] = payload_mapping.get("cancel_event")

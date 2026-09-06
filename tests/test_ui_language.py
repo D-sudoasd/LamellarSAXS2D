@@ -230,6 +230,7 @@ def test_chinese_analysis_panel_uses_localized_public_labels(qtbot, tmp_path) ->
     )
     qtbot.addWidget(window)
 
+    assert window.pages.tabText(0) == "蝴蝶分析"
     assert [
         window.pages.tabText(window.pages.indexOf(page))
         for page in (
@@ -238,7 +239,7 @@ def test_chinese_analysis_panel_uses_localized_public_labels(qtbot, tmp_path) ->
             window.batch_page,
             window.evolution_page,
         )
-    ] == ["精修", "测量 / 剖面", "批处理", "演化"]
+    ] == ["高级强度", "测量 / 剖面", "批处理", "演化"]
     assert window.parameters_dock.windowTitle() == "参数"
     assert window.preview_button.text() == "预览"
     assert window.optimize_button.text() == "精修"

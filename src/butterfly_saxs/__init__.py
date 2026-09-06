@@ -11,9 +11,12 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "analyze_butterfly": (".butterfly", "analyze_butterfly"),
+    "trace_butterfly_ridges": (".butterfly_ridge", "trace_butterfly_ridges"),
+    "fit_arc_ellipses": (".arc_geometry", "fit_arc_ellipses"),
     "AnalysisConfig": (".models", "AnalysisConfig"),
     "AnalysisResult": (".models", "AnalysisResult"),
     "ParameterSet": (".models", "ParameterSet"),
@@ -37,6 +40,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 _ALIASES: dict[str, str] = {"ImageFrame": "LoadedImage", "QMap": "GeometryMaps"}
 
 __all__ = [
+    "analyze_butterfly",
+    "trace_butterfly_ridges",
+    "fit_arc_ellipses",
     "AnalysisConfig",
     "AnalysisResult",
     "ImageFrame",

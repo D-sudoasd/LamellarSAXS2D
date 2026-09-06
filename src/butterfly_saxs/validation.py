@@ -483,6 +483,12 @@ class AnalysisDomain:
     schema_version: str = ANALYSIS_DOMAIN_SCHEMA_VERSION
 
     @property
+    def non_window_valid_mask(self) -> np.ndarray:
+        """Validity before a q-window choice, for explicit window sensitivity."""
+        return (self.finite_mask & self.detector_valid_mask & self.external_valid_mask
+                & ~self.roi_exclusion_mask & self.weight_valid_mask)
+
+    @property
     def counts(self) -> dict[str, int]:
         image_count = int(np.prod(self.image_shape))
         finite_count = int(np.count_nonzero(self.finite_mask))

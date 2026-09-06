@@ -7,6 +7,7 @@ from math import cos, pi, sin
 from typing import Any
 
 from .i18n import translate, validate_language
+from .qspace import QSpaceView
 from .qt_compat import QT_AVAILABLE, QtCore, QtWidgets
 
 
@@ -1188,4 +1189,4 @@ def _symmetric_levels(
     magnitude = max(abs(limits[0]), abs(limits[1]))
     return -magnitude, magnitude
 
-__all__ = ["PLOT_AVAILABLE", "PatternView", "OverlayView", "ViewGrid"]
+__all__ = ["PLOT_AVAILABLE", "PatternView", "OverlayView", "ViewGrid", "QSpaceView"]

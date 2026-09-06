@@ -215,6 +215,12 @@ def canonical_ellipse_payload(
         "multistart_count": int(_field(fit, "multistart_count", default=1) or 1),
         "flags": flags,
     }
+    for name in ("method_version", "candidate_fit", "quantitative_parameters",
+                 "parameter_identifiability", "arc_diagnostics", "point_diagnostics",
+                 "uncertainty", "sensitivity", "warm_start_eligible", "measurement_status", "branch_swap_applied"):
+        value = _field(fit, name, default=None)
+        if value is not None:
+            payload[name] = value
     return public_ellipse_payload(payload)
 
 

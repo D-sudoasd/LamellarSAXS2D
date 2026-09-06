@@ -405,7 +405,15 @@ def evaluate_p4_ellipse_quality(
             symmetry_message,
         )
 
-    if coverage is None:
+    coverage_definition = _read(_read(ellipse, "coverage", {}), "definition", "legacy_span")
+    calibrated_coverage_definition = (thresholds or {}).get("coverage_definition", "legacy_span")
+    if coverage_definition == "connected_arc_support_v1" and calibrated_coverage_definition != coverage_definition:
+        coverage_status = "WARN"
+        coverage_message = (
+            "connected arc support is reported; old span-based thresholds are not calibrated "
+            "for this definition (coverage remains unassessed)"
+        )
+    elif coverage is None:
         coverage_status = "FAIL"
         coverage_message = "angular coverage is unavailable"
     elif coverage < limits["minimum_angular_coverage_fail"]:
@@ -424,6 +432,8 @@ def evaluate_p4_ellipse_quality(
         {
             "fail_below": limits["minimum_angular_coverage_fail"],
             "warn_below": limits["minimum_angular_coverage_warn"],
+            "metric_definition": coverage_definition,
+            "threshold_definition": calibrated_coverage_definition,
         },
         coverage_message,
     )
@@ -504,7 +514,16 @@ def evaluate_p4_ellipse_quality(
     if coverage_span is None and coverage is not None:
         coverage_span = float(coverage * 2.0 * np.pi)
     span_deg = float(np.degrees(coverage_span)) if coverage_span is not None else None
-    if span_deg is None:
+    if coverage_definition == "connected_arc_support_v1" and calibrated_coverage_definition != coverage_definition:
+        observed_length = _finite(_read(_read(ellipse, "coverage", {}), "observed_angular_length", None))
+        add(
+            "short_arc", "WARN",
+            {"envelope_span_deg": span_deg,
+             "observed_parameter_angle_deg": float(np.degrees(observed_length)) if observed_length is not None else None},
+            {"metric_definition": coverage_definition, "threshold_definition": calibrated_coverage_definition},
+            "disconnected observed support is not certified by a broad angular envelope; new thresholds are unassessed",
+        )
+    elif span_deg is None:
         add(
             "short_arc",
             "WARN",

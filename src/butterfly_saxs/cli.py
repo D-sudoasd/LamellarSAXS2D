@@ -100,6 +100,14 @@ def _analysis_overrides(args: argparse.Namespace) -> dict[str, Any]:
             ellipse[key] = value
     if ellipse:
         mapping["ellipse"] = ellipse
+    butterfly = {}
+    for argument, key in (("butterfly_stage", "stage"), ("butterfly_resamples", "resamples"),
+                          ("butterfly_seed", "seed"), ("butterfly_sensitivity", "sensitivity")):
+        value = getattr(args, argument, None)
+        if value is not None:
+            butterfly[key] = value
+    if butterfly:
+        mapping["butterfly"] = butterfly
     return mapping
 
 
@@ -136,9 +144,14 @@ def _add_refinement_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--q-max", type=float, help="analysis q upper bound")
     parser.add_argument(
         "--ridge-method",
-        choices=("radial_peak", "azimuthal_peak", "surface_curvature"),
-        help="ridge localization method (radial_peak, azimuthal_peak, or surface_curvature)",
+        choices=("radial_peak", "azimuthal_peak", "surface_curvature", "butterfly_curvature"),
+        help="observed ridge method, including side-aware butterfly_curvature",
     )
+    parser.add_argument("--butterfly-stage", choices=("trace", "evaluate"), default=None)
+    parser.add_argument("--butterfly-resamples", type=int, default=None,
+                        help="image-level resampling count; zero skips empirical intervals")
+    parser.add_argument("--butterfly-seed", type=int, default=None)
+    parser.add_argument("--butterfly-no-sensitivity", dest="butterfly_sensitivity", action="store_false", default=None)
     parser.add_argument("--ridge-snr-threshold", type=float, help="minimum ridge SNR")
     parser.add_argument(
         "--ridge-min-peak-fraction",
@@ -715,7 +728,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
                     key: result_mapping.get(key)
                     for key in (
                         "metadata", "flags", "parameters", "ridges", "ridge_points",
-                        "ellipse_fit", "lobe_radial_profiles", "lobe_radial_peaks",
+                        "ellipse_fit", "butterfly", "lobe_radial_profiles", "lobe_radial_peaks",
                         "full2d", "analysis", "analysis_domain", "valid_mask",
                     )
                     if key in result_mapping
@@ -726,7 +739,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
                 key: item.result.get(key)
                 for key in (
                     "metadata", "flags", "parameters", "ridges", "ridge_points",
-                    "ellipse_fit", "lobe_radial_profiles", "lobe_radial_peaks",
+                    "ellipse_fit", "butterfly", "lobe_radial_profiles", "lobe_radial_peaks",
                     "full2d", "analysis", "analysis_domain",
                 )
                 if key in item.result

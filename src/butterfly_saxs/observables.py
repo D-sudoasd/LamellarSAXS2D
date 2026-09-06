@@ -537,6 +537,7 @@ class ObservableSet(_MappingResult):
     # want both measurements in one observable bundle.
     lobe_radial_profiles: list[RadialProfile] = field(default_factory=list)
     lobe_radial_peaks: list[RidgePoint] = field(default_factory=list)
+    butterfly: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         std = float(self.phi_app_std_deg)
@@ -3693,11 +3694,22 @@ def measure_observables(
     curvature_percentile: float = 25.0,
     curvature_normal_step: float = 1.0,
     p4_quality_thresholds: Mapping[str, Any] | None = None,
+    butterfly_options: Mapping[str, Any] | None = None,
     cancel_event: Any = None,
 ) -> ObservableSet:
     """Run the standard angular, lobe, ridge, and ellipse measurement chain."""
 
     raise_if_cancelled(cancel_event, "observables:start")
+    if str(ridge_method).replace("-", "_") == "butterfly_curvature":
+        from .butterfly import measure_butterfly_observables
+
+        return measure_butterfly_observables(
+            frame, qmap, q_window, mask=mask, options=butterfly_options,
+            draw_axis_deg=draw_axis_deg, ellipse_parameters=ellipse_parameters,
+            multistart=ellipse_multistart, fit_ellipse=fit_ellipse,
+            n_angular_bins=n_angular_bins, n_radial_bins=n_radial_bins,
+            snr_threshold=ridge_snr_threshold, cancel_event=cancel_event,
+        )
     q_unit = _q_unit(qmap)
     angular = measure_angular_spectrum(frame, qmap, q_window, n_bins=n_angular_bins, mask=mask)
     lobes = measure_four_lobe_peaks(

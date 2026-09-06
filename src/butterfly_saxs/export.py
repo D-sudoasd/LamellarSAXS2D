@@ -484,6 +484,37 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
                 ),
             }
         )
+    ellipse = _value(value, "ellipse_fit", "ellipse", default={})
+    evidence = _value(ellipse, "quantitative_parameters", default={})
+    if isinstance(evidence, Mapping) and evidence:
+        aliases = {"semi_major": "a", "semi_minor": "b", "axes_ratio": "axis_ratio",
+                   "ellipse_axis_tilt_deg": "theta_deg", "angle_deg": "theta_deg",
+                   "eccentricity": "axis_ratio", "ellipticity": "axis_ratio"}
+        for row in rows:
+            name = row["parameter"]
+            check = evidence.get(aliases.get(name, name))
+            if not isinstance(check, Mapping):
+                continue
+            candidate_value = check.get("candidate_value")
+            if name in ("eccentricity", "ellipticity") and candidate_value is not None:
+                candidate_value = math.sqrt(max(0., 1. - float(candidate_value) ** 2))
+            row["candidate_value"] = _scalar(candidate_value)
+            row["identifiability_status"] = check.get("status", "undetermined")
+            row["identifiability_reason"] = check.get("reason", "")
+            row["parameter_source"] = "quantitative_if_available_else_candidate_only"
+            if check.get("status") != "available":
+                row["value"] = ""
+            else:
+                quantitative_value = check.get("value")
+                if name in ("eccentricity", "ellipticity") and quantitative_value is not None:
+                    quantitative_value = math.sqrt(max(0., 1. - float(quantitative_value) ** 2))
+                row["value"] = _scalar(quantitative_value)
+            interval = check.get("interval")
+            if isinstance(interval, (tuple, list)) and len(interval) == 2 and name not in ("eccentricity", "ellipticity"):
+                row["interval_low"], row["interval_high"] = interval
+            row["interval_kind"] = check.get("interval_kind", "")
+            if not row.get("unit"):
+                row["unit"] = "dimensionless" if name in ("eccentricity", "ellipticity") else check.get("unit", "")
     return rows
 
 
@@ -970,6 +1001,8 @@ class StreamingBatchExporter:
         "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "parameter",
         "value", "stderr", "uncertainty", "fixed", "unit", "flags",
         "bound_flags", "scientific_flags",
+        "candidate_value", "identifiability_status", "identifiability_reason", "parameter_source",
+        "interval_low", "interval_high", "interval_kind",
     ]
     _RIDGE_COLUMNS = [
         "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error",
@@ -979,6 +1012,12 @@ class StreamingBatchExporter:
         "n_pixels", "valid", "accepted", "method", "reason", "flags", "support",
         "score", "point_score", "trajectory_id", "branch_id", "q_unit",
         "quadrant", "quadrant_pair", "branch_assignment_source", "symmetry_flags",
+        "point_id", "arc_id", "side", "pixel_x", "pixel_y", "localization_sigma_q",
+        "normal_fwhm_q", "normal_qx", "normal_qy", "q_normal_step", "scale_stability",
+        "topology_flags", "projection_qx", "projection_qy", "normal_residual_q",
+        "curvature_seed_qx", "curvature_seed_qy", "curvature_seed_pixel_x", "curvature_seed_pixel_y",
+        "profile_shift_q", "profile_shift_pixel", "profile_refinement_applied", "profile_refinement_reason",
+        "uncertainty_source",
     ]
     _LOBE_COLUMNS = [
         "frame_index", "frame_id", "path", "frame_selector", "dataset", "time",
