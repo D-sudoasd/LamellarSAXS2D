@@ -28,6 +28,23 @@ class _FakeFit:
         self.model_image = np.ones(shape, dtype=float)
 
 
+def test_loaded_payload_reports_the_geometry_it_actually_used(tmp_path, monkeypatch):
+    import butterfly_saxs.geometry as geometry
+
+    path = tmp_path / "image.npy"
+    np.save(path, np.ones((5, 6)))
+    service = ButterflyAnalysisService()
+    monkeypatch.setattr(geometry, "load_poni", lambda value: value)
+    monkeypatch.setattr(service, "_geometry_for", lambda shape, poni, **kwargs: {
+        "qx": np.ones(shape), "qy": np.zeros(shape), "q_unit": "nm^-1",
+    })
+    first = service.load_image(path, poni="first.poni")
+    second = service.load_image(path, poni="second.poni")
+    assert first["poni"] == "first.poni"
+    assert second["poni"] == "second.poni"
+    assert service.current_payload()["poni"] == "second.poni"
+
+
 def test_service_marks_unusable_pixels_and_reports_q_units() -> None:
     image = np.ones((12, 14), dtype=float)
     yy, xx = np.indices(image.shape, dtype=float)

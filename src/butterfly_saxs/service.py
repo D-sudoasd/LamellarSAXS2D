@@ -1100,6 +1100,10 @@ class ButterflyAnalysisService:
         # Keep the loaded pair local: another batch worker may replace the
         # document state before it starts optimization.
         payload = self._payload_from_loaded(loaded, qmap)
+        # The payload belongs to the candidate geometry, before document state
+        # is committed.  Reporting self.poni_path here would report the previous
+        # calibration (or None) when opening a saved project in a fresh window.
+        payload["poni"] = candidate_poni_path
         if external_mask is not None:
             mask_value = (
                 read_image(

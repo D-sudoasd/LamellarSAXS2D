@@ -671,7 +671,7 @@ if QT_AVAILABLE:
             if not hasattr(self, "parameters_dock"):
                 return
             page = self.pages.widget(int(index))
-            if page is getattr(self, "butterfly_page", None):
+            if page in (getattr(self, "butterfly_page", None), getattr(self, "lamellar_page", None)):
                 self.parameters_dock.hide()
             else:
                 self.parameters_dock.show()
@@ -778,6 +778,10 @@ if QT_AVAILABLE:
             refinement_layout.addWidget(self.views, 1)
             self.pages.addTab(self.refinement_page, "Advanced intensity / Refinement")
             self._build_measurements_page()
+            from .lamellar_page import LamellarPage
+
+            self.lamellar_page = LamellarPage(self.pages, language=self._language)
+            self.pages.addTab(self.lamellar_page, "实空间片层")
             self.setCentralWidget(self.pages)
 
         def _on_butterfly_identify(self, settings: Any) -> None:
@@ -2415,6 +2419,11 @@ if QT_AVAILABLE:
                 self.pages.setTabText(self.pages.indexOf(page), self._tr(key))
             if hasattr(self, "butterfly_workbench"):
                 self.butterfly_workbench.set_language(self._language)
+            self.lamellar_page.set_language(self._language)
+            self.pages.setTabText(
+                self.pages.indexOf(self.lamellar_page),
+                "Real-space lamellae" if self._language == "en" else "实空间片层",
+            )
             self.parameters_dock.setWindowTitle(self._tr("dock.parameters"))
             self.parameter_table_title.setText(self._tr("label.parameter_table_title"))
             self.parameter_table_title.setAccessibleName(
@@ -3248,6 +3257,8 @@ if QT_AVAILABLE:
             self._set_busy(False)
             if hasattr(self, "butterfly_workbench"):
                 self.butterfly_workbench.invalidate_result()
+            if hasattr(self, "lamellar_page"):
+                self.lamellar_page.invalidate()
             if clear_fit:
                 self.views.clear_fit()
                 self._fit_ridge_points = []
@@ -3655,6 +3666,8 @@ if QT_AVAILABLE:
 
             if self._fit_session_restore_active:
                 return
+            if hasattr(self, "lamellar_page"):
+                self.lamellar_page.invalidate()
             self._fit_session["manual_status"] = "unreviewed"
             self._fit_session["reviewed_by"] = ""
             self._fit_session["reviewed_at"] = None
@@ -4746,6 +4759,7 @@ if QT_AVAILABLE:
             self._pending_input_records.clear()
             self._last_result_signature = None
             self._last_result_input_records = None
+            self.lamellar_page.invalidate()
             self._sync_fit_session_controls()
             active = next(iter(self._workers.values()), None)
             self._set_busy(bool(active), getattr(active, "kind", "cancelled"))
@@ -4760,6 +4774,7 @@ if QT_AVAILABLE:
             self._pending_input_records.clear()
             self._last_result_signature = None
             self._last_result_input_records = None
+            self.lamellar_page.invalidate()
             self._sync_fit_session_controls()
             active = next(iter(self._workers.values()), None)
             self._set_busy(bool(active), getattr(active, "kind", "ignored"))
@@ -4884,6 +4899,7 @@ if QT_AVAILABLE:
                     self._set_busy(False, "cancelled")
                 return
             self._last_error = str(error)
+            self.lamellar_page.invalidate()
             self._last_result_signature = None
             self._last_result_input_records = None
             self._last_result = None
@@ -5085,6 +5101,24 @@ if QT_AVAILABLE:
                 geometry_only=geometry_only,
             )
             self._update_measurements(result)
+            if isinstance(result, Mapping):
+                self.lamellar_page.set_source(
+                    {
+                        **result,
+                        "source_identity": {
+                            "source": self._source_path,
+                            "frame": self._frame,
+                            "dataset": self._dataset,
+                            "input_records": deepcopy(self._loaded_input_records),
+                        },
+                        "observed": observed,
+                        "qx": result_qx,
+                        "qy": result_qy,
+                        "q_unit": result_q_unit,
+                        "draw_axis_deg": self.analysis_settings.get("draw_axis_deg", 90.),
+                    },
+                    context_signature=self._fit_state_signature(),
+                )
 
         def _update_batch_rows(self, records: Iterable[Any]) -> None:
             rows = list(records)
@@ -5712,6 +5746,7 @@ if QT_AVAILABLE:
                 "roi_exclusion": _jsonable(self._exclusion_roi),
                 "rois": list(self._roi_specs),
                 "fit_session": self._fit_session_for_project(),
+                "lamellar_view": self.lamellar_page.document(),
                 "batch": {
                     "mode": self.batch_mode_combo.currentData(),
                     "stage": self.batch_stage_combo.currentData(),
@@ -5867,6 +5902,7 @@ if QT_AVAILABLE:
             snapshot["ui_display_settings"] = self._snapshot_project_value(
                 self.display_settings
             )
+            snapshot["lamellar_view"] = self.lamellar_page.snapshot_state()
             snapshot["ui_batch"] = {
                 "mode": self.batch_mode_combo.currentData(),
                 "stage": self.batch_stage_combo.currentData(),
@@ -6051,6 +6087,8 @@ if QT_AVAILABLE:
             self._sync_fit_session_controls(preserve_edits=True)
             self._render_metric_labels()
             self._render_status()
+            if "lamellar_view" in snapshot:
+                self.lamellar_page.restore_state(snapshot["lamellar_view"])
 
         def _apply_project_document(self, data: Mapping[str, Any], target: Path) -> None:
             """Apply an already parsed/normalized document through the UI seam."""
@@ -6163,6 +6201,11 @@ if QT_AVAILABLE:
             finally:
                 self._fit_session_restore_active = False
             self._sync_fit_session_controls()
+
+            self.lamellar_page.restore_document(
+                data.get("lamellar_view"), context_signature=self._fit_state_signature(),
+                observed=self._observed, qx=self._qx, qy=self._qy,
+            )
 
         def save_project(self, path: str | Path | bool | None = None) -> bool:
             if isinstance(path, bool):
@@ -6290,6 +6333,7 @@ if QT_AVAILABLE:
 
         def plot_evolution(self, records: Iterable[Any]) -> None:
             self.evolution_records = list(records)
+            self.lamellar_page.set_series(self.evolution_records, context_signature=self._fit_state_signature())
             if not self.evolution_records:
                 self.evolution_table.setRowCount(0)
                 self.evolution_parameter_combo.clear()
@@ -6480,8 +6524,9 @@ if QT_AVAILABLE:
                 return
             self._closing = True
             self.cancel_jobs()
+            self.lamellar_page.shutdown()
             self._thread_pool.clear()
-            if self._workers:
+            if self._workers or self.lamellar_page.jobs_running():
                 self._set_status("status.closing")
                 event.ignore()
                 QtCore.QTimer.singleShot(50, self._finish_close_when_idle)
@@ -6490,7 +6535,7 @@ if QT_AVAILABLE:
             event.accept()
 
         def _finish_close_when_idle(self) -> None:
-            if self._workers:
+            if self._workers or self.lamellar_page.jobs_running():
                 QtCore.QTimer.singleShot(50, self._finish_close_when_idle)
                 return
             self._thread_pool.clear()
@@ -6571,6 +6616,7 @@ def _gui_options(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--mask-frame", type=int)
     parser.add_argument("--mask-dataset")
     parser.add_argument("--no-auto-preview", action="store_true")
+    parser.add_argument("--lamellar-results", help="Open a native result bundle in the lamellar schematic page")
     raw = list(sys.argv[1:] if argv is None else argv)
     # QApplication should never be asked to interpret our scientific options;
     # only this small parser consumes them.
@@ -6676,6 +6722,9 @@ def create_app(
     from .workbench import upgrade_window
 
     upgrade_window(window)
+    if options.lamellar_results:
+        window.lamellar_page.import_results(options.lamellar_results)
+        window.pages.setCurrentWidget(window.lamellar_page)
     return app, window
 
 

@@ -14,6 +14,9 @@ The screenshot uses synthetic data and demonstrates the observed, model, residua
 
 ## Features
 
+- Parameter-driven real-space lamellar studio: linked SAXS, shared 2D/3D slab geometry, fixed-layout sequence playback, explicit candidate/assumption provenance, and SVG/PDF/PNG/GIF exports. See the [lamellar studio guide](docs/lamellar_workbench_zh.md). This feature produces schematics, not a unique structural inversion.
+- Publication artboards (0.4): planar micro-bevel geometry, opaque matte Qt Quick 3D, balanced orthographic framing, 89/183 mm layouts, editable SVG/TrueType PDF annotations and genuine 600 dpi PNG/TIFF renders. See the [publication guide](docs/publication_figures_zh.md).
+
 - Observed butterfly arc workflow (`butterfly_curvature`) with separately identified ellipse sides, restricted arc projection and parameter-level evidence. See the [butterfly arc guide](docs/butterfly_arcs_zh.md). Older projects retain their saved ridge method.
 
 - CBF, EDF, TIF/TIFF, NPY, NPZ, HDF5, CSV, and TXT input, including explicit frame/dataset selection.
@@ -156,6 +159,9 @@ The implementation is informed by the ellipse and lamellar-pattern analysis disc
 LamellarSAXS2D 面向取向层片体系的各向异性二维 SAXS 花样，提供从像素、剖面、峰脊线到镜像双椭圆和整幅经验强度模型的定量测量，并可跟踪原位序列中的参数演化。软件保留输入强度的数值尺度；当提供 PONI 文件时，通过 pyFAI 生成物理 `q/chi/qx/qy` 坐标。
 
 ### 主要能力
+
+- “实空间片层”页自动接入径向峰与已有拟合结果，联动二维投影、原生三维薄板及实验序列；支持单/多堆栈、候选值预览、撤销/重做和可追溯出图。详见[片层工作台指南](docs/lamellar_workbench_zh.md)。厚度、横向尺寸及出平面排列均保留为示意假设。
+- 0.4 新增[发表画板](docs/publication_figures_zh.md)：平直微倒角片层、哑光材质、均衡光照、结构主图与 SAXS 组合版式，以及保留矢量文字的 600 dpi 高清输出。
 
 - 读取 CBF、EDF、TIF/TIFF、NPY、NPZ、HDF5、CSV/TXT，并显式选择帧或数据集。
 - 使用 PONI、外部 mask 和排除 ROI 管理真实探测器几何与有效像素。

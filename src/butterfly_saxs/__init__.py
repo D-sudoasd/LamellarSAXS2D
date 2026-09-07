@@ -11,9 +11,19 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.4.0"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "PublicationStyle": (".publication_models", "PublicationStyle"),
+    "PublicationFigureSpec": (".publication_models", "PublicationFigureSpec"),
+    "export_publication_figure": (".publication", "export_publication_figure"),
+    "render_publication_figure": (".publication", "render_publication_figure"),
+    "LamellarSettings": (".lamellar", "LamellarSettings"),
+    "LamellarScene": (".lamellar", "LamellarScene"),
+    "build_lamellar_scene": (".lamellar", "build_lamellar_scene"),
+    "load_lamellar_sources": (".lamellar", "load_lamellar_sources"),
+    "export_lamellar_scene": (".lamellar_export", "export_lamellar_scene"),
+    "export_lamellar_sequence": (".lamellar_export", "export_lamellar_sequence"),
     "analyze_butterfly": (".butterfly", "analyze_butterfly"),
     "trace_butterfly_ridges": (".butterfly_ridge", "trace_butterfly_ridges"),
     "fit_arc_ellipses": (".arc_geometry", "fit_arc_ellipses"),
@@ -40,6 +50,16 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 _ALIASES: dict[str, str] = {"ImageFrame": "LoadedImage", "QMap": "GeometryMaps"}
 
 __all__ = [
+    "PublicationStyle",
+    "PublicationFigureSpec",
+    "export_publication_figure",
+    "render_publication_figure",
+    "LamellarSettings",
+    "LamellarScene",
+    "build_lamellar_scene",
+    "load_lamellar_sources",
+    "export_lamellar_scene",
+    "export_lamellar_sequence",
     "analyze_butterfly",
     "trace_butterfly_ridges",
     "fit_arc_ellipses",

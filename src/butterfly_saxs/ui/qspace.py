@@ -167,6 +167,8 @@ if QT_AVAILABLE:
             self._q_window: tuple[float, float] | None = None
             self._q_unit = "q"
             self._language = "zh_CN"
+            self._compact_mode = False
+            self._empty_message_override: str | None = None
             self._plot_rect = QtCore.QRectF()
             self._interaction_mode = "select_point"
             self._draft_points: list[tuple[float, float]] = []
@@ -186,6 +188,8 @@ if QT_AVAILABLE:
                 (-1, "unknown"): True,
             }
             self._show_excluded = False
+            self._branch_colors = ((42, 154, 220), (239, 143, 44))
+            self._custom_branch_colors = False
             self.setAccessibleName("Butterfly reciprocal-space image")
             self.setAccessibleDescription(
                 "Curvilinear q-space image with selectable butterfly points and editable regions"
@@ -348,11 +352,17 @@ if QT_AVAILABLE:
             self.update()
 
         def _empty_state_message(self) -> str:
+            if self._empty_message_override:
+                return self._empty_message_override
             return (
                 "Load a frame to view reciprocal space"
                 if self._language.lower().startswith("en")
                 else "请先载入图像以查看倒易空间"
             )
+
+        def set_empty_message(self, message: str | None) -> None:
+            self._empty_message_override = message
+            self.update()
 
         @staticmethod
         def _normalise_qmap(qx: Any, qy: Any, shape: tuple[int, int]) -> tuple[Any, Any]:
@@ -466,7 +476,8 @@ if QT_AVAILABLE:
             span_x = max(1e-12, x1 - x0)
             span_y = max(1e-12, y1 - y0)
             margin = 28.0
-            available = self.rect().adjusted(margin, margin, -margin, -margin)
+            available = (self.rect().adjusted(42, 12, -12, -34) if self._compact_mode
+                         else self.rect().adjusted(margin, margin, -margin, -margin))
             if available.width() <= 1 or available.height() <= 1:
                 self._plot_rect = QtCore.QRectF()
                 return
@@ -479,6 +490,26 @@ if QT_AVAILABLE:
                 width,
                 height,
             )
+
+        def set_compact_mode(self, compact: bool = True) -> None:
+            """Use sparse, non-overlapping axes in a small read-only panel."""
+            self._compact_mode = bool(compact)
+            self._mesh_cache_key = None
+            self.update()
+
+        def set_branch_colors(self, colors: Any) -> None:
+            """Optional display palette; measurement/branch identities are unchanged."""
+            if _np is None:
+                raise RuntimeError("NumPy is required for display palettes")
+            values = _np.asarray(colors, dtype=float)
+            if values.shape not in {(2, 3), (2, 4)} or not _np.all(_np.isfinite(values)):
+                raise ValueError("branch colors must contain two finite RGB or RGBA colors")
+            self._branch_colors = tuple(tuple(int(round(v * 255)) for v in _np.clip(row[:3], 0, 1)) for row in values)
+            self._custom_branch_colors = True
+            self.update()
+
+        def _branch_color(self, branch: int, alpha: int = 255) -> Any:
+            return QtGui.QColor(*self._branch_colors[int(branch) % 2], alpha)
 
         def _q_to_screen(self, qx: float, qy: float) -> QtCore.QPointF | None:
             if self._q_bounds is None or self._plot_rect.isNull():
@@ -937,9 +968,9 @@ if QT_AVAILABLE:
                     continue
                 upper = side == "upper"
                 if branch == 0:
-                    color = QtGui.QColor(42, 154, 220, 255)
+                    color = self._branch_color(0)
                 elif branch == 1:
-                    color = QtGui.QColor(239, 143, 44, 255)
+                    color = self._branch_color(1)
                 else:
                     color = QtGui.QColor(180, 180, 185, 255)
                 painter.setPen(QtGui.QPen(color, 1.5))
@@ -975,7 +1006,7 @@ if QT_AVAILABLE:
                         if not self._visible_branches.get((branch, side), True):
                             continue
                         screen_points = [self._q_to_screen(*pair) for pair in segment["points"]]
-                        color = QtGui.QColor(42, 154, 220, 190) if branch == 0 else QtGui.QColor(239, 143, 44, 190)
+                        color = self._branch_color(branch, 190)
                         dashed = extrapolated or bool(segment.get("break_reason"))
                         painter.setPen(QtGui.QPen(color, 2.0, QtCore.Qt.PenStyle.DashLine if dashed else QtCore.Qt.PenStyle.SolidLine))
                         painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
@@ -1020,7 +1051,7 @@ if QT_AVAILABLE:
                     screen_points.append(self._q_to_screen(*pair))
                     previous_q = pair
                     previous_point = item if isinstance(item, Mapping) else None
-                color = QtGui.QColor(42, 154, 220, 190) if str(_read(arc, ("side",), "upper")) == "upper" else QtGui.QColor(239, 143, 44, 190)
+                color = self._branch_color(0 if str(_read(arc, ("side",), "upper")) == "upper" else 1, 190)
                 painter.setPen(QtGui.QPen(color, 2.0, QtCore.Qt.PenStyle.DashLine if extrapolated else QtCore.Qt.PenStyle.SolidLine))
                 painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
                 self._draw_polyline_segments(painter, screen_points)
@@ -1095,6 +1126,8 @@ if QT_AVAILABLE:
                     if branch == 0
                     else QtGui.QColor(250, 175, 95, 175)
                 )
+                if self._custom_branch_colors:
+                    color = self._branch_color(branch, 175)
                 painter.setPen(QtGui.QPen(color, 1.2, QtCore.Qt.PenStyle.DashLine))
                 painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
                 self._draw_polyline_segments(painter, screen_points)
@@ -1169,6 +1202,27 @@ if QT_AVAILABLE:
             self._draw_butterfly(painter)
             self._draw_edits(painter)
             self._draw_draft(painter)
+            if self._compact_mode:
+                painter.setPen(QtGui.QColor(198, 204, 215))
+                font = painter.font()
+                font.setPointSizeF(8.0)
+                painter.setFont(font)
+                x0, x1, y0, y1 = self._q_bounds
+                for fraction in (0., .5, 1.):
+                    xvalue, yvalue = x0 + fraction * (x1 - x0), y0 + fraction * (y1 - y0)
+                    if fraction == .5:
+                        xvalue = 0. if x0 < 0 < x1 else xvalue
+                        yvalue = 0. if y0 < 0 < y1 else yvalue
+                    xp, yp = self._q_to_screen(xvalue, y0), self._q_to_screen(x0, yvalue)
+                    painter.drawText(QtCore.QRectF(xp.x() - 28, self._plot_rect.bottom() + 2, 56, 14),
+                                     QtCore.Qt.AlignmentFlag.AlignCenter, f"{xvalue:.2g}")
+                    painter.drawText(QtCore.QRectF(self._plot_rect.left() - 39, yp.y() - 7, 34, 14),
+                                     QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, f"{yvalue:.2g}")
+                painter.drawText(QtCore.QRectF(0, self.height() - 17, self.width(), 15),
+                                 QtCore.Qt.AlignmentFlag.AlignCenter, f"qx ({self._q_unit})")
+                painter.drawText(int(self._plot_rect.left() + 3), int(self._plot_rect.top() + 11), "qy")
+                painter.end()
+                return
             painter.setPen(QtGui.QColor(198, 204, 215))
             x0, x1, y0, y1 = self._q_bounds
             tick_count = 4
