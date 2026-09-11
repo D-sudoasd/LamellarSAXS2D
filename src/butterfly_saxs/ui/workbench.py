@@ -42,6 +42,7 @@ _GUIDE_TEXT = {
         "open_image": "打开二维 SAXS 图像。",
         "select_poni": "选择与该数据对应的 PONI；未标定前不要解释间距。",
         "preview": "设置 q 范围和 mask 后运行 Preview。",
+        "identify_arcs": "先到蝴蝶页识别弧线，再评估。多数帧得到一阶环周期（环 L）；内部椭圆另给出未发表的 Ln/Lz/长轴 L。多帧请用批处理。",
         "inspect_failure": "检查错误提示、有效像素、q 范围和 mask，再重新运行。",
         "review": "检查 Observed / Model / Residual / Overlay 后接受或拒绝结果。",
         "export": "导出证据包，或在一致配置下进入批处理。",
@@ -70,6 +71,7 @@ _GUIDE_TEXT = {
         "open_image": "Open a two-dimensional SAXS image.",
         "select_poni": "Select the matching PONI before interpreting physical spacing.",
         "preview": "Set the q range and mask, then run Preview.",
+        "identify_arcs": "On the Butterfly page, Identify arcs, then Evaluate. Most frames give a first-order ring period (L ring). Interior ellipses add unpublished Ln/Lz/L major. Use Batch for a folder of frames.",
         "inspect_failure": (
             "Inspect the error, valid pixels, q range, and mask, then rerun."
         ),
@@ -113,10 +115,13 @@ def _is_physical_q(unit: str) -> bool:
     return normalized in {
         "1/nm",
         "nm^-1",
+        "nm-1",
+        "nm⁻¹",
         "1/a",
         "a^-1",
         "angstrom^-1",
         "å^-1",
+        "a⁻¹",
     }
 
 
@@ -245,7 +250,7 @@ def _workflow_lines(window: Any) -> tuple[str, bool]:
     elif not q_ready:
         next_step = text["select_poni"]
     elif result is None:
-        next_step = text["preview"]
+        next_step = text["identify_arcs"]
     elif geometry_only:
         next_step = text["geometry_review"]
     elif review in {"unreviewed", ""}:

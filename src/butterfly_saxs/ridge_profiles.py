@@ -329,12 +329,14 @@ def extract_normal_profile(
     opts = _normalise_options(options)
     context = opts.get("_profile_context")
     if isinstance(context, Mapping):
-        data = np.asarray(context["data"], dtype=float)
-        qx = np.asarray(context["qx"], dtype=float)
-        qy = np.asarray(context["qy"], dtype=float)
-        valid = np.asarray(context["valid"], dtype=bool)
-        inverse_context = np.asarray(context.get("inverse_jacobian"), dtype=float)
-        determinant_context = np.asarray(context.get("jacobian_determinant"), dtype=float)
+        # Reuse the precomputed buffers.  Recasting 2.5 Mpx arrays on every
+        # candidate was the dominant cost on calibrated detector frames.
+        data = context["data"]
+        qx = context["qx"]
+        qy = context["qy"]
+        valid = context["valid"]
+        inverse_context = context.get("inverse_jacobian")
+        determinant_context = context.get("jacobian_determinant")
         context_q_step = float(context.get("q_step", float("nan")))
     else:
         data, _image_mask = _as_image(image)

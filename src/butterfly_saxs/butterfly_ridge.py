@@ -15,12 +15,15 @@ eigenvalue as a proxy for curvature.
 
 from __future__ import annotations
 
+import time as _time
+
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import hashlib
 import json
 import math
+import time
 from typing import Any
 
 import numpy as np
@@ -59,6 +62,29 @@ def _safe_gradient(array: np.ndarray, axis: int) -> np.ndarray:
     if array.shape[axis] < 2:
         return np.zeros_like(array, dtype=float)
     return np.asarray(np.gradient(array, axis=axis), dtype=float)
+
+
+def _offset_nearest(array: np.ndarray, drow: np.ndarray, dcol: np.ndarray) -> np.ndarray:
+    """Sample ``array`` at each pixel plus a local (row, col) offset.
+
+    The curvature stencil only needs a one-pixel sign/height check.  Full-image
+    ``map_coordinates`` on a 2.5 Mpx detector was the dominant evaluate cost.
+    """
+
+    rows, cols = array.shape
+    row_index = np.arange(rows, dtype=np.float64)[:, None]
+    col_index = np.arange(cols, dtype=np.float64)[None, :]
+    yi = np.clip(
+        np.rint(np.nan_to_num(row_index - drow, nan=0.0, posinf=0.0, neginf=0.0)).astype(np.intp),
+        0,
+        rows - 1,
+    )
+    xi = np.clip(
+        np.rint(np.nan_to_num(col_index - dcol, nan=0.0, posinf=0.0, neginf=0.0)).astype(np.intp),
+        0,
+        cols - 1,
+    )
+    return np.asarray(array[yi, xi], dtype=array.dtype)
 
 
 def _as_image(image: Any) -> tuple[np.ndarray, np.ndarray | None]:
@@ -108,6 +134,8 @@ def _normalise_options(options: Any) -> dict[str, Any]:
         "seed_snap_factor": 3.0,
         "center_qx": 0.0,
         "center_qy": 0.0,
+        "first_order_prefer": True,
+        "fill_sparse_first_order_ring": True,
     }
     merged = {**defaults, **values}
     if "scales" in values and "smoothing_scales" not in values:
@@ -164,6 +192,14 @@ def _normalise_options(options: Any) -> dict[str, Any]:
     if not isinstance(merged["profile_refinement"], (bool, np.bool_)):
         raise ValueError("profile_refinement must be boolean")
     merged["profile_refinement"] = bool(merged["profile_refinement"])
+    if "first_order_band" in values and "first_order_prefer" not in values:
+        merged["first_order_prefer"] = values["first_order_band"]
+    if not isinstance(merged["first_order_prefer"], (bool, np.bool_)):
+        raise ValueError("first_order_prefer must be boolean")
+    merged["first_order_prefer"] = bool(merged["first_order_prefer"])
+    if not isinstance(merged["fill_sparse_first_order_ring"], (bool, np.bool_)):
+        raise ValueError("fill_sparse_first_order_ring must be boolean")
+    merged["fill_sparse_first_order_ring"] = bool(merged["fill_sparse_first_order_ring"])
     return merged
 
 
@@ -381,14 +417,13 @@ def _scaled_surface_field(
         singular_min = np.sqrt(np.maximum((singular_trace - singular_disc) / 2.0, 0.0))
         q_scale_anisotropy = singular_max / np.maximum(singular_min, np.finfo(float).eps)
         normal_slope = gradient_x * normal_x + gradient_y * normal_y
-    yy, xx = np.indices(image.shape, dtype=float)
     step_factor = float(options.get("normal_step_factor", 1.0))
     sample_dx = displacement_x * step_factor
     sample_dy = displacement_y * step_factor
-    slope_minus = _sample(normal_slope, yy - sample_dy, xx - sample_dx)
-    slope_plus = _sample(normal_slope, yy + sample_dy, xx + sample_dx)
-    intensity_minus = _sample(z, yy - sample_dy, xx - sample_dx)
-    intensity_plus = _sample(z, yy + sample_dy, xx + sample_dx)
+    slope_minus = _offset_nearest(normal_slope, sample_dy, sample_dx)
+    slope_plus = _offset_nearest(normal_slope, -sample_dy, -sample_dx)
+    intensity_minus = _offset_nearest(z, sample_dy, sample_dx)
+    intensity_plus = _offset_nearest(z, -sample_dy, -sample_dx)
     slope_derivative = (slope_plus - slope_minus) / np.maximum(2.0 * q_step * step_factor, np.finfo(float).eps)
     offset_q = np.divide(-normal_slope, slope_derivative, out=np.full_like(normal_slope, np.nan), where=np.abs(slope_derivative) > 1e-10)
     offset_fraction = np.divide(offset_q, max(q_step * step_factor, np.finfo(float).eps))
@@ -840,6 +875,963 @@ def _assign_reference_branches(candidates: list[dict[str, Any]], options: Mappin
             point["topology_flags"] = list(dict.fromkeys(point.get("topology_flags", []) + ["unresolved_reference_branch"]))
 
 
+def _side_from_reference_axis(
+    qx: float,
+    qy: float,
+    *,
+    center_x: float,
+    center_y: float,
+    reference_axis_deg: float,
+    q_step: float,
+) -> str:
+    """Upper/lower from the declared draw axis when the local major is unusable."""
+
+    theta = math.radians(float(reference_axis_deg))
+    dx = float(qx) - float(center_x)
+    dy = float(qy) - float(center_y)
+    perpendicular = -dx * math.sin(theta) + dy * math.cos(theta)
+    scale = _side_axis_threshold(math.hypot(dx, dy), q_step)
+    if perpendicular > scale:
+        return "upper"
+    if perpendicular < -scale:
+        return "lower"
+    return "unknown"
+
+
+def _side_axis_threshold(radius: float, q_step: float) -> float:
+    """Perpendicular band that is still 'on' the local major axis.
+
+    This is an angular criterion, not a detector-pixel floor.  A one-pixel
+    band swallows an entire flat butterfly wing once ``b`` is smaller than
+    the q-grid step, leaving every point ``side=unknown``.
+    """
+
+    del q_step
+    finite_radius = abs(float(radius)) if np.isfinite(radius) else 0.0
+    return max(finite_radius * math.sin(math.radians(0.20)), float(np.finfo(float).eps))
+
+
+def _point_identity_key(point: Mapping[str, Any]) -> tuple[int, str] | None:
+    """Return a quantitative (branch, side) key, or None when it is unresolved."""
+
+    try:
+        branch = int(point.get("branch_id", -1))
+    except (TypeError, ValueError):
+        return None
+    side = str(point.get("side", "unknown") or "unknown")
+    if branch in (0, 1) and side in {"upper", "lower"}:
+        return branch, side
+    return None
+
+
+def _demote_unresolved_identity_point(point: dict[str, Any], reason: str, *flags: str) -> None:
+    """Keep a tip/axis candidate visible without letting it poison siblings."""
+
+    extra = list(flags) + [reason]
+    point["topology_flags"] = list(dict.fromkeys(list(point.get("topology_flags", [])) + extra))
+    if bool(point.get("accepted", False)):
+        point["accepted"] = False
+        point["reason"] = reason
+
+
+def _first_order_q_hint(
+    q: np.ndarray,
+    intensity: np.ndarray,
+    valid: np.ndarray,
+    q_min: float,
+    q_max: float,
+    *,
+    n_bins: int = 96,
+) -> dict[str, Any]:
+    """Locate the lowest-q significant ring inside the user window.
+
+    A wide experimental window often contains the first-order butterfly and a
+    growing harmonic.  The Wang/Grubb ellipse is the innermost ring, so the
+    hint is the lowest-q local maximum that is still a substantial fraction
+    of the global I(q) peak.  The caller may tighten an analysis band without
+    rewriting the user's configured q_window.
+    """
+
+    summary: dict[str, Any] = {
+        "q_star": None,
+        "band": None,
+        "n_bins": int(n_bins),
+        "reason": None,
+    }
+    selected = (
+        np.asarray(valid, dtype=bool)
+        & np.isfinite(q)
+        & np.isfinite(intensity)
+        & (q >= q_min)
+        & (q <= q_max)
+    )
+    if int(np.count_nonzero(selected)) < 200:
+        summary["reason"] = "insufficient_pixels"
+        return summary
+    radii = np.asarray(q[selected], dtype=float)
+    weights = np.clip(np.asarray(intensity[selected], dtype=float), 0.0, None)
+    edges = np.linspace(float(q_min), float(q_max), int(n_bins) + 1)
+    summed, _ = np.histogram(radii, bins=edges, weights=weights)
+    counts, _ = np.histogram(radii, bins=edges)
+    profile = np.divide(
+        summed,
+        counts,
+        out=np.zeros_like(summed, dtype=float),
+        where=counts > 0,
+    )
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    usable = np.isfinite(profile) & (counts >= 8)
+    if int(np.count_nonzero(usable)) < 8:
+        summary["reason"] = "sparse_radial_profile"
+        return summary
+    intensity_q = np.where(usable, profile, 0.0)
+    peak = float(np.max(intensity_q))
+    if not np.isfinite(peak) or peak <= 0.0:
+        summary["reason"] = "empty_radial_profile"
+        return summary
+    interior = (
+        (intensity_q[1:-1] >= intensity_q[:-2])
+        & (intensity_q[1:-1] >= intensity_q[2:])
+        & (intensity_q[1:-1] >= 0.25 * peak)
+    )
+    peak_indices = np.where(interior)[0] + 1
+    if peak_indices.size == 0:
+        peak_indices = np.asarray([int(np.argmax(intensity_q))], dtype=int)
+    # Adjacent bins of one Bragg ring can each look like a local max.
+    # Harmonics sit at ≳2× q*, so keep the strongest member of the lowest-q
+    # family instead of the first noisy shoulder.
+    peak_index = _select_first_order_peak_index(
+        centres[peak_indices],
+        intensity_q[peak_indices],
+        peak_indices,
+    )
+    q_bin = float(centres[peak_index])
+    q_star = _refine_radial_peak_q(
+        radii, weights, q_bin, q_min, q_max, coarse_bins=int(n_bins)
+    )
+    if not np.isfinite(q_star) or q_star <= 0.0:
+        summary["reason"] = "invalid_peak"
+        return summary
+    low = max(float(q_min), 0.62 * q_star)
+    high = min(float(q_max), 1.45 * q_star)
+    if high <= low:
+        summary["q_star"] = q_star
+        summary["q_star_bin"] = q_bin
+        summary["reason"] = "degenerate_band"
+        return summary
+    summary.update(
+        {
+            "q_star": q_star,
+            "q_star_bin": q_bin,
+            "band": [low, high],
+            "reason": "ok",
+        }
+    )
+    return summary
+
+
+def _select_first_order_peak_index(
+    peak_q: np.ndarray,
+    peak_intensity: np.ndarray,
+    peak_indices: np.ndarray,
+    *,
+    family_span: float = 1.45,
+) -> int:
+    """Pick the strongest bin in the lowest-q peak family."""
+
+    if peak_indices.size == 1:
+        return int(peak_indices[0])
+    families: list[list[int]] = [[0]]
+    for offset in range(1, int(peak_q.size)):
+        root = float(peak_q[families[-1][0]])
+        value = float(peak_q[offset])
+        if np.isfinite(root) and np.isfinite(value) and value <= family_span * root:
+            families[-1].append(offset)
+        else:
+            families.append([offset])
+    family = families[0]
+    best = max(family, key=lambda item: float(peak_intensity[item]))
+    return int(peak_indices[best])
+
+
+def _refine_radial_peak_q(
+    radii: np.ndarray,
+    weights: np.ndarray,
+    q_bin: float,
+    q_min: float,
+    q_max: float,
+    *,
+    n_bins: int = 25,
+    coarse_bins: int = 96,
+) -> float:
+    """Parabolic sub-bin refinement of I(q)* around a coarse histogram peak."""
+
+    try:
+        centre = float(q_bin)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not (np.isfinite(centre) and centre > 0.0):
+        return float("nan")
+    coarse_step = (float(q_max) - float(q_min)) / max(int(coarse_bins), 1)
+    if not np.isfinite(coarse_step) or coarse_step <= 0.0:
+        coarse_step = 0.08 * centre
+    # Stay inside the coarse peak's own bin.  A 0.75–1.25 window plus a
+    # grid that misses q_bin makes the 3-point interpolate hit its clamp
+    # and snap every frame to one of two discrete q* values.
+    span = max(float(coarse_step), 0.06 * centre)
+    count = max(7, int(n_bins) | 1)
+    mid = count // 2
+    step = 2.0 * span / count
+    low = centre - (mid + 0.5) * step
+    high = centre + (mid + 0.5) * step
+    low = max(float(q_min), low)
+    high = min(float(q_max), high)
+    if high <= low:
+        return centre
+    edges = np.linspace(low, high, count + 1)
+    summed, _ = np.histogram(radii, bins=edges, weights=weights)
+    counts, _ = np.histogram(radii, bins=edges)
+    profile = np.divide(
+        summed,
+        counts,
+        out=np.zeros_like(summed, dtype=float),
+        where=counts > 0,
+    )
+    centres = 0.5 * (edges[:-1] + edges[1:])
+    usable = np.isfinite(profile) & (counts >= 4)
+    if int(np.count_nonzero(usable)) < 5:
+        return centre
+    intensity_q = np.where(usable, profile, 0.0)
+    index = int(np.argmin(np.abs(centres - centre)))
+    if not usable[index]:
+        return centre
+    if 0 < index < intensity_q.size - 1 and (
+        intensity_q[index] < intensity_q[index - 1]
+        or intensity_q[index] < intensity_q[index + 1]
+    ):
+        # One step toward the higher neighbour keeps the interpolate on
+        # this ring without a second argmax over the whole window.
+        index = index - 1 if intensity_q[index - 1] > intensity_q[index + 1] else index + 1
+        if not usable[index]:
+            return centre
+    if index <= 0 or index >= intensity_q.size - 1:
+        return float(centres[index])
+    y0, y1, y2 = float(intensity_q[index - 1]), float(intensity_q[index]), float(intensity_q[index + 1])
+    denom = y0 - 2.0 * y1 + y2
+    if abs(denom) < 1e-12 or y1 + 1e-12 < max(y0, y2):
+        return float(centres[index])
+    delta = 0.5 * (y0 - y2) / denom
+    delta = max(-0.5, min(0.5, float(delta)))
+    bin_step = float(centres[index] - centres[index - 1])
+    refined = float(centres[index] + delta * bin_step)
+    if not (np.isfinite(refined) and low <= refined <= high):
+        return float(centres[index])
+    return refined
+
+
+def _prefer_first_order_scores(
+    candidates: Sequence[dict[str, Any]],
+    q_star: float | None,
+    *,
+    sigma_log: float = 0.45,
+) -> int:
+    """Down-weight harmonic-scale candidates without clipping ellipse tips.
+
+    A hard |q| crop around I(q)* removes the major-axis ends of a flat
+    Wang ellipse.  A log-q score weight keeps those tips while making a
+    3–4× harmonic lose NMS / max_points competition.
+    """
+
+    try:
+        hint = float(q_star) if q_star is not None else float("nan")
+    except (TypeError, ValueError):
+        return 0
+    if not np.isfinite(hint) or hint <= 0.0 or not np.isfinite(sigma_log) or sigma_log <= 0.0:
+        return 0
+    updated = 0
+    for point in candidates:
+        try:
+            radius = float(np.hypot(float(point["qx"]), float(point["qy"])))
+            score = float(point.get("score", 0.0))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (np.isfinite(radius) and radius > 0.0 and np.isfinite(score)):
+            continue
+        weight = math.exp(-0.5 * (math.log(radius / hint) / float(sigma_log)) ** 2)
+        point["score"] = score * weight
+        point["first_order_weight"] = float(weight)
+        updated += 1
+    return updated
+
+
+def _axis_deviation_deg(
+    qx: float,
+    qy: float,
+    *,
+    center_x: float,
+    center_y: float,
+    reference_axis_deg: float,
+) -> float:
+    """Absolute angle from the declared draw-axis line, in degrees."""
+
+    theta = math.radians(float(reference_axis_deg))
+    dx = float(qx) - float(center_x)
+    dy = float(qy) - float(center_y)
+    along = dx * math.cos(theta) + dy * math.sin(theta)
+    perpendicular = -dx * math.sin(theta) + dy * math.cos(theta)
+    angle = math.degrees(math.atan2(perpendicular, along))
+    return min(abs(angle), abs(abs(angle) - 180.0))
+
+
+def _angular_delta_deg(first: float, second: float) -> float:
+    return abs(((float(first) - float(second) + 180.0) % 360.0) - 180.0)
+
+
+def _sparse_first_order_coverage(
+    points: Sequence[Mapping[str, Any]],
+    *,
+    center_x: float,
+    center_y: float,
+    reference_axis_deg: float,
+) -> dict[str, Any]:
+    """True when accepted identity points are too axial to define an ellipse."""
+
+    identity = [
+        point
+        for point in points
+        if bool(point.get("accepted", False)) and _point_identity_key(point) is not None
+    ]
+    if not identity:
+        return {"sparse": True, "n": 0, "max_dev_deg": None}
+    deviations = [
+        _axis_deviation_deg(
+            float(point["qx"]),
+            float(point["qy"]),
+            center_x=center_x,
+            center_y=center_y,
+            reference_axis_deg=reference_axis_deg,
+        )
+        for point in identity
+    ]
+    max_dev = max(deviations)
+    sparse = max_dev < 18.0 or (len(identity) < 8 and max_dev < 25.0)
+    return {"sparse": sparse, "n": len(identity), "max_dev_deg": float(max_dev)}
+
+
+def _sector_first_order_peak(
+    qx: np.ndarray,
+    qy: np.ndarray,
+    q: np.ndarray,
+    intensity: np.ndarray,
+    valid: np.ndarray,
+    *,
+    sector_deg: float,
+    halfwidth_deg: float,
+    hint: float,
+) -> dict[str, Any] | None:
+    """Return one observed radial peak in an azimuth sector, or None."""
+
+    if not (np.isfinite(hint) and hint > 0.0):
+        return None
+    ang = np.degrees(np.arctan2(qy, qx))
+    delta = np.abs(((ang - float(sector_deg) + 180.0) % 360.0) - 180.0)
+    q_lo, q_hi = 0.70 * hint, 1.45 * hint
+    selected = (
+        np.asarray(valid, dtype=bool)
+        & np.isfinite(q)
+        & np.isfinite(intensity)
+        & (delta <= float(halfwidth_deg))
+        & (q >= q_lo)
+        & (q <= q_hi)
+    )
+    if int(np.count_nonzero(selected)) < 12:
+        return None
+    radii = np.asarray(q[selected], dtype=float)
+    values = np.asarray(intensity[selected], dtype=float)
+    edges = np.linspace(q_lo, q_hi, 9)
+    profile = np.full(edges.size - 1, np.nan, dtype=float)
+    counts = np.zeros(edges.size - 1, dtype=int)
+    idx = np.digitize(radii, edges) - 1
+    for bin_i in range(edges.size - 1):
+        in_bin = idx == bin_i
+        counts[bin_i] = int(np.count_nonzero(in_bin))
+        if counts[bin_i] >= 2:
+            profile[bin_i] = float(np.nanmedian(values[in_bin]))
+    usable = np.isfinite(profile)
+    if int(np.count_nonzero(usable)) < 3:
+        return None
+    peak_i = int(np.nanargmax(np.where(usable, profile, -np.inf)))
+    peak = float(profile[peak_i])
+    baseline = float(np.nanmedian(profile[usable]))
+    if not (np.isfinite(peak) and np.isfinite(baseline) and baseline > 0 and peak >= 1.30 * baseline):
+        return None
+    q_star = float(0.5 * (edges[peak_i] + edges[peak_i + 1]))
+    in_bin = selected & (q >= edges[peak_i]) & (q < edges[peak_i + 1])
+    if int(np.count_nonzero(in_bin)) < 3:
+        in_bin = selected
+    sample_qx = float(np.nanmedian(qx[in_bin]))
+    sample_qy = float(np.nanmedian(qy[in_bin]))
+    if not (np.isfinite(sample_qx) and np.isfinite(sample_qy)):
+        return None
+    rows, cols = np.nonzero(in_bin)
+    nearest = int(np.argmin((qx[in_bin] - sample_qx) ** 2 + (qy[in_bin] - sample_qy) ** 2))
+    return {
+        "qx": sample_qx,
+        "qy": sample_qy,
+        "q_star": q_star,
+        "intensity": peak,
+        "contrast": peak / baseline,
+        "pixel_x": float(cols[nearest]),
+        "pixel_y": float(rows[nearest]),
+        "sector_deg": float(sector_deg),
+    }
+
+
+def _next_arc_id(points: Sequence[Mapping[str, Any]], arcs: Sequence[Mapping[str, Any]] | None = None) -> int:
+    used = {-1}
+    for record in list(points) + list(arcs or ()):
+        try:
+            used.add(int(record.get("arc_id", -1)))
+        except (TypeError, ValueError):
+            continue
+    return max(used) + 1
+
+
+def _fill_sparse_first_order_ring(
+    points: list[dict[str, Any]],
+    *,
+    qx: np.ndarray,
+    qy: np.ndarray,
+    q: np.ndarray,
+    intensity: np.ndarray,
+    valid: np.ndarray,
+    hint: float | None,
+    options: Mapping[str, Any],
+    q_step: float,
+    signature: str,
+    arcs: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Add observed first-order ring samples when curvature kept only the streak.
+
+    This does not invent quadrants.  A sector is filled only when I(q) still
+    has a peak near the first-order hint and no accepted identity point is
+    already there.
+    """
+
+    summary: dict[str, Any] = {"applied": False, "added": 0, "reason": None, "sectors": []}
+    if not bool(options.get("fill_sparse_first_order_ring", True)):
+        summary["reason"] = "disabled"
+        return summary
+    try:
+        hint_q = float(hint) if hint is not None else float("nan")
+    except (TypeError, ValueError):
+        hint_q = float("nan")
+    if not (np.isfinite(hint_q) and hint_q > 0.0):
+        summary["reason"] = "no_first_order_hint"
+        return summary
+    center_x = float(options.get("center_qx", 0.0))
+    center_y = float(options.get("center_qy", 0.0))
+    reference = float(options.get("reference_axis_deg", 0.0))
+    coverage = _sparse_first_order_coverage(
+        points, center_x=center_x, center_y=center_y, reference_axis_deg=reference
+    )
+    summary.update(coverage)
+    if not coverage["sparse"]:
+        summary["reason"] = "identity_coverage_sufficient"
+        return summary
+    existing_angles = []
+    for point in points:
+        if not bool(point.get("accepted", False)):
+            continue
+        existing_angles.append(math.degrees(math.atan2(float(point["qy"]), float(point["qx"]))))
+    added: list[dict[str, Any]] = []
+    for quadrant in (0.0, 90.0, 180.0, 270.0):
+        for offset in (30.0, 45.0, 60.0, 75.0):
+            sector = reference + quadrant + offset
+            if any(_angular_delta_deg(sector, angle) < 12.0 for angle in existing_angles):
+                continue
+            peak = _sector_first_order_peak(
+                qx,
+                qy,
+                q,
+                intensity,
+                valid,
+                sector_deg=sector,
+                halfwidth_deg=7.5,
+                hint=hint_q,
+            )
+            if peak is None:
+                continue
+            point = {
+                "qx": peak["qx"],
+                "qy": peak["qy"],
+                "pixel_x": peak["pixel_x"],
+                "pixel_y": peak["pixel_y"],
+                "intensity": peak["intensity"],
+                "snr": peak["contrast"],
+                "normal_qx": peak["qx"] / max(hint_q, 1e-12),
+                "normal_qy": peak["qy"] / max(hint_q, 1e-12),
+                "tangent_qx": -peak["qy"] / max(hint_q, 1e-12),
+                "tangent_qy": peak["qx"] / max(hint_q, 1e-12),
+                "curvature": float("nan"),
+                "scale": 1.0,
+                "scale_stability": float("nan"),
+                "scale_stable": False,
+                "topology_flag": "first_order_ring_sample",
+                "topology": "first_order_ring_sample",
+                "topology_flags": ["first_order_ring_sample", "side_from_reference_axis"],
+                "accepted": True,
+                "valid": True,
+                "reason": "first_order_ring_sample",
+                "arc_id": -1,
+                "score": float(peak["contrast"]),
+                "q_normal_step": float(q_step),
+                "localization_sigma_q": float(q_step),
+                "sampling_sigma_q": float(q_step),
+                "uncertainty_source": "azimuthal_radial_peak",
+            }
+            _assign_reference_branches([point], options)
+            point["side"] = _side_from_reference_axis(
+                float(point["qx"]),
+                float(point["qy"]),
+                center_x=center_x,
+                center_y=center_y,
+                reference_axis_deg=reference,
+                q_step=q_step,
+            )
+            if _point_identity_key(point) is None:
+                continue
+            added.append(point)
+            existing_angles.append(math.degrees(math.atan2(float(point["qy"]), float(point["qx"]))))
+            summary["sectors"].append(
+                {
+                    "sector_deg": peak["sector_deg"],
+                    "q_star": peak["q_star"],
+                    "contrast": peak["contrast"],
+                }
+            )
+    if not added:
+        summary["reason"] = "no_observed_sector_peak"
+        return summary
+    _assign_point_ids(added, signature)
+    next_arc = _next_arc_id(points, arcs)
+    for point in added:
+        point["arc_id"] = int(next_arc)
+        if arcs is not None:
+            arcs.append(
+                {
+                    "arc_id": int(next_arc),
+                    "valid": True,
+                    "reason": "first_order_ring_sample",
+                    "topology_flags": ["first_order_ring_sample"],
+                    "point_ids": [str(point["point_id"])],
+                    "identity_resolved": _point_identity_key(point) is not None,
+                }
+            )
+        next_arc += 1
+    points.extend(added)
+    summary["applied"] = True
+    summary["added"] = len(added)
+    summary["reason"] = "filled_observed_ring_sectors"
+    return summary
+
+
+# First-order tips of a flat origin-centred ellipse can reach ~3× q*.
+# A 3–4× harmonic sits beyond that and must not remain in the same family.
+FIRST_ORDER_FAMILY_SPAN = 3.5
+
+
+def _demote_secondary_radial_population(
+    points: Sequence[dict[str, Any]],
+    prefer_radius: float | None = None,
+) -> dict[str, Any]:
+    """Keep one radial family when a late frame still has an earlier ring.
+
+    A single origin-centred ellipse cannot carry the first-order butterfly and
+    a harmonic at once.  A clear |q| gap demotes the family farther from the
+    first-order hint; without a hint the inner ring is kept.  Unimodal wings
+    are unchanged.
+    """
+
+    accepted = [
+        point
+        for point in points
+        if bool(point.get("accepted", False)) and _point_identity_key(point) is not None
+    ]
+    radii = []
+    for point in accepted:
+        try:
+            radius = float(np.hypot(float(point["qx"]), float(point["qy"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if np.isfinite(radius) and radius > 0.0:
+            radii.append(radius)
+    summary = {"split": False, "kept": 0, "demoted": 0, "threshold": None, "keep": None}
+    if len(radii) >= 12:
+        ordered = np.sort(np.asarray(radii, dtype=float))
+        gaps = np.diff(ordered)
+        if gaps.size > 0:
+            split_at = int(np.argmax(gaps))
+            low = ordered[: split_at + 1]
+            high = ordered[split_at + 1 :]
+            gap = float(gaps[split_at])
+            median = float(np.median(ordered))
+            can_split = (
+                low.size >= 4
+                and high.size >= 4
+                and median > 0.0
+                and gap >= 0.35 * median
+                and float(high[0] / max(float(low[-1]), np.finfo(float).eps)) >= 1.8
+            )
+            if can_split:
+                if prefer_radius is not None:
+                    try:
+                        hint_radius = float(prefer_radius)
+                    except (TypeError, ValueError):
+                        hint_radius = float("nan")
+                    if np.isfinite(hint_radius) and hint_radius > 0.0:
+                        keep_high = abs(float(np.median(high)) - hint_radius) < abs(
+                            float(np.median(low)) - hint_radius
+                        )
+                    else:
+                        keep_high = False
+                else:
+                    keep_high = False
+                threshold = 0.5 * (float(low[-1]) + float(high[0]))
+                demoted = 0
+                for point in accepted:
+                    try:
+                        radius = float(np.hypot(float(point["qx"]), float(point["qy"])))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    drop = radius < threshold if keep_high else radius >= threshold
+                    if drop:
+                        _demote_unresolved_identity_point(
+                            point, "secondary_radial_population", "mixed_radial_populations"
+                        )
+                        demoted += 1
+                summary.update(
+                    {
+                        "split": True,
+                        "kept": int(len(accepted) - demoted),
+                        "demoted": int(demoted),
+                        "threshold": threshold,
+                        "keep": "high_q" if keep_high else "low_q",
+                    }
+                )
+    extra = _demote_beyond_first_order_family(accepted, prefer_radius)
+    if extra:
+        summary["demoted"] = int(summary.get("demoted") or 0) + extra
+        summary["hint_ceiling"] = _first_order_family_ceiling(prefer_radius)
+        if not summary["split"]:
+            summary["keep"] = "first_order_hint"
+    summary["kept"] = int(sum(1 for point in accepted if point.get("accepted")))
+    return summary
+
+
+def _first_order_family_ceiling(prefer_radius: Any) -> float | None:
+    try:
+        hint = float(prefer_radius) if prefer_radius is not None else float("nan")
+    except (TypeError, ValueError):
+        return None
+    if not (np.isfinite(hint) and hint > 0.0):
+        return None
+    return float(FIRST_ORDER_FAMILY_SPAN) * hint
+
+
+def _demote_beyond_first_order_family(
+    accepted: Sequence[dict[str, Any]],
+    prefer_radius: Any,
+) -> int:
+    ceiling = _first_order_family_ceiling(prefer_radius)
+    if ceiling is None:
+        return 0
+    demoted = 0
+    for point in accepted:
+        if not bool(point.get("accepted", False)):
+            continue
+        try:
+            radius = float(np.hypot(float(point["qx"]), float(point["qy"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if radius > ceiling:
+            _demote_unresolved_identity_point(
+                point, "secondary_radial_population", "beyond_first_order_family"
+            )
+            demoted += 1
+    return demoted
+
+
+def _component_major_direction(
+    ordered: Sequence[int],
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    center_x: float,
+    center_y: float,
+    reference_vector: np.ndarray,
+) -> tuple[np.ndarray, float, bool]:
+    positions = np.asarray(
+        [[candidates[index]["qx"], candidates[index]["qy"]] for index in ordered],
+        dtype=float,
+    )
+    centered = positions - np.asarray([center_x, center_y])
+    if len(positions) >= 3 and np.linalg.matrix_rank(np.cov(centered.T)) > 0:
+        covariance = np.cov(centered.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        major = np.asarray(eigenvectors[:, int(np.argmax(eigenvalues))], dtype=float)
+    else:
+        tangents = np.asarray(
+            [[candidates[index]["tangent_qx"], candidates[index]["tangent_qy"]] for index in ordered],
+            dtype=float,
+        )
+        major = np.nanmedian(tangents, axis=0)
+    major_norm = float(np.hypot(*major))
+    direction_confidence = 0.0
+    if major_norm > 1e-10 and np.all(np.isfinite(major)):
+        major = major / major_norm
+        alignment = abs(float(np.dot(major, reference_vector)))
+        direction_confidence = float(min(1.0, alignment))
+        if float(np.dot(major, reference_vector)) < 0:
+            major = -major
+    else:
+        major = np.asarray([np.nan, np.nan], dtype=float)
+    resolved = bool(np.all(np.isfinite(major)) and direction_confidence >= 0.20)
+    return major, direction_confidence, resolved
+
+
+def _assign_component_identities(
+    ordered: Sequence[int],
+    candidates: list[dict[str, Any]],
+    options: Mapping[str, Any],
+    q_step: float,
+    *,
+    center_x: float,
+    center_y: float,
+    major: np.ndarray,
+    resolved: bool,
+) -> None:
+    positions = np.asarray(
+        [[candidates[index]["qx"], candidates[index]["qy"]] for index in ordered],
+        dtype=float,
+    )
+    centered = positions - np.asarray([center_x, center_y])
+    side_normal = np.asarray([-major[1], major[0]]) if resolved else np.asarray([np.nan, np.nan])
+    median_radius = float(np.nanmedian(np.linalg.norm(centered, axis=1)))
+    side_scale = _side_axis_threshold(median_radius, q_step)
+    for order_index, index in enumerate(ordered):
+        point = candidates[index]
+        point["arc_order"] = int(order_index)
+        branch, quadrant = _quadrant_branch(
+            float(point["qx"]),
+            float(point["qy"]),
+            center_x=center_x,
+            center_y=center_y,
+            reference_axis_deg=float(options.get("reference_axis_deg", 0.0)),
+            tolerance_deg=float(options["quadrant_axis_tol_deg"]),
+        )
+        point["branch_id"], point["quadrant"] = int(branch), quadrant
+        short_arc = len(ordered) < int(options["min_arc_points"])
+        use_reference_side = (not resolved) or short_arc
+        if use_reference_side:
+            point["side"] = _side_from_reference_axis(
+                float(point["qx"]),
+                float(point["qy"]),
+                center_x=center_x,
+                center_y=center_y,
+                reference_axis_deg=float(options.get("reference_axis_deg", 0.0)),
+                q_step=q_step,
+            )
+        else:
+            radial = np.asarray([float(point["qx"]) - center_x, float(point["qy"]) - center_y])
+            side_value = float(np.dot(radial, side_normal))
+            point["side"] = (
+                "upper" if side_value > side_scale else "lower" if side_value < -side_scale else "unknown"
+            )
+        flags = list(point.get("topology_flags", []))
+        flags.append("connected_arc")
+        point["topology_flag"] = "connected_observed_arc"
+        point["topology"] = "connected_observed_arc"
+        if short_arc:
+            flags.append("short_arc")
+        if not resolved:
+            flags.append("major_direction_ambiguous")
+        if use_reference_side and point["side"] in {"upper", "lower"}:
+            flags.append("side_from_reference_axis")
+        elif not resolved and bool(point.get("accepted", False)):
+            point["reason"] = "ambiguous_major_direction"
+        if _point_identity_key(point) is None:
+            reason = "side_axis_boundary" if int(point["branch_id"]) in (0, 1) else "unresolved_reference_branch"
+            flags.append(reason)
+            if bool(point.get("accepted", False)):
+                point["accepted"] = False
+                point["reason"] = reason
+        point["topology_flags"] = list(dict.fromkeys(flags))
+
+
+def _component_tangent_errors(
+    ordered: Sequence[int],
+    candidates: list[dict[str, Any]],
+) -> list[float]:
+    tangent_errors: list[float] = []
+    for order_index, index in enumerate(ordered):
+        if len(ordered) == 1:
+            tangent_errors.append(float("nan"))
+            continue
+        neighbour = ordered[min(order_index + 1, len(ordered) - 1)] if order_index == 0 else ordered[order_index - 1]
+        dx = float(candidates[neighbour]["qx"]) - float(candidates[index]["qx"])
+        dy = float(candidates[neighbour]["qy"]) - float(candidates[index]["qy"])
+        norm = math.hypot(dx, dy)
+        if norm <= np.finfo(float).eps:
+            tangent_errors.append(float("nan"))
+            continue
+        observed = np.asarray([dx / norm, dy / norm])
+        tangent = np.asarray(
+            [float(candidates[index]["tangent_qx"]), float(candidates[index]["tangent_qy"])]
+        )
+        dot = float(np.clip(abs(np.dot(observed, tangent)), -1.0, 1.0))
+        error = float(np.degrees(np.arccos(dot)))
+        tangent_errors.append(error)
+        candidates[index]["tangent_error_deg"] = error
+    return tangent_errors
+
+
+def _split_component_identities(ordered: Sequence[int], candidates: Sequence[Mapping[str, Any]]) -> dict[tuple[int, str], list[int]]:
+    """Split one connected wing into identity-pure (branch, side) groups.
+
+    A continuous ellipse wing often crosses the local major axis at the tip.
+    Those two sides belong to the same observed component but must not share
+    one arc identity, or the later refresh would discard the whole wing.
+    """
+
+    groups: dict[tuple[int, str], list[int]] = {}
+    for index in ordered:
+        key = _point_identity_key(candidates[index])
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(index)
+    return groups
+
+
+def _build_identity_arc(
+    *,
+    arc_id: int,
+    ordered: Sequence[int],
+    candidates: list[dict[str, Any]],
+    options: Mapping[str, Any],
+    major: np.ndarray,
+    direction_confidence: float,
+    resolved: bool,
+    parent_split: bool,
+) -> dict[str, Any]:
+    for order_index, index in enumerate(ordered):
+        candidates[index]["arc_id"] = int(arc_id)
+        candidates[index]["arc_order"] = int(order_index)
+        if parent_split:
+            candidates[index]["topology_flags"] = list(
+                dict.fromkeys(candidates[index].get("topology_flags", []) + ["identity_split_from_connected_wing"])
+            )
+    tangent_errors = _component_tangent_errors(ordered, candidates)
+    accepted_count = int(sum(bool(candidates[index]["accepted"]) for index in ordered))
+    scale_values = np.asarray([float(candidates[index]["scale"]) for index in ordered], dtype=float)
+    scale_stability = (
+        float(1.0 / (1.0 + np.nanstd(scale_values) / max(np.nanmean(scale_values), np.finfo(float).eps)))
+        if scale_values.size
+        else float("nan")
+    )
+    for index in ordered:
+        candidates[index]["scale_stability"] = scale_stability
+        candidates[index]["scale_stable"] = bool(scale_stability >= 0.5)
+        if scale_stability < 0.5:
+            candidates[index]["topology_flags"] = list(
+                dict.fromkeys(candidates[index]["topology_flags"] + ["scale_unstable"])
+            )
+    tangent_error_median = (
+        float(np.nanmedian(tangent_errors)) if np.any(np.isfinite(tangent_errors)) else float("nan")
+    )
+    branch_ids = sorted({int(candidates[index]["branch_id"]) for index in ordered})
+    sides = sorted({str(candidates[index]["side"]) for index in ordered if _point_identity_key(candidates[index])})
+    identity_resolved = bool(len(branch_ids) == 1 and branch_ids[0] in (0, 1) and len(sides) == 1 and sides[0] in {"upper", "lower"})
+    identity_flags: list[str] = []
+    if not (len(branch_ids) == 1 and branch_ids[0] in (0, 1)):
+        identity_flags.append("unresolved_or_mixed_branch")
+    if not (len(sides) == 1 and sides[0] in {"upper", "lower"}):
+        identity_flags.append("unresolved_or_mixed_side")
+    if parent_split:
+        identity_flags.append("identity_split_from_connected_wing")
+    arc_valid = bool(
+        accepted_count >= int(options["min_arc_points"])
+        and np.isfinite(tangent_error_median)
+        and tangent_error_median <= float(options.get("max_arc_tangent_error_deg", 45.0))
+        and scale_stability >= 0.4
+        and identity_resolved
+    )
+    return {
+        "arc_id": int(arc_id),
+        "point_ids": [str(candidates[index]["point_id"]) for index in ordered],
+        "ordered_point_ids": [str(candidates[index]["point_id"]) for index in ordered],
+        "n_points": int(len(ordered)),
+        "accepted_points": accepted_count,
+        "valid": arc_valid,
+        "reason": "accepted" if arc_valid else "short_or_rejected_arc",
+        "major_direction_qx": float(major[0]),
+        "major_direction_qy": float(major[1]),
+        "major_direction_resolved": resolved,
+        "major_direction_confidence": direction_confidence,
+        "side_reference": "observed_arc_major_direction_and_center",
+        "reference_axis_deg": float(options.get("reference_axis_deg", 0.0)),
+        "branch_ids": branch_ids,
+        "quadrants": sorted({str(candidates[index]["quadrant"]) for index in ordered}),
+        "sides": sides,
+        "accepted_branch_ids": branch_ids,
+        "accepted_sides": sides,
+        "identity_resolved": identity_resolved,
+        "identity_flags": identity_flags,
+        "tangent_error_deg": tangent_errors,
+        "tangent_error_median_deg": tangent_error_median,
+        "scale_stability": scale_stability,
+        "topology_flag": "connected_observed_arc",
+        "topology_flags": ["topology_before_ellipse_fit", *identity_flags],
+        "parent_component_split": bool(parent_split),
+    }
+
+
+def _attach_unresolved_to_nearest_arc(
+    unresolved: Sequence[int],
+    arcs: Sequence[Mapping[str, Any]],
+    candidates: list[dict[str, Any]],
+) -> None:
+    """Keep tip/axis points on a same-branch sibling arc for review only."""
+
+    if not unresolved or not arcs:
+        return
+    by_id = {str(item.get("point_id")): item for item in candidates}
+    for index in unresolved:
+        point = candidates[index]
+        if int(point.get("arc_id", -1)) >= 0:
+            continue
+        branch = int(point.get("branch_id", -1))
+        qx, qy = float(point["qx"]), float(point["qy"])
+        best_id = None
+        best_distance = float("inf")
+        for arc in arcs:
+            if branch in (0, 1) and list(arc.get("branch_ids", ())) != [branch]:
+                continue
+            for point_id in arc.get("ordered_point_ids", ()):
+                sibling = by_id.get(str(point_id))
+                if sibling is None:
+                    continue
+                distance = math.hypot(qx - float(sibling["qx"]), qy - float(sibling["qy"]))
+                if distance < best_distance:
+                    best_distance = distance
+                    best_id = int(arc["arc_id"])
+        if best_id is None:
+            continue
+        point["arc_id"] = best_id
+        point["topology_flags"] = list(
+            dict.fromkeys(point.get("topology_flags", []) + ["attached_unresolved_identity"])
+        )
+
+
 def _arc_topology(
     groups: list[list[int]],
     edges: list[tuple[int, int]],
@@ -856,140 +1848,43 @@ def _arc_topology(
         if len(component) < 2:
             continue
         ordered = _ordered_component(component, edges, candidates)
-        positions = np.asarray([[candidates[index]["qx"], candidates[index]["qy"]] for index in ordered], dtype=float)
-        centered = positions - np.asarray([center_x, center_y])
-        if len(positions) >= 3 and np.linalg.matrix_rank(np.cov(centered.T)) > 0:
-            covariance = np.cov(centered.T)
-            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-            major = np.asarray(eigenvectors[:, int(np.argmax(eigenvalues))], dtype=float)
-        else:
-            tangents = np.asarray([[candidates[index]["tangent_qx"], candidates[index]["tangent_qy"]] for index in ordered], dtype=float)
-            major = np.nanmedian(tangents, axis=0)
-        major_norm = float(np.hypot(*major))
-        direction_confidence = 0.0
-        if major_norm > 1e-10 and np.all(np.isfinite(major)):
-            major /= major_norm
-            alignment = abs(float(np.dot(major, reference_vector)))
-            direction_confidence = float(min(1.0, alignment))
-            if float(np.dot(major, reference_vector)) < 0:
-                major *= -1.0
-        else:
-            major = np.asarray([np.nan, np.nan], dtype=float)
-        resolved = bool(np.all(np.isfinite(major)) and direction_confidence >= 0.20)
-        if resolved:
-            side_normal = np.asarray([-major[1], major[0]])
-        else:
-            side_normal = np.asarray([np.nan, np.nan])
-        for order_index, index in enumerate(ordered):
-            point = candidates[index]
-            point["arc_id"] = int(arc_id)
-            point["arc_order"] = int(order_index)
-            branch, quadrant = _quadrant_branch(
-                float(point["qx"]),
-                float(point["qy"]),
-                center_x=center_x,
-                center_y=center_y,
-                reference_axis_deg=float(options.get("reference_axis_deg", 0.0)),
-                tolerance_deg=float(options["quadrant_axis_tol_deg"]),
+        major, direction_confidence, resolved = _component_major_direction(
+            ordered,
+            candidates,
+            center_x=center_x,
+            center_y=center_y,
+            reference_vector=reference_vector,
+        )
+        _assign_component_identities(
+            ordered,
+            candidates,
+            options,
+            q_step,
+            center_x=center_x,
+            center_y=center_y,
+            major=major,
+            resolved=resolved,
+        )
+        identity_groups = _split_component_identities(ordered, candidates)
+        parent_split = len(identity_groups) > 1
+        unresolved = [index for index in ordered if _point_identity_key(candidates[index]) is None]
+        created: list[dict[str, Any]] = []
+        for key in sorted(identity_groups):
+            group = identity_groups[key]
+            arc = _build_identity_arc(
+                arc_id=arc_id,
+                ordered=group,
+                candidates=candidates,
+                options=options,
+                major=major,
+                direction_confidence=direction_confidence,
+                resolved=resolved,
+                parent_split=parent_split,
             )
-            point["branch_id"], point["quadrant"] = int(branch), quadrant
-            if resolved:
-                radial = np.asarray([float(point["qx"]) - center_x, float(point["qy"]) - center_y])
-                side_value = float(np.dot(radial, side_normal))
-                side_scale = max(q_step, float(np.nanmedian(np.linalg.norm(centered, axis=1))) * 0.02)
-                point["side"] = "upper" if side_value > side_scale else "lower" if side_value < -side_scale else "unknown"
-            else:
-                point["side"] = "unknown"
-            flags = list(point.get("topology_flags", []))
-            flags.append("connected_arc")
-            point["topology_flag"] = "connected_observed_arc"
-            point["topology"] = "connected_observed_arc"
-            if len(ordered) < int(options["min_arc_points"]):
-                flags.append("short_arc")
-            if not resolved:
-                flags.append("major_direction_ambiguous")
-                point["reason"] = "ambiguous_major_direction" if point["accepted"] else point["reason"]
-            point["topology_flags"] = list(dict.fromkeys(flags))
-        # Local observed tangents and finite-difference direction errors are
-        # retained for UI review and do not become an ellipse orientation.
-        tangent_errors: list[float] = []
-        for order_index, index in enumerate(ordered):
-            if len(ordered) == 1:
-                continue
-            neighbour = ordered[min(order_index + 1, len(ordered) - 1)] if order_index == 0 else ordered[order_index - 1]
-            dx = float(candidates[neighbour]["qx"]) - float(candidates[index]["qx"])
-            dy = float(candidates[neighbour]["qy"]) - float(candidates[index]["qy"])
-            norm = math.hypot(dx, dy)
-            if norm <= np.finfo(float).eps:
-                tangent_errors.append(float("nan"))
-                continue
-            observed = np.asarray([dx / norm, dy / norm])
-            tangent = np.asarray([float(candidates[index]["tangent_qx"]), float(candidates[index]["tangent_qy"])])
-            dot = float(np.clip(abs(np.dot(observed, tangent)), -1.0, 1.0))
-            error = float(np.degrees(np.arccos(dot)))
-            tangent_errors.append(error)
-            candidates[index]["tangent_error_deg"] = error
-        accepted_count = int(sum(bool(candidates[index]["accepted"]) for index in component))
-        scale_values = np.asarray([float(candidates[index]["scale"]) for index in component], dtype=float)
-        scale_stability = float(1.0 / (1.0 + np.nanstd(scale_values) / max(np.nanmean(scale_values), np.finfo(float).eps))) if scale_values.size else float("nan")
-        for index in component:
-            candidates[index]["scale_stability"] = scale_stability
-            candidates[index]["scale_stable"] = bool(scale_stability >= 0.5)
-            if scale_stability < 0.5:
-                candidates[index]["topology_flags"] = list(dict.fromkeys(candidates[index]["topology_flags"] + ["scale_unstable"]))
-        tangent_error_median = float(np.nanmedian(tangent_errors)) if np.any(np.isfinite(tangent_errors)) else float("nan")
-        branch_ids = sorted({int(candidates[index]["branch_id"]) for index in component})
-        sides = sorted({str(candidates[index]["side"]) for index in component})
-        branch_resolved = len(branch_ids) == 1 and branch_ids[0] in (0, 1)
-        side_resolved = len(sides) == 1 and sides[0] in {"upper", "lower"}
-        identity_resolved = bool(branch_resolved and side_resolved)
-        identity_flags: list[str] = []
-        if not branch_resolved:
-            identity_flags.append("unresolved_or_mixed_branch")
-        if not side_resolved:
-            identity_flags.append("unresolved_or_mixed_side")
-        for index in component:
-            if identity_flags:
-                candidates[index]["topology_flags"] = list(
-                    dict.fromkeys(candidates[index].get("topology_flags", []) + identity_flags)
-                )
-        arc_valid = bool(
-            accepted_count >= int(options["min_arc_points"])
-            and np.isfinite(tangent_error_median)
-            and tangent_error_median <= float(options.get("max_arc_tangent_error_deg", 45.0))
-            and scale_stability >= 0.4
-            and identity_resolved
-        )
-        arcs.append(
-            {
-                "arc_id": int(arc_id),
-                "point_ids": [str(candidates[index]["point_id"]) for index in ordered],
-                "ordered_point_ids": [str(candidates[index]["point_id"]) for index in ordered],
-                "n_points": int(len(component)),
-                "accepted_points": accepted_count,
-                "valid": arc_valid,
-                "reason": "accepted" if arc_valid else "short_or_rejected_arc",
-                "major_direction_qx": float(major[0]),
-                "major_direction_qy": float(major[1]),
-                "major_direction_resolved": resolved,
-                "major_direction_confidence": direction_confidence,
-                "side_reference": "observed_arc_major_direction_and_center",
-                "reference_axis_deg": float(options.get("reference_axis_deg", 0.0)),
-                "branch_ids": branch_ids,
-                "quadrants": sorted({str(candidates[index]["quadrant"]) for index in component}),
-                "sides": sides,
-                "accepted_branch_ids": branch_ids,
-                "accepted_sides": sides,
-                "identity_resolved": identity_resolved,
-                "identity_flags": identity_flags,
-                "tangent_error_deg": tangent_errors,
-                "tangent_error_median_deg": tangent_error_median,
-                "scale_stability": scale_stability,
-                "topology_flag": "connected_observed_arc",
-                "topology_flags": ["topology_before_ellipse_fit", *identity_flags],
-            }
-        )
-        arc_id += 1
+            arcs.append(arc)
+            created.append(arc)
+            arc_id += 1
+        _attach_unresolved_to_nearest_arc(unresolved, created, candidates)
     for point in candidates:
         if int(point.get("arc_id", -1)) < 0:
             branch, quadrant = _quadrant_branch(
@@ -1001,10 +1896,21 @@ def _arc_topology(
                 tolerance_deg=float(options["quadrant_axis_tol_deg"]),
             )
             point["branch_id"], point["quadrant"] = int(branch), quadrant
-            point["side"] = "unknown"
+            if str(point.get("side", "unknown")) not in {"upper", "lower"}:
+                point["side"] = _side_from_reference_axis(
+                    float(point["qx"]),
+                    float(point["qy"]),
+                    center_x=center_x,
+                    center_y=center_y,
+                    reference_axis_deg=float(options.get("reference_axis_deg", 0.0)),
+                    q_step=q_step,
+                )
+            extra_flags = ["unconnected_candidate"]
+            if point["side"] in {"upper", "lower"}:
+                extra_flags.append("side_from_reference_axis")
             point["topology_flag"] = "unconnected_candidate"
             point["topology"] = "unconnected_candidate"
-            point["topology_flags"] = list(dict.fromkeys(point.get("topology_flags", []) + ["unconnected_candidate"]))
+            point["topology_flags"] = list(dict.fromkeys(point.get("topology_flags", []) + extra_flags))
     return arcs
 
 
@@ -1018,6 +1924,15 @@ def _refresh_arc_identity(arcs: list[dict[str, Any]], points: list[dict[str, Any
             points_by_arc[arc_id].append(point)
     for arc in arcs:
         members = points_by_arc.get(int(arc.get("arc_id", -1)), [])
+        for point in members:
+            if _point_identity_key(point) is not None:
+                continue
+            reason = (
+                "side_axis_boundary"
+                if int(point.get("branch_id", -1)) in (0, 1)
+                else "unresolved_point_identity"
+            )
+            _demote_unresolved_identity_point(point, reason, "unresolved_point_identity")
         branch_ids = sorted({int(point.get("branch_id", -1)) for point in members})
         sides = sorted({str(point.get("side", "unknown")) for point in members})
         accepted_members = [
@@ -1025,11 +1940,13 @@ def _refresh_arc_identity(arcs: list[dict[str, Any]], points: list[dict[str, Any
             for point in members
             if bool(point.get("accepted", False)) and bool(point.get("valid", False))
         ]
-        accepted_branch_ids = sorted({int(point.get("branch_id", -1)) for point in accepted_members})
-        accepted_sides = sorted({str(point.get("side", "unknown")) for point in accepted_members})
+        accepted_keys = [_point_identity_key(point) for point in accepted_members]
+        known_accepted = [key for key in accepted_keys if key is not None]
+        accepted_branch_ids = sorted({key[0] for key in known_accepted})
+        accepted_sides = sorted({key[1] for key in known_accepted})
         branch_resolved = len(accepted_branch_ids) == 1 and accepted_branch_ids[0] in (0, 1)
         side_resolved = len(accepted_sides) == 1 and accepted_sides[0] in {"upper", "lower"}
-        identity_resolved = bool(branch_resolved and side_resolved)
+        identity_resolved = bool(branch_resolved and side_resolved and known_accepted)
         identity_flags: list[str] = []
         if not branch_resolved:
             identity_flags.append("unresolved_or_mixed_branch")
@@ -1042,16 +1959,25 @@ def _refresh_arc_identity(arcs: list[dict[str, Any]], points: list[dict[str, Any
         arc["identity_resolved"] = identity_resolved
         arc["identity_flags"] = identity_flags
         arc["topology_flags"] = list(dict.fromkeys(list(arc.get("topology_flags", [])) + identity_flags))
-        if not identity_resolved:
+        if identity_resolved:
+            continue
+        # Only mixed *known* identities reject the remaining accepted points.
+        # Unresolved tip/axis points were already demoted above.
+        if known_accepted and not identity_resolved:
             arc["valid"] = False
             arc["reason"] = "unresolved_or_mixed_branch_or_side"
-            for point in members:
-                if bool(point.get("accepted", False)):
-                    point["accepted"] = False
-                    point["reason"] = "unresolved_arc_identity"
-                    point["topology_flags"] = list(
-                        dict.fromkeys(list(point.get("topology_flags", [])) + identity_flags + ["unresolved_arc_identity"])
-                    )
+            for point in accepted_members:
+                if _point_identity_key(point) is None:
+                    continue
+                point["accepted"] = False
+                point["reason"] = "unresolved_arc_identity"
+                point["topology_flags"] = list(
+                    dict.fromkeys(list(point.get("topology_flags", [])) + identity_flags + ["unresolved_arc_identity"])
+                )
+        elif not known_accepted:
+            arc["valid"] = False
+            if not arc.get("reason"):
+                arc["reason"] = "unresolved_or_mixed_branch_or_side"
 
 
 def _apply_seeds(
@@ -1352,7 +2278,7 @@ def _apply_profile_refinement(
         major_y = float(arc.get("major_direction_qy", float("nan")))
         radial_x, radial_y = new_qx - center_x, new_qy - center_y
         side_value = radial_x * (-major_y) + radial_y * major_x
-        side_scale = max(q_step, 0.02 * float(np.hypot(radial_x, radial_y)))
+        side_scale = _side_axis_threshold(float(np.hypot(radial_x, radial_y)), q_step)
         new_side = "upper" if side_value > side_scale else "lower" if side_value < -side_scale else "unknown"
         if str(point.get("side", "unknown")) in {"upper", "lower"} and new_side != str(point["side"]):
             point["profile_refinement_reason"] = "profile_shift_crosses_side_boundary"
@@ -1402,6 +2328,30 @@ def _public_point(point: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _deferred_rejected_profile(point: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep a review stub without sampling a detector-sized profile."""
+
+    return {
+        "point_id": str(point.get("point_id", "")),
+        "valid": True,
+        "model": "deferred_candidate_profile",
+        "reason": "fit_deferred_rejected_candidate",
+        "fit_deferred": True,
+        "ambiguous": False,
+        "offset_q": [],
+        "raw_intensity": [],
+        "fit_intensity": [],
+        "peaks": [],
+        "peak_count": 0,
+        "snr": float("nan"),
+        "normal_fwhm_q": float("nan"),
+        "localization_sigma_q": float("nan"),
+        "sampling_sigma_q": float("nan"),
+        "uncertainty_source": "not_fit_rejected_candidate",
+        "support_fraction": 0.0,
+    }
+
+
 def trace_butterfly_ridges(
     image: np.ndarray | Mapping[str, Any] | Any,
     qmap: Mapping[str, Any] | Any,
@@ -1424,6 +2374,7 @@ def trace_butterfly_ridges(
     """
 
     _check_cancelled(cancel_event, "ridge-trace:input")
+    started = time.perf_counter()
     image_array, image_mask = _as_image(image)
     qx, qy, q, qmap_mask = _as_qmap(qmap, image_array.shape)
     q_min, q_max = _parse_q_window(q_window, q)
@@ -1449,6 +2400,8 @@ def trace_butterfly_ridges(
         valid &= ~explicit_mask
     valid, applied_edits, seed_actions = _apply_edits(valid, qx, qy, edits)
     finite_domain = np.isfinite(qx) & np.isfinite(qy) & np.isfinite(q) & (q >= q_min) & (q <= q_max)
+    first_order = _first_order_q_hint(q, image_array, valid, q_min, q_max)
+    first_order["applied"] = False
     if not np.any(finite_domain):
         return {
             "points": [],
@@ -1496,6 +2449,10 @@ def trace_butterfly_ridges(
     q_step = float(np.nanmedian(raw_steps)) if raw_steps else float(coordinate_cache[2])
     if not np.isfinite(q_step) or q_step <= 0:
         q_step = 1.0
+    if bool(opts.get("first_order_prefer", True)):
+        n_weighted = _prefer_first_order_scores(raw_candidates, first_order.get("q_star"))
+        first_order["applied"] = bool(n_weighted)
+        first_order["n_weighted"] = int(n_weighted)
     candidates = _nms(raw_candidates, opts, q_step)
     if opts["max_points"] is not None and len(candidates) > int(opts["max_points"]):
         candidates = sorted(candidates, key=lambda point: (-float(point.get("score", 0.0)), float(point["qx"]), float(point["qy"])))[: int(opts["max_points"])]
@@ -1525,21 +2482,26 @@ def trace_butterfly_ridges(
     )
     arcs_by_id = {int(arc["arc_id"]): arc for arc in arcs}
     profiles: dict[str, dict[str, Any]] = {}
+    n_profiled = 0
     for point in candidates:
         _check_cancelled(cancel_event, "ridge-trace:profiles")
-        profile = extract_normal_profile(
-            image_array,
-            {"qx": qx, "qy": qy, "q": q},
-            point,
-            mask=~valid,
-            options={
-                **opts,
-                "_profile_context": profile_context,
-                "fit_gaussian": bool(point["accepted"]),
-                "profile_half_width_q": opts["profile_half_width_q"] or 5.0 * max(float(point.get("q_normal_step", q_step)), q_step),
-            },
-            cancel_event=cancel_event,
-        )
+        if not bool(point.get("accepted", False)):
+            profile = _deferred_rejected_profile(point)
+        else:
+            n_profiled += 1
+            profile = extract_normal_profile(
+                image_array,
+                {"qx": qx, "qy": qy, "q": q},
+                point,
+                mask=~valid,
+                options={
+                    **opts,
+                    "_profile_context": profile_context,
+                    "fit_gaussian": True,
+                    "profile_half_width_q": opts["profile_half_width_q"] or 5.0 * max(float(point.get("q_normal_step", q_step)), q_step),
+                },
+                cancel_event=cancel_event,
+            )
         point_id = str(point["point_id"])
         profiles[point_id] = profile
         point["normal_fwhm_q"] = float(profile.get("normal_fwhm_q", float("nan")))
@@ -1577,6 +2539,44 @@ def trace_butterfly_ridges(
             point["reason"] = "excluded_point_edit"
             point["topology_flags"] = list(dict.fromkeys(point["topology_flags"] + ["excluded_point_edit"]))
     _refresh_arc_identity(arcs, candidates)
+    radial_split = _demote_secondary_radial_population(
+        candidates, prefer_radius=first_order.get("q_star")
+    )
+    ring_fill = _fill_sparse_first_order_ring(
+        candidates,
+        qx=qx,
+        qy=qy,
+        q=q,
+        intensity=image_array,
+        valid=valid,
+        hint=first_order.get("q_star"),
+        options=opts,
+        q_step=q_step,
+        signature=signature,
+        arcs=arcs,
+    )
+    for point in candidates:
+        point_id = str(point.get("point_id", ""))
+        if point_id and point_id not in profiles:
+            profiles[point_id] = {
+                "point_id": point_id,
+                "valid": True,
+                "model": "azimuthal_radial_peak",
+                "reason": "first_order_ring_sample",
+                "fit_deferred": False,
+                "ambiguous": False,
+                "offset_q": [],
+                "raw_intensity": [],
+                "fit_intensity": [],
+                "peaks": [{"q": float(np.hypot(float(point["qx"]), float(point["qy"])))}],
+                "peak_count": 1,
+                "snr": float(point.get("snr", float("nan"))),
+                "normal_fwhm_q": float("nan"),
+                "localization_sigma_q": float(point.get("localization_sigma_q", q_step)),
+                "sampling_sigma_q": float(q_step),
+                "uncertainty_source": "azimuthal_radial_peak",
+                "support_fraction": 1.0,
+            }
     _check_cancelled(cancel_event, "ridge-trace:edits")
     # Freeze finite observed support only after profile refinement and all
     # seed/exclude edits.  The freezer mutates the working records so its
@@ -1618,11 +2618,15 @@ def trace_butterfly_ridges(
         "reference_axis_deg": float(reference_axis_deg),
         "center_q": [float(opts["center_qx"]), float(opts["center_qy"])],
         "q_window": [float(q_min), float(q_max)],
+        "first_order_q_hint": first_order,
+        "first_order_ring_fill": ring_fill,
         "smoothing_scales": [float(value) for value in opts["smoothing_scales"]],
         "crop": {"row_start": row0, "row_stop": row1, "col_start": col0, "col_stop": col1, "shape": [row1 - row0, col1 - col0], "original_shape": list(image_array.shape)},
         "n_raw_candidates": int(len(raw_candidates)),
         "n_points": int(len(public_points)),
+        "n_profiled_points": int(n_profiled),
         "n_accepted_points": int(sum(bool(point["accepted"]) for point in public_points)),
+        "elapsed_s": float(time.perf_counter() - started),
         "n_arcs": int(len(arcs)),
         "n_valid_arcs": int(sum(bool(arc["valid"]) for arc in arcs)),
         "scale_stability": {"mean": float(np.nanmean([point["scale_stability"] for point in public_points])) if public_points else float("nan"), "min": float(np.nanmin([point["scale_stability"] for point in public_points])) if public_points else float("nan")},
@@ -1631,8 +2635,10 @@ def trace_butterfly_ridges(
         "seed_matches": seed_records,
         "excluded_point_ids": sorted(excluded_ids),
         "observed_support": support_summary,
+        "radial_population": radial_split,
         "wang2007_vertical_slice": wang,
-        "flags": ["observed_only", "no_ellipse_fit", "rejected_candidates_retained", "topology_before_ellipse_fit"],
+        "flags": ["observed_only", "no_ellipse_fit", "rejected_candidates_retained", "topology_before_ellipse_fit"]
+        + (["mixed_radial_populations"] if radial_split.get("split") else []),
     }
     return {"points": public_points, "arcs": arcs, "profiles": profiles, "diagnostics": diagnostics, "method_version": METHOD_VERSION}
 

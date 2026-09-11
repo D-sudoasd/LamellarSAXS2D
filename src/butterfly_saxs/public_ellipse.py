@@ -6,6 +6,8 @@ from collections.abc import Mapping
 import math
 from typing import Any
 
+from .observables import _SPACING_CENTER_REL_TOL, _q_to_nm_inverse_scale, ellipse_radius
+
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -80,6 +82,102 @@ def _finite(value: Any, default: float = float("nan")) -> float:
     except (TypeError, ValueError):
         return default
     return number if math.isfinite(number) else default
+
+
+def _origin_centered_periods(
+    *,
+    a: float,
+    b: float,
+    theta_deg: float,
+    cx: float,
+    cy: float,
+    q_unit: Any,
+    draw_axis_deg: float = 90.0,
+) -> tuple[float, float, float, tuple[str, ...]]:
+    """Apparent Ln/Lz/L_major from an origin-centred q ellipse, or NaN with flags."""
+
+    unavailable = ("spacing_unavailable_unknown_q_unit",)
+    scale = _q_to_nm_inverse_scale(q_unit)
+    if scale is None:
+        return float("nan"), float("nan"), float("nan"), unavailable
+    if not (math.isfinite(a) and math.isfinite(b) and a > 0.0 and b > 0.0):
+        return float("nan"), float("nan"), float("nan"), ("spacing_unavailable_degenerate_axes",)
+    center_scale = max(1.0, abs(a), abs(b))
+    center_tol = _SPACING_CENTER_REL_TOL * center_scale
+    if not (math.isfinite(cx) and math.isfinite(cy) and math.hypot(cx, cy) <= center_tol):
+        return float("nan"), float("nan"), float("nan"), (
+            "spacing_unavailable_nonzero_center",
+            "spacing_requires_origin_centered_ellipse_assumption",
+        )
+    ln = 2.0 * math.pi / (b * scale)
+    l_major = 2.0 * math.pi / (a * scale)
+    try:
+        draw = float(draw_axis_deg)
+    except (TypeError, ValueError):
+        draw = 90.0
+    if not math.isfinite(draw):
+        draw = 90.0
+    qz = float(ellipse_radius(math.radians(draw), a, b, math.radians(theta_deg)))
+    lz = 2.0 * math.pi / (qz * scale) if math.isfinite(qz) and qz > 0.0 else float("nan")
+    return ln, lz, l_major, ("spacing_requires_origin_centered_ellipse_assumption",)
+
+
+def observed_arc_radius_period(
+    points: Any,
+    q_unit: Any,
+    first_order_q: Any = None,
+) -> tuple[float, float, tuple[str, ...]]:
+    """Apparent Bragg period of the first-order ring.
+
+    When a two-ellipse fit pins ``b/a`` on a bound, ``2π/b`` is not a usable
+    lamellar period.  The I(q)* hint is the azimuthally averaged first-order
+    peak; the median |q| of accepted arcs is kept only when that hint is
+    missing.  Curvature tips sit outside I(q)* and must not walk the published
+    period.
+    """
+
+    radii: list[float] = []
+    if isinstance(points, (list, tuple)):
+        rows = points
+    else:
+        rows = ()
+    for point in rows:
+        if not isinstance(point, Mapping):
+            continue
+        try:
+            radius = math.hypot(float(point["qx"]), float(point["qy"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(radius) and radius > 0.0:
+            radii.append(radius)
+    radii.sort()
+    mid = len(radii) // 2
+    arc_q = (
+        radii[mid]
+        if len(radii) % 2 == 1
+        else (0.5 * (radii[mid - 1] + radii[mid]) if len(radii) >= 2 else float("nan"))
+    )
+    if len(radii) < 5:
+        arc_q = float("nan")
+    try:
+        hint = float(first_order_q) if first_order_q is not None else float("nan")
+    except (TypeError, ValueError):
+        hint = float("nan")
+    scale = _q_to_nm_inverse_scale(q_unit)
+    if math.isfinite(hint) and hint > 0.0:
+        flags = ["spacing_from_first_order_iq"]
+        if math.isfinite(arc_q) and arc_q > 1.8 * hint:
+            flags.append("arc_radius_on_secondary_population")
+        elif not math.isfinite(arc_q):
+            flags.append("spacing_iq_without_dense_arc_radius")
+        if scale is None:
+            return hint, float("nan"), tuple(flags + ["spacing_unavailable_unknown_q_unit"])
+        return hint, 2.0 * math.pi / (hint * scale), tuple(flags)
+    if not math.isfinite(arc_q):
+        return float("nan"), float("nan"), ("spacing_unavailable_insufficient_arc_radius",)
+    if scale is None:
+        return arc_q, float("nan"), ("spacing_unavailable_unknown_q_unit",)
+    return arc_q, 2.0 * math.pi / (arc_q * scale), ("spacing_from_observed_arc_radius",)
 
 
 def canonical_ellipse_payload(
@@ -161,7 +259,34 @@ def canonical_ellipse_payload(
         "ellipticity": _finite(_field(fit, "ellipticity", "eccentricity", default=float("nan"))),
         "L_N": _finite(_field(fit, "L_N", "Ln_from_minor_axis_nm", default=float("nan"))),
         "L_z": _finite(_field(fit, "L_z", "Lz_from_draw_axis_nm", default=float("nan"))),
+        "L_from_major_axis_nm": _finite(
+            _field(fit, "L_from_major_axis_nm", default=float("nan"))
+        ),
     }
+    if not math.isfinite(common["ellipticity"]) and math.isfinite(ratio):
+        common["ellipticity"] = math.sqrt(max(0.0, 1.0 - ratio * ratio))
+        common["eccentricity"] = common["ellipticity"]
+    if (
+        not math.isfinite(common["L_N"])
+        or not math.isfinite(common["L_z"])
+        or not math.isfinite(common["L_from_major_axis_nm"])
+    ):
+        ln, lz, l_major, spacing_flags = _origin_centered_periods(
+            a=a,
+            b=b,
+            theta_deg=theta_deg,
+            cx=cx,
+            cy=cy,
+            q_unit=q_unit,
+            draw_axis_deg=reference_axis + 90.0,
+        )
+        if not math.isfinite(common["L_N"]):
+            common["L_N"] = ln
+        if not math.isfinite(common["L_z"]):
+            common["L_z"] = lz
+        if not math.isfinite(common["L_from_major_axis_nm"]):
+            common["L_from_major_axis_nm"] = l_major
+        flags = tuple(dict.fromkeys((*flags, *spacing_flags)))
     common["Ln_from_minor_axis_nm"] = common["L_N"]
     common["Lz_from_draw_axis_nm"] = common["L_z"]
     # Longitudinal/export consumers read the parameter mapping directly.

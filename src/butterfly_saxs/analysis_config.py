@@ -155,10 +155,12 @@ def normalize_ellipse_settings(settings: Mapping[str, Any] | None) -> dict[str, 
         "theta_max_deg",
     ):
         if name in nested:
-            explicit = True
-            result[name] = _optional_float(
+            parsed = _optional_float(
                 _ellipse_scalar(nested[name], name), f"ellipse {name}"
             )
+            if parsed is not None:
+                explicit = True
+                result[name] = parsed
         value = result.get(name)
         if value is not None and not np.isfinite(float(value)):
             raise ValueError(f"ellipse {name} must be finite or Auto")
@@ -422,6 +424,30 @@ def validate_analysis_settings(
             "ridge_method must be 'radial_peak', 'azimuthal_peak', 'surface_curvature', or 'butterfly_curvature'"
         )
     merged["ridge_method"] = method
+    raw_input = settings if isinstance(settings, Mapping) else {}
+    raw_ellipse = raw_input.get("ellipse") if isinstance(raw_input.get("ellipse"), Mapping) else {}
+    raw_preset = str(
+        raw_ellipse.get("preset", raw_input.get("ellipse_preset", ""))
+        if isinstance(raw_ellipse, Mapping)
+        else raw_input.get("ellipse_preset", "")
+    ).strip().lower().replace("-", "_")
+    root_named_preset = "ellipse_preset" in raw_input
+    nested_named_preset = isinstance(raw_ellipse, Mapping) and "preset" in raw_ellipse
+    nested_standard_marker = (
+        nested_named_preset
+        and set(raw_ellipse).issubset({"preset"})
+        and raw_preset == "standard"
+    )
+    if method == "butterfly_curvature" and not root_named_preset and (
+        not nested_named_preset or nested_standard_marker
+    ):
+        # Butterfly wings are short and flat.  The unconstrained standard
+        # prior lets b/a collapse to a line; apply the documented very-flat
+        # interval unless the caller named a preset.
+        merged["ellipse_preset"] = "flat_ellipse"
+        ellipse = dict(merged.get("ellipse") or {}) if isinstance(merged.get("ellipse"), Mapping) else {}
+        ellipse["preset"] = "flat_ellipse"
+        merged["ellipse"] = ellipse
     if merged.get("butterfly") is not None or method == "butterfly_curvature":
         from .butterfly_settings import normalize_butterfly_settings
 

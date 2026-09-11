@@ -246,10 +246,13 @@ def sample(array: np.ndarray, y: np.ndarray, x: np.ndarray, *, order: int = 1) -
         yi = np.clip(np.rint(y).astype(int), 0, array.shape[0] - 1)
         xi = np.clip(np.rint(x).astype(int), 0, array.shape[1] - 1)
         return np.asarray(array[yi, xi], dtype=float)
+    values = array if getattr(array, "dtype", None) == np.float64 else np.asarray(array, dtype=float)
+    sample_y = y if getattr(y, "dtype", None) == np.float64 else np.asarray(y, dtype=float)
+    sample_x = x if getattr(x, "dtype", None) == np.float64 else np.asarray(x, dtype=float)
     return np.asarray(
         map_coordinates(
-            np.asarray(array, dtype=float),
-            [np.asarray(y, dtype=float), np.asarray(x, dtype=float)],
+            values,
+            [sample_y, sample_x],
             order=order,
             mode="nearest",
             prefilter=False,

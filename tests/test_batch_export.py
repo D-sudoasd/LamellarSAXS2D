@@ -395,6 +395,69 @@ def test_input_fingerprint_changes_when_content_changes_without_stat_change(tmp_
     assert input_fingerprint([ref]) != before
 
 
+def test_input_fingerprint_reports_progress_and_honors_cancel(tmp_path: Path) -> None:
+    from butterfly_saxs.batch import input_fingerprint
+    from butterfly_saxs.cancellation import AnalysisCancelled
+
+    paths = _touch_frames(tmp_path, ["frame1.tif", "frame2.tif", "frame3.tif"])
+    refs = [FrameRef(path) for path in paths]
+    seen: list[int] = []
+
+    def progress(payload):
+        seen.append(int(payload["completed"]))
+        if payload["completed"] >= 1:
+            raise_cancel.set()
+
+    raise_cancel = __import__("threading").Event()
+    with pytest.raises(AnalysisCancelled, match="hashing inputs"):
+        input_fingerprint(refs, progress=progress, cancel_event=raise_cancel)
+    assert seen[0] == 0
+    assert 1 in seen
+
+
+def test_run_batch_emits_hash_phase_before_analyzer(tmp_path: Path) -> None:
+    from butterfly_saxs.batch import run_batch
+
+    path = _touch_frames(tmp_path, ["frame1.tif"])[0]
+    order: list[str] = []
+
+    def analyzer(frame):
+        del frame
+        order.append("analyze")
+        return {"parameters": {"a": 1.0}, "metrics": {"success": True}}
+
+    def progress(payload):
+        order.append(str(payload.get("phase") or ""))
+
+    run = run_batch([path], analyzer, progress=progress)
+    assert run[0].ok
+    assert order[0] == "input_fingerprint"
+    assert "config_fingerprint" in order
+    assert order.index("input_fingerprint") < order.index("analyze")
+    assert order.index("config_fingerprint") < order.index("analyze")
+    assert order.index("config_fingerprint") < next(
+        i for i, name in enumerate(order) if name == "analyze"
+    )
+
+
+def test_run_batch_cancel_during_fingerprint_skips_analyzer(tmp_path: Path) -> None:
+    from butterfly_saxs.batch import run_batch
+
+    path = _touch_frames(tmp_path, ["frame1.tif"])[0]
+    analyzed = []
+    event = __import__("threading").Event()
+    event.set()
+
+    def analyzer(frame):
+        analyzed.append(frame)
+        return {"parameters": {"a": 1.0}, "metrics": {"success": True}}
+
+    run = run_batch([path], analyzer, cancel_event=event)
+    assert run.cancelled is True
+    assert run.processed_count == 0
+    assert analyzed == []
+
+
 def test_export_files_round_trip_without_dropping_arrays_or_flags(tmp_path: Path) -> None:
     paths = _touch_frames(tmp_path, ["frame1.tif", "frame2.tif"])
 
@@ -466,6 +529,69 @@ def test_export_provenance_records_versions_and_stays_strict_json(tmp_path: Path
     assert "NaN" not in outputs["provenance"].read_text(encoding="utf-8")
     manifest = json.loads(outputs["manifest"].read_text(encoding="utf-8"))
     assert manifest["provenance"]["versions"] == versions
+
+
+def test_frame_summary_exports_arc_quality_and_radial_period(tmp_path: Path) -> None:
+    frame = FrameFitResult(
+        frame=FrameRef(tmp_path / "frame1.tif"),
+        result={
+            "status": "ok",
+            "quality_status": "WARN",
+            "arc_sides": "4/4",
+            "geometry_parameters": {
+                "q_star_from_arcs": 0.099,
+                "L_from_observed_radius_nm": 63.2,
+                "q_star_source": "first_order_iq",
+                "Ln_candidate_from_minor_axis_nm": 174.5,
+                "Lz_candidate_from_draw_axis_nm": 52.0,
+            },
+            "ellipse_kind": "ring",
+            "butterfly": {"quality": {"status": "WARN"}},
+        },
+    )
+    outputs = export_batch([frame], tmp_path / "exports")
+    with outputs["frame_summary"].open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["quality_status"] == "WARN"
+    assert row["arc_sides"] == "4/4"
+    assert float(row["q_star_from_arcs"]) == pytest.approx(0.099)
+    assert float(row["L_from_observed_radius_nm"]) == pytest.approx(63.2)
+    assert row["q_star_source"] == "first_order_iq"
+    assert row["ellipse_kind"] == "ring"
+    assert float(row["Ln_candidate_from_minor_axis_nm"]) == pytest.approx(174.5)
+    assert float(row["Lz_candidate_from_draw_axis_nm"]) == pytest.approx(52.0)
+
+
+def test_frame_summary_does_not_export_capped_solver_shape_on_ring_rows(tmp_path: Path) -> None:
+    frame = FrameFitResult(
+        frame=FrameRef(tmp_path / "frame1.tif"),
+        result={
+            "status": "ok",
+            "ellipse_kind": "ring",
+            "parameters": {"a": 0.27, "b": 0.095, "axis_ratio": 0.35, "theta_deg": 32.0},
+            "geometry_parameters": {
+                "a": None,
+                "b": None,
+                "axis_ratio": None,
+                "theta_deg": None,
+                "q_star_from_arcs": 0.09296,
+                "L_from_observed_radius_nm": 67.58,
+            },
+            "ellipse_fit": {
+                "parameters": {"a": 0.27, "theta_deg": 32.0},
+                "bound_flags": {"axis_ratio": True},
+            },
+        },
+    )
+    outputs = export_batch([frame], tmp_path / "exports")
+    with outputs["frame_summary"].open(newline="", encoding="utf-8") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["ellipse_kind"] == "ring"
+    assert row["a"] == ""
+    assert row["b"] == ""
+    assert row["axis_ratio"] == ""
+    assert row["theta_deg"] == ""
+    assert float(row["L_from_observed_radius_nm"]) == pytest.approx(67.58)
 
 
 def test_export_public_radial_lobe_row_contains_paired_angles(tmp_path: Path) -> None:

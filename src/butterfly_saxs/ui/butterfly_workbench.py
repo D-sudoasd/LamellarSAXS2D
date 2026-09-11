@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 from typing import Any
 
+from ..butterfly_quality import classify_ellipse_publication, unpublished_ellipse_shape
 from ..butterfly_settings import normalize_butterfly_settings
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .qspace import QSpaceView
@@ -1299,6 +1300,158 @@ if QT_AVAILABLE:
                         reason_text = "Trace stage; click Evaluate for 32 resamples"
                 for column, text in enumerate(
                     (display_name, _fmt(value), status_text, _fmt(candidate_value), interval_text, reason_text)
+                ):
+                    self.quantity_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
+            self._render_review_observables()
+
+        def _render_review_observables(self) -> None:
+            """Show observed period and coverage even when Ln/b/a stay unpublished."""
+
+            result = self._result if isinstance(self._result, Mapping) else {}
+            candidate = result.get("candidate_fit")
+            if not isinstance(candidate, Mapping):
+                candidate = {}
+            quality = result.get("quality")
+            if not isinstance(quality, Mapping):
+                quality = {}
+            metrics = quality.get("metrics")
+            side_counts = metrics.get("side_counts") if isinstance(metrics, Mapping) else None
+            sides = None
+            if isinstance(side_counts, Mapping) and side_counts:
+                present = sum(
+                    1
+                    for value in side_counts.values()
+                    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+                )
+                sides = f"{present}/4"
+            english = self._language.lower().startswith("en")
+            bound_flags = candidate.get("bound_flags")
+            flag_names = [str(item) for item in (candidate.get("flags") or ()) if item]
+            flag_names.extend(str(item) for item in (quality.get("flags") or ()) if item)
+            if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
+                flag_names.append("axis_ratio_at_bound")
+            kind = classify_ellipse_publication(
+                quality_status=quality.get("status"),
+                axis_ratio=candidate.get("axis_ratio"),
+                flags=flag_names,
+            )
+            unpublished_shape = unpublished_ellipse_shape(
+                quality_status=quality.get("status"),
+                axis_ratio=candidate.get("axis_ratio"),
+                flags=flag_names,
+            )
+            if kind == "ring":
+                reading = "ring only" if english else "仅一阶环"
+            elif kind == "fail":
+                reading = "fail" if english else "失败"
+            else:
+                reading = "ellipse" if english else "椭圆"
+            review_rows = (
+                (
+                    "reading" if english else "判读",
+                    reading,
+                    quality.get("status"),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "quality" if english else "质量",
+                    quality.get("status"),
+                    quality.get("status"),
+                    None,
+                    None,
+                    ", ".join(str(item) for item in (quality.get("flags") or ()) if item),
+                ),
+                (
+                    "arcs" if english else "弧",
+                    sides,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "q* (first-order)" if english else "一阶 q*",
+                    candidate.get("q_star_from_arcs", result.get("q_star_from_arcs")),
+                    candidate.get("q_star_source", result.get("q_star_source")),
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "L ring (nm)" if english else "环 L（nm）",
+                    candidate.get(
+                        "L_from_observed_radius_nm",
+                        result.get("L_from_observed_radius_nm"),
+                    ),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            if not unpublished_shape:
+                extra = []
+                ln = candidate.get("Ln_from_minor_axis_nm", candidate.get("L_N"))
+                lz = candidate.get("Lz_from_draw_axis_nm", candidate.get("L_z"))
+                l_major = candidate.get("L_from_major_axis_nm")
+                reason = (
+                    "apparent; unpublished until independently supported"
+                    if english
+                    else "表观值；尚未独立支持，故不发表"
+                )
+                if ln not in (None, ""):
+                    extra.append(
+                        (
+                            "Ln candidate (nm)" if english else "Ln 候选（nm）",
+                            None,
+                            None,
+                            ln,
+                            None,
+                            reason,
+                        )
+                    )
+                if lz not in (None, ""):
+                    extra.append(
+                        (
+                            "Lz candidate (nm)" if english else "Lz 候选（nm）",
+                            None,
+                            None,
+                            lz,
+                            None,
+                            reason,
+                        )
+                    )
+                if l_major not in (None, ""):
+                    extra.append(
+                        (
+                            "L major candidate (nm)" if english else "长轴 L 候选（nm）",
+                            None,
+                            None,
+                            l_major,
+                            None,
+                            reason,
+                        )
+                    )
+                if extra:
+                    review_rows = review_rows + tuple(extra)
+            if not any(row[1] not in (None, "", []) for row in review_rows):
+                return
+            for name, value, status, candidate_value, interval, reason in review_rows:
+                if value in (None, "") and not status and not reason:
+                    continue
+                row = self.quantity_table.rowCount()
+                self.quantity_table.insertRow(row)
+                for column, text in enumerate(
+                    (
+                        str(name),
+                        _fmt(value),
+                        "" if status is None else str(status),
+                        _fmt(candidate_value),
+                        "" if interval is None else str(interval),
+                        "" if reason is None else str(reason),
+                    )
                 ):
                     self.quantity_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
 

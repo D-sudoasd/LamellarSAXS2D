@@ -193,6 +193,7 @@ _CONFIG_FILE_KEYS = frozenset(
         "geometry_path",
         "mask",
         "mask_path",
+        "external_mask",
         "valid_mask",
         "valid_mask_path",
         "sigma",
@@ -245,6 +246,17 @@ def _config_with_file_fingerprints_cached(
     # Bind in-memory q maps/masks/weights by content as well as by shape.  A
     # compact descriptor avoids copying a 2.48 Mpx detector array into every
     # checkpoint while still making resume fail closed when its values change.
+    geometry_fingerprint = getattr(value, "fingerprint", None)
+    if (
+        isinstance(geometry_fingerprint, str)
+        and geometry_fingerprint
+        and hasattr(value, "q_nm_inv")
+    ):
+        return {
+            "geometry_maps": True,
+            "fingerprint": geometry_fingerprint,
+            "q_unit": getattr(value, "q_unit", None),
+        }
     shape = getattr(value, "shape", None)
     dtype = getattr(value, "dtype", None)
     tobytes = getattr(value, "tobytes", None)
@@ -866,9 +878,46 @@ resolve_frame_refs = build_frame_refs
 discover_frames = build_frame_refs
 
 
-def input_fingerprint(refs: Iterable[FrameRef]) -> str:
+def _is_cancelled(cancel_event: Any) -> bool:
+    """Return True when a batch cancel Event, flag, or callback is set."""
+
+    if cancel_event is None:
+        return False
+    if callable(cancel_event):
+        return bool(cancel_event())
+    checker = getattr(cancel_event, "is_set", None)
+    if callable(checker):
+        return bool(checker())
+    return bool(getattr(cancel_event, "cancelled", False))
+
+
+def input_fingerprint(
+    refs: Iterable[FrameRef],
+    *,
+    progress: Callable[[Mapping[str, Any]], Any] | None = None,
+    cancel_event: Any = None,
+) -> str:
+    """SHA-256 identity of every selected frame file.
+
+    Optional ``progress`` receives ``{phase, completed, total}`` before each
+    file so a long in-situ series is not silent while hashing.  ``cancel_event``
+    is checked between files and between 1 MiB chunks.
+    """
+
+    items = list(refs)
     records: list[dict[str, Any]] = []
-    for ref in refs:
+    total = len(items)
+    for index, ref in enumerate(items):
+        if _is_cancelled(cancel_event):
+            raise AnalysisCancelled("batch cancelled while hashing inputs")
+        if progress is not None:
+            progress(
+                {
+                    "phase": "input_fingerprint",
+                    "completed": index,
+                    "total": total,
+                }
+            )
         path = Path(ref.path)
         stat: dict[str, Any] = {"exists": path.exists()}
         if path.exists():
@@ -881,6 +930,8 @@ def input_fingerprint(refs: Iterable[FrameRef]) -> str:
                 digest = hashlib.sha256()
                 with path.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        if _is_cancelled(cancel_event):
+                            raise AnalysisCancelled("batch cancelled while hashing inputs")
                         digest.update(chunk)
                 stat.update(
                     {
@@ -888,6 +939,8 @@ def input_fingerprint(refs: Iterable[FrameRef]) -> str:
                         "content_sha256": digest.hexdigest(),
                     }
                 )
+            except AnalysisCancelled:
+                raise
             except OSError:
                 # Keep the stat identity when content access is unavailable;
                 # the explicit marker makes the reduced guarantee auditable.
@@ -897,6 +950,14 @@ def input_fingerprint(refs: Iterable[FrameRef]) -> str:
         ref_record = ref.to_dict()
         ref_record["path"] = _canonical_path(path)
         records.append({"ref": ref_record, "file": stat})
+    if progress is not None:
+        progress(
+            {
+                "phase": "input_fingerprint",
+                "completed": total,
+                "total": total,
+            }
+        )
     return _hash_json(records)
 
 
@@ -1642,9 +1703,67 @@ def run_batch(
         if any(value not in (None, 1) for value in selection.values())
         else config
     )
-    input_hash = input_fingerprint(refs)
-    config_hash = config_fingerprint(fingerprint_config, mode=mode)
+    callback = progress if progress is not None else on_progress
     started_batch = __import__("time").perf_counter()
+
+    def cancelled() -> bool:
+        return _is_cancelled(cancel_event)
+
+    def emit_phase(phase: str, *, hashed: int | None = None, completed: int = 0) -> None:
+        if callback is None:
+            return
+        payload: dict[str, Any] = {
+            "index": completed,
+            "completed": completed,
+            "total": len(refs),
+            "fraction": float(completed / len(refs)) if refs else 1.0,
+            "phase": phase,
+            "frame": None,
+            "status": None,
+            "elapsed_s": __import__("time").perf_counter() - started_batch,
+            "cancelled": cancelled(),
+        }
+        if hashed is not None:
+            payload["hashed"] = hashed
+        callback(payload)
+
+    emit_phase("input_fingerprint", hashed=0)
+    try:
+        def hash_progress(payload: Mapping[str, Any]) -> None:
+            emit_phase(
+                "input_fingerprint",
+                hashed=int(payload.get("completed", 0) or 0),
+            )
+
+        input_hash = input_fingerprint(
+            refs,
+            progress=hash_progress if callback is not None else None,
+            cancel_event=cancelled,
+        )
+        if cancelled():
+            raise AnalysisCancelled("batch cancelled while hashing inputs")
+        emit_phase("config_fingerprint")
+        config_hash = config_fingerprint(fingerprint_config, mode=mode)
+        if cancelled():
+            raise AnalysisCancelled("batch cancelled while hashing config")
+        emit_phase("analyze")
+    except AnalysisCancelled:
+        run = BatchRunResult(
+            frame_results=[],
+            mode=mode,
+            input_hash="",
+            config_hash="",
+            checkpoint=checkpoint_file,
+            manifest=manifest,
+            total_count=len(refs),
+            selection=selection,
+            resolved_config=config,
+        )
+        run.cancelled = True
+        run.elapsed_s = __import__("time").perf_counter() - started_batch
+        emit_phase("cancelled")
+        return run
+
     run = BatchRunResult(
         frame_results=[],
         mode=mode,
@@ -1657,18 +1776,6 @@ def run_batch(
         resolved_config=config,
     )
 
-    callback = progress if progress is not None else on_progress
-
-    def cancelled() -> bool:
-        if cancel_event is None:
-            return False
-        if callable(cancel_event):
-            return bool(cancel_event())
-        checker = getattr(cancel_event, "is_set", None)
-        if callable(checker):
-            return bool(checker())
-        return bool(getattr(cancel_event, "cancelled", False))
-
     def emit_progress(index: int, item: FrameFitResult | None = None) -> None:
         if callback is None:
             return
@@ -1677,6 +1784,7 @@ def run_batch(
             "completed": len(run.frame_results),
             "total": len(refs),
             "fraction": float(len(run.frame_results) / len(refs)) if refs else 1.0,
+            "phase": "cancelled" if cancelled() else "analyze",
             "frame": None if item is None else item.frame.to_dict(),
             "status": None if item is None else item.status,
             "elapsed_s": __import__("time").perf_counter() - started_batch,
@@ -1729,6 +1837,7 @@ def run_batch(
             run.cancelled = True
             emit_progress(len(run.frame_results), None)
             break
+        emit_progress(len(run.frame_results), None)
         restored = prior_records.get(frame.key)
         # Successful frames are safe to restore.  Failed frames are retried so
         # a transient detector/read error does not become permanent.

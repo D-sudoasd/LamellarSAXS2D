@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 import threading
 
 import numpy as np
@@ -10,7 +11,16 @@ from butterfly_saxs.butterfly_ridge import (
     METHOD_VERSION,
     _annotate_scale_stability,
     _apply_seeds,
+    _demote_secondary_radial_population,
+    _arc_topology,
+    _assign_component_identities,
+    _first_order_q_hint,
+    _select_first_order_peak_index,
     _graph_arcs,
+    _prefer_first_order_scores,
+    _fill_sparse_first_order_ring,
+    _point_identity_key,
+    _sparse_first_order_coverage,
     _nms,
     _normalise_options,
     _raw_candidates,
@@ -434,3 +444,514 @@ def test_trace_builds_coordinate_derivatives_once_for_all_scales(monkeypatch: py
         options={"smoothing_scales": (1.0, 1.8, 2.8), "max_points": 100, "run_wang_check": False},
     )
     assert calls == 1
+
+
+def _ellipse_wing_candidates():
+    from butterfly_saxs.ellipse import EllipseGeometry
+
+    geometry = EllipseGeometry(0.0, 0.0, 1.5, 0.12, 0.80)
+    samples = (0.55, 0.40, 0.25, 0.0, -0.25, -0.40, -0.55)
+    candidates = []
+    for index, t in enumerate(samples):
+        qx, qy = geometry.point(t)
+        candidates.append(
+            {
+                "point_id": f"p{index}",
+                "qx": float(qx[0] if np.ndim(qx) else qx),
+                "qy": float(qy[0] if np.ndim(qy) else qy),
+                "tangent_qx": float(-math.sin(t)),
+                "tangent_qy": float(math.cos(t)),
+                "accepted": True,
+                "valid": True,
+                "reason": "accepted",
+                "scale": 2.0,
+                "topology_flags": [],
+                "arc_id": -1,
+                "branch_id": -1,
+                "side": "unknown",
+            }
+        )
+    return candidates
+
+
+def test_connected_two_sided_wing_splits_instead_of_rejecting_all_points() -> None:
+    from butterfly_saxs.butterfly_ridge import _arc_topology, _refresh_arc_identity
+
+    candidates = _ellipse_wing_candidates()
+    options = _normalise_options({"min_arc_points": 3, "reference_axis_deg": 0.0})
+    groups = [list(range(len(candidates)))]
+    edges = [(index, index + 1) for index in range(len(candidates) - 1)]
+    arcs = _arc_topology(groups, edges, candidates, options, 0.02)
+    _refresh_arc_identity(arcs, candidates)
+
+    accepted = [point for point in candidates if point["accepted"]]
+    sides = {point["side"] for point in accepted}
+    assert "upper" in sides
+    assert "lower" in sides
+    assert all(point["reason"] != "unresolved_arc_identity" for point in accepted)
+    resolved = [arc for arc in arcs if arc["identity_resolved"]]
+    assert len(resolved) >= 2
+    assert {tuple(arc["accepted_sides"]) for arc in resolved} >= {("lower",), ("upper",)}
+    tip = next(point for point in candidates if point["point_id"] == "p3")
+    assert tip["accepted"] is False
+    assert tip["reason"] in {"side_axis_boundary", "unresolved_point_identity"}
+    assert tip["side"] == "unknown"
+
+
+def test_flat_wing_keeps_side_labels_when_pixel_step_exceeds_minor_axis() -> None:
+    from butterfly_saxs.butterfly_ridge import _arc_topology
+    from butterfly_saxs.ellipse import EllipseGeometry
+
+    geometry = EllipseGeometry(0.0, 0.0, 0.72, 0.02, math.radians(17.0))
+    samples = (0.28, 0.18, 0.10, 0.0, -0.10, -0.18, -0.28)
+    candidates = []
+    for index, value in enumerate(samples):
+        qx, qy = geometry.point(value)
+        candidates.append(
+            {
+                "point_id": f"p{index}",
+                "qx": float(qx[0] if np.ndim(qx) else qx),
+                "qy": float(qy[0] if np.ndim(qy) else qy),
+                "tangent_qx": float(-math.sin(value)),
+                "tangent_qy": float(math.cos(value)),
+                "accepted": True,
+                "valid": True,
+                "reason": "accepted",
+                "scale": 2.0,
+                "topology_flags": [],
+                "arc_id": -1,
+                "branch_id": -1,
+                "side": "unknown",
+            }
+        )
+    options = _normalise_options({"min_arc_points": 3, "reference_axis_deg": 0.0})
+    groups = [list(range(len(candidates)))]
+    edges = [(index, index + 1) for index in range(len(candidates) - 1)]
+    # Pixel step is larger than b=0.0144; a one-pixel side band would
+    # swallow the whole wing.
+    _arc_topology(groups, edges, candidates, options, 0.025)
+    sides = {point["side"] for point in candidates if point["accepted"]}
+    assert "upper" in sides
+    assert "lower" in sides
+    tip = next(point for point in candidates if point["point_id"] == "p3")
+    assert tip["side"] == "unknown"
+
+
+def test_coarse_flat_ellipse_trace_recovers_four_identity_sides() -> None:
+    from butterfly_saxs.benchmark_arcs import generate_arc_case
+
+    case = generate_arc_case("ellipse_ratio_020", seed=502, shape=(96, 96))
+    result = trace_butterfly_ridges(
+        case["image"],
+        case["qmap"],
+        (0.05, 1.1),
+        mask=case.get("mask"),
+        reference_axis_deg=0.0,
+        options={"run_wang_check": False},
+    )
+    sides = {
+        (point.get("branch_id"), point.get("side"))
+        for point in result["points"]
+        if point.get("accepted") and point.get("side") in {"upper", "lower"}
+    }
+    assert sides == {(0, "upper"), (0, "lower"), (1, "upper"), (1, "lower")}
+
+
+def test_secondary_radial_population_is_demoted_and_unimodal_wings_are_kept() -> None:
+    mixed = []
+    for index, radius in enumerate([0.11] * 8 + [0.48] * 10):
+        angle = 0.4 + 0.05 * (index % 4)
+        mixed.append(
+            {
+                "qx": radius * math.cos(angle),
+                "qy": radius * math.sin(angle),
+                "branch_id": index % 2,
+                "side": "upper" if index % 2 == 0 else "lower",
+                "accepted": True,
+            }
+        )
+    summary = _demote_secondary_radial_population(mixed)
+    assert summary["split"] is True
+    assert summary["keep"] == "low_q"
+    assert summary["demoted"] == 10
+    assert sum(1 for point in mixed if point["accepted"]) == 8
+    assert all(point["reason"] == "secondary_radial_population" for point in mixed if not point["accepted"])
+    harmonic = [dict(point) for point in mixed]
+    for point in harmonic:
+        point["accepted"] = True
+        point.pop("reason", None)
+    hinted = _demote_secondary_radial_population(harmonic, prefer_radius=0.48)
+    assert hinted["keep"] == "high_q"
+    assert hinted["demoted"] == 8
+
+    unimodal = []
+    for index in range(16):
+        radius = 0.70 + 0.02 * (index % 3)
+        angle = 0.3 + 0.04 * index
+        unimodal.append(
+            {
+                "qx": radius * math.cos(angle),
+                "qy": radius * math.sin(angle),
+                "branch_id": 0,
+                "side": "upper",
+                "accepted": True,
+            }
+        )
+    kept = _demote_secondary_radial_population(unimodal)
+    assert kept["split"] is False
+    assert all(point["accepted"] for point in unimodal)
+
+    continuum = []
+    for index, radius in enumerate(np.linspace(0.09, 0.55, 24)):
+        angle = 0.35 + 0.03 * (index % 5)
+        continuum.append(
+            {
+                "qx": float(radius * math.cos(angle)),
+                "qy": float(radius * math.sin(angle)),
+                "branch_id": index % 2,
+                "side": "upper" if index % 2 == 0 else "lower",
+                "accepted": True,
+            }
+        )
+    trimmed = _demote_secondary_radial_population(continuum, prefer_radius=0.092)
+    assert trimmed["demoted"] > 0
+    assert trimmed["keep"] == "first_order_hint"
+    assert all(
+        math.hypot(float(point["qx"]), float(point["qy"])) <= 3.5 * 0.092 + 1e-12
+        for point in continuum
+        if point["accepted"]
+    )
+
+
+def test_first_order_q_hint_selects_inner_ring_not_brighter_harmonic() -> None:
+    axis = np.linspace(-0.8, 0.8, 81)
+    qx, qy = np.meshgrid(axis, axis)
+    radius = np.hypot(qx, qy)
+    image = (
+        8.0 * np.exp(-0.5 * ((radius - 0.10) / 0.012) ** 2)
+        + 22.0 * np.exp(-0.5 * ((radius - 0.40) / 0.020) ** 2)
+    )
+    hint = _first_order_q_hint(radius, image, np.isfinite(image), 0.05, 0.80)
+    assert hint["reason"] == "ok"
+    assert hint["q_star"] == pytest.approx(0.10, abs=0.03)
+    assert hint["band"][1] < 0.22
+
+
+def test_first_order_q_hint_refines_off_the_coarse_bin_center() -> None:
+    axis = np.linspace(-0.4, 0.4, 161)
+    qx, qy = np.meshgrid(axis, axis)
+    radius = np.hypot(qx, qy)
+    image = 10.0 * np.exp(-0.5 * ((radius - 0.0925) / 0.008) ** 2)
+    hint = _first_order_q_hint(radius, image, np.isfinite(image), 0.05, 0.80)
+    assert hint["reason"] == "ok"
+    assert hint["q_star"] == pytest.approx(0.0925, abs=0.003)
+    assert abs(hint["q_star"] - 0.0925) <= abs(float(hint["q_star_bin"]) - 0.0925) + 1e-12
+
+
+def test_first_order_refine_does_not_snap_to_a_two_value_clamp() -> None:
+    axis = np.linspace(-0.4, 0.4, 161)
+    qx, qy = np.meshgrid(axis, axis)
+    radius = np.hypot(qx, qy)
+    values = []
+    for centre in (0.0918, 0.0925, 0.0934):
+        image = 10.0 * np.exp(-0.5 * ((radius - centre) / 0.005) ** 2)
+        hint = _first_order_q_hint(radius, image, np.isfinite(image), 0.05, 0.80)
+        values.append(float(hint["q_star"]))
+    assert values[1] == pytest.approx(0.0925, abs=0.003)
+    assert values[0] < values[1] < values[2]
+    assert {round(value, 6) for value in values} != {0.091903, 0.093066}
+
+
+def test_select_first_order_peak_keeps_stronger_bin_of_the_same_ring() -> None:
+    peak_q = np.array([0.0852, 0.0930, 0.370])
+    peak_intensity = np.array([0.90, 1.20, 3.00])
+    peak_indices = np.array([4, 5, 40])
+    assert _select_first_order_peak_index(peak_q, peak_intensity, peak_indices) == 5
+
+
+def test_first_order_q_hint_ignores_low_q_shoulder_of_the_same_ring() -> None:
+    axis = np.linspace(-0.8, 0.8, 161)
+    qx, qy = np.meshgrid(axis, axis)
+    radius = np.hypot(qx, qy)
+    image = (
+        6.5 * np.exp(-0.5 * ((radius - 0.082) / 0.0045) ** 2)
+        + 10.0 * np.exp(-0.5 * ((radius - 0.093) / 0.006) ** 2)
+        + 24.0 * np.exp(-0.5 * ((radius - 0.38) / 0.018) ** 2)
+    )
+    hint = _first_order_q_hint(radius, image, np.isfinite(image), 0.05, 0.80)
+    assert hint["reason"] == "ok"
+    assert hint["q_star"] == pytest.approx(0.093, abs=0.008)
+    assert hint["band"][1] < 0.22
+
+
+def test_unresolved_major_keeps_reference_axis_side_instead_of_dropping_the_wing() -> None:
+    candidates = [
+        {
+            "qx": -0.096,
+            "qy": -0.034,
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+            "branch_id": -1,
+            "side": "unknown",
+        },
+        {
+            "qx": -0.103,
+            "qy": -0.030,
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+            "branch_id": -1,
+            "side": "unknown",
+        },
+    ]
+    options = _normalise_options({"min_arc_points": 6, "reference_axis_deg": 0.0})
+    _assign_component_identities(
+        [0, 1],
+        candidates,
+        options,
+        0.01,
+        center_x=0.0,
+        center_y=0.0,
+        major=np.asarray([np.nan, np.nan], dtype=float),
+        resolved=False,
+    )
+    assert candidates[0]["branch_id"] == 0
+    assert candidates[0]["side"] == "lower"
+    assert candidates[0]["accepted"] is True
+    assert "side_from_reference_axis" in candidates[0]["topology_flags"]
+    assert candidates[1]["side"] == "lower"
+    assert candidates[1]["accepted"] is True
+
+
+def test_short_arc_uses_reference_side_even_when_local_major_resolves() -> None:
+    candidates = [
+        {
+            "qx": -0.100,
+            "qy": -0.020,
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+            "branch_id": -1,
+            "side": "unknown",
+        },
+        {
+            "qx": -0.105,
+            "qy": -0.018,
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+            "branch_id": -1,
+            "side": "unknown",
+        },
+    ]
+    options = _normalise_options({"min_arc_points": 6, "reference_axis_deg": 0.0})
+    _assign_component_identities(
+        [0, 1],
+        candidates,
+        options,
+        0.01,
+        center_x=0.0,
+        center_y=0.0,
+        major=np.asarray([0.0, 1.0], dtype=float),
+        resolved=True,
+    )
+    assert candidates[0]["branch_id"] == 0
+    assert candidates[0]["side"] == "lower"
+    assert candidates[0]["accepted"] is True
+    assert "side_from_reference_axis" in candidates[0]["topology_flags"]
+
+
+def test_unconnected_branched_point_gets_reference_axis_side() -> None:
+    candidates = [
+        {
+            "qx": -0.10,
+            "qy": 0.03,
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+            "arc_id": -1,
+            "branch_id": -1,
+            "side": "unknown",
+            "tangent_qx": 0.0,
+            "tangent_qy": 1.0,
+            "scale": 2.0,
+        }
+    ]
+    options = _normalise_options({"reference_axis_deg": 0.0})
+    _arc_topology([], [], candidates, options, 0.01)
+    assert candidates[0]["branch_id"] == 1
+    assert candidates[0]["side"] == "upper"
+    assert candidates[0]["accepted"] is True
+    assert "side_from_reference_axis" in candidates[0]["topology_flags"]
+
+
+def test_first_order_score_weight_keeps_tips_and_suppresses_harmonics() -> None:
+    points = [
+        {"qx": 0.11, "qy": 0.0, "score": 1.0},
+        {"qx": 0.40, "qy": 0.0, "score": 1.0},
+    ]
+    updated = _prefer_first_order_scores(points, 0.10)
+    assert updated == 2
+    assert points[0]["score"] > 0.7
+    assert points[1]["score"] < 0.05
+
+
+def test_unknown_tip_point_does_not_poison_an_identity_pure_arc() -> None:
+    from butterfly_saxs.butterfly_ridge import _refresh_arc_identity
+
+    points = [
+        {
+            "point_id": "upper-1",
+            "arc_id": 0,
+            "branch_id": 0,
+            "side": "upper",
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+        },
+        {
+            "point_id": "upper-2",
+            "arc_id": 0,
+            "branch_id": 0,
+            "side": "upper",
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+        },
+        {
+            "point_id": "tip",
+            "arc_id": 0,
+            "branch_id": 0,
+            "side": "unknown",
+            "accepted": True,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": [],
+        },
+    ]
+    arcs = [
+        {
+            "arc_id": 0,
+            "valid": True,
+            "reason": "accepted",
+            "topology_flags": ["topology_before_ellipse_fit"],
+        }
+    ]
+    _refresh_arc_identity(arcs, points)
+    assert points[0]["accepted"] is True
+    assert points[1]["accepted"] is True
+    assert points[2]["accepted"] is False
+    assert points[2]["reason"] == "side_axis_boundary"
+    assert arcs[0]["identity_resolved"] is True
+    assert arcs[0]["valid"] is True
+
+
+def test_axial_identity_points_are_sparse_coverage() -> None:
+    points = [
+        {"qx": 0.10, "qy": 0.01, "accepted": True, "branch_id": 0, "side": "upper"},
+        {"qx": 0.11, "qy": -0.01, "accepted": True, "branch_id": 0, "side": "lower"},
+        {"qx": -0.10, "qy": 0.01, "accepted": True, "branch_id": 1, "side": "upper"},
+        {"qx": -0.11, "qy": -0.01, "accepted": True, "branch_id": 1, "side": "lower"},
+    ]
+    sparse = _sparse_first_order_coverage(
+        points, center_x=0.0, center_y=0.0, reference_axis_deg=0.0
+    )
+    assert sparse["sparse"] is True
+    assert sparse["n"] == 4
+    wide = [
+        {**points[0], "qx": 0.07, "qy": 0.08},
+        {**points[1], "qx": 0.07, "qy": -0.08},
+        {**points[2], "qx": -0.07, "qy": 0.08},
+        {**points[3], "qx": -0.07, "qy": -0.08},
+        {"qx": 0.05, "qy": 0.09, "accepted": True, "branch_id": 0, "side": "upper"},
+        {"qx": 0.05, "qy": -0.09, "accepted": True, "branch_id": 0, "side": "lower"},
+        {"qx": -0.05, "qy": 0.09, "accepted": True, "branch_id": 1, "side": "upper"},
+        {"qx": -0.05, "qy": -0.09, "accepted": True, "branch_id": 1, "side": "lower"},
+    ]
+    assert _sparse_first_order_coverage(
+        wide, center_x=0.0, center_y=0.0, reference_axis_deg=0.0
+    )["sparse"] is False
+
+
+def test_sparse_ring_fill_adds_observed_peaks_not_empty_sectors() -> None:
+    axis = np.linspace(-1.0, 1.0, 81)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    image = 0.2 + 4.0 * np.exp(-0.5 * ((q - 0.50) / 0.03) ** 2)
+    valid = np.isfinite(image)
+    points = [
+        {
+            "qx": 0.50,
+            "qy": 0.02,
+            "accepted": True,
+            "branch_id": 0,
+            "side": "upper",
+            "point_id": "axial-plus",
+        },
+        {
+            "qx": -0.50,
+            "qy": -0.02,
+            "accepted": True,
+            "branch_id": 0,
+            "side": "lower",
+            "point_id": "axial-minus",
+        },
+    ]
+    options = _normalise_options({"reference_axis_deg": 0.0, "run_wang_check": False})
+    arcs: list[dict[str, object]] = []
+    summary = _fill_sparse_first_order_ring(
+        points,
+        qx=qx,
+        qy=qy,
+        q=q,
+        intensity=image,
+        valid=valid,
+        hint=0.50,
+        options=options,
+        q_step=0.025,
+        signature="test-ring",
+        arcs=arcs,
+    )
+    assert summary["applied"] is True
+    assert summary["added"] >= 4
+    added = [point for point in points if point.get("reason") == "first_order_ring_sample"]
+    assert added
+    assert all(_point_identity_key(point) is not None for point in added)
+    assert len({int(point["arc_id"]) for point in added}) == len(added)
+    assert len(arcs) == len(added)
+    assert max(abs(math.degrees(math.atan2(float(p["qy"]), float(p["qx"])))) for p in added) > 25.0
+
+    empty = np.full_like(image, 0.2)
+    axial_only = [
+        {
+            "qx": 0.50,
+            "qy": 0.02,
+            "accepted": True,
+            "branch_id": 0,
+            "side": "upper",
+            "point_id": "axial-plus",
+        }
+    ]
+    none = _fill_sparse_first_order_ring(
+        axial_only,
+        qx=qx,
+        qy=qy,
+        q=q,
+        intensity=empty,
+        valid=valid,
+        hint=0.50,
+        options=options,
+        q_step=0.025,
+        signature="test-empty",
+    )
+    assert none["applied"] is False
+    assert none["added"] == 0
+    assert none["reason"] == "no_observed_sector_peak"

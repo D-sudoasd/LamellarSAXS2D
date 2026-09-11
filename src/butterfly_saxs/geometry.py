@@ -95,6 +95,12 @@ class GeometryMaps:
         )
 
     @property
+    def q_unit(self) -> str:
+        """PONI maps are physical q; the array names are already nm^-1."""
+
+        return str(self.metadata.get("q_unit", self.metadata.get("unit", "nm^-1")) or "nm^-1")
+
+    @property
     def q(self) -> np.ndarray:
         return self.q_nm_inv
 

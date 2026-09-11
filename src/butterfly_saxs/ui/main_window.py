@@ -27,6 +27,7 @@ from .models import ParameterRow, ParameterTableModel
 from .project_document import ProjectDocumentController
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .butterfly_workbench import ButterflyWorkbench
+from .qspace import overlay_ring_radius, overlay_uses_first_order_ring
 from .views import PLOT_AVAILABLE, ViewGrid, _disable_auto_si_prefix
 from .workers import AnalysisWorker, GenerationGuard
 from ..service import DEFAULT_ANALYSIS_SETTINGS
@@ -274,6 +275,185 @@ _BATCH_STATUS_KEYS = {
     "failed": "status.batch_failed",
     "skipped": "status.batch_skipped",
 }
+_BATCH_TABLE_HEADERS = (
+    "header.frame",
+    "header.status",
+    "header.quality",
+    "header.a",
+    "header.b",
+    "header.axis_ratio",
+    "header.theta_deg",
+    "header.arcs",
+    "header.ln",
+    "header.lz",
+    "header.l_radial",
+    "header.rmse",
+    "header.flags",
+)
+
+
+def _batch_scalar(source: Any, names: tuple[str, ...]) -> float | None:
+    """Read one finite geometry/export scalar from nested batch records."""
+
+    if not isinstance(source, Mapping):
+        return None
+    for name in names:
+        value = source.get(name)
+        if isinstance(value, Mapping):
+            value = value.get("value", value.get("candidate_value", value.get("val")))
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number):
+            return number
+    return None
+
+
+def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Collect public ellipse fields for the batch review table."""
+
+    sources: list[Any] = [
+        record.get("geometry_parameters"),
+        record.get("parameters"),
+        record.get("ellipse_fit"),
+        record.get("metrics"),
+    ]
+    butterfly = record.get("butterfly")
+    if isinstance(butterfly, Mapping):
+        sources.extend(
+            (
+                butterfly.get("candidate_fit"),
+                butterfly.get("quantitative_parameters"),
+                butterfly,
+            )
+        )
+    observables = record.get("observables")
+    if isinstance(observables, Mapping):
+        sources.extend((observables.get("ellipse"), observables.get("butterfly"), observables))
+    a = b = ratio = theta = ln = lz = l_radial = rmse = None
+    ln_candidate = lz_candidate = l_major_candidate = None
+    for source in sources:
+        if a is None:
+            a = _batch_scalar(source, ("a", "semi_major"))
+        if b is None:
+            b = _batch_scalar(source, ("b", "semi_minor"))
+        if ratio is None:
+            ratio = _batch_scalar(source, ("axis_ratio", "b_over_a"))
+        if theta is None:
+            theta = _batch_scalar(source, ("theta_deg", "angle_deg"))
+        if ln is None:
+            ln = _batch_scalar(source, ("Ln_from_minor_axis_nm", "L_N", "Ln_nm"))
+        if lz is None:
+            lz = _batch_scalar(source, ("Lz_from_draw_axis_nm", "L_z", "Lz_nm"))
+        if ln_candidate is None:
+            ln_candidate = _batch_scalar(source, ("Ln_candidate_from_minor_axis_nm",))
+        if lz_candidate is None:
+            lz_candidate = _batch_scalar(source, ("Lz_candidate_from_draw_axis_nm",))
+        if l_major_candidate is None:
+            l_major_candidate = _batch_scalar(source, ("L_candidate_from_major_axis_nm",))
+        if l_radial is None:
+            l_radial = _batch_scalar(source, ("L_from_observed_radius_nm",))
+        if rmse is None:
+            rmse = _batch_scalar(source, ("rmse", "geometry_rmse", "residual_rms"))
+    if ratio is None and a not in (None, 0.0) and b is not None:
+        try:
+            ratio = float(b) / float(a)
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = None
+    arcs = record.get("arc_sides")
+    if not arcs:
+        for source in sources:
+            if isinstance(source, Mapping) and source.get("arc_sides"):
+                arcs = source.get("arc_sides")
+                break
+    if not arcs:
+        counts = None
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            quality = source.get("quality")
+            metrics = quality.get("metrics") if isinstance(quality, Mapping) else source.get("metrics")
+            if isinstance(metrics, Mapping):
+                counts = metrics.get("side_counts")
+            if isinstance(counts, Mapping) and counts:
+                present = sum(
+                    1 for value in counts.values()
+                    if isinstance(value, (int, float)) and value > 0
+                )
+                arcs = f"{present}/4"
+                break
+    quality = record.get("quality_status")
+    if not quality:
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            nested = source.get("quality")
+            if isinstance(nested, Mapping):
+                quality = nested.get("status", nested.get("engineering_status"))
+            if quality:
+                break
+            quality = source.get("quality_status")
+            if quality:
+                break
+    flag_tokens: list[str] = []
+    flags = record.get("flags", ())
+    if isinstance(flags, Mapping):
+        flags = flags.get("flags", ())
+    if isinstance(flags, str):
+        flag_tokens.extend(part.strip() for part in flags.split(",") if part.strip())
+    else:
+        flag_tokens.extend(str(item) for item in (flags or ()) if item)
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        nested = source.get("flags")
+        if isinstance(nested, str):
+            flag_tokens.extend(part.strip() for part in nested.split(",") if part.strip())
+        elif nested:
+            flag_tokens.extend(str(item) for item in nested if item)
+        bound_flags = source.get("bound_flags")
+        if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
+            flag_tokens.append("axis_ratio_at_bound")
+    flags_text = ", ".join(dict.fromkeys(flag_tokens))
+    unpublished_shape = any(
+        token in flags_text
+        for token in (
+            "axis_ratio_at_bound",
+            "axis_ratio_collapsed_to_line",
+            "major_axis_exceeds_observed_extent",
+        )
+    )
+    if unpublished_shape:
+        a = None
+        b = None
+        ratio = None
+        theta = None
+    quality_text = str(quality).upper() if quality else None
+    from ..butterfly_quality import classify_ellipse_publication
+
+    ellipse_kind = classify_ellipse_publication(
+        quality_status=quality_text,
+        axis_ratio=ratio,
+        flags=flag_tokens,
+    )
+    return {
+        "a": a,
+        "b": b,
+        "axis_ratio": ratio,
+        "theta_deg": theta,
+        "arcs": arcs,
+        "quality": quality_text,
+        "ellipse_kind": ellipse_kind,
+        "ln": ln,
+        "lz": lz,
+        "ln_candidate": ln_candidate,
+        "lz_candidate": lz_candidate,
+        "l_major_candidate": l_major_candidate,
+        "l_radial": l_radial,
+        "rmse": rmse,
+        "flags": flags_text,
+    }
 
 
 def _parameter_number(parameters: Mapping[str, Any], names: tuple[str, ...]) -> float | None:
@@ -332,6 +512,27 @@ def model_ellipse_pair(parameters: Mapping[str, Any], *, reference_axis_deg: flo
             "branch_id": 1,
             "branch": "ellipse_b",
         },
+    ]
+
+
+def first_order_ring_overlay(payload: Mapping[str, Any] | None) -> list[dict[str, Any]] | None:
+    """Replace a capped solver ellipse with a first-order ring at q*."""
+
+    if not overlay_uses_first_order_ring(payload):
+        return None
+    radius = overlay_ring_radius(payload)
+    if radius is None:
+        return None
+    return [
+        {
+            "cx": 0.0,
+            "cy": 0.0,
+            "a": float(radius),
+            "b": float(radius),
+            "angle_deg": 0.0,
+            "source": "first_order_ring",
+            "branch_id": -1,
+        }
     ]
 
 
@@ -784,11 +985,23 @@ if QT_AVAILABLE:
             self.pages.addTab(self.lamellar_page, "实空间片层")
             self.setCentralWidget(self.pages)
 
+        def _butterfly_page_analysis(self, settings: Any) -> dict[str, Any]:
+            """Keep the butterfly page on the flat-ellipse prior unless the user named another."""
+
+            payload: dict[str, Any] = {
+                "ridge_method": "butterfly_curvature",
+                "butterfly": settings,
+            }
+            preset = str(self.ellipse_preset_combo.currentData() or "standard")
+            if preset.strip().lower().replace("-", "_") in {"", "standard"}:
+                payload["ellipse_preset"] = "flat_ellipse"
+            return payload
+
         def _on_butterfly_identify(self, settings: Any) -> None:
             """Commit trace settings, then reuse the existing geometry worker."""
 
             self.set_analysis_settings(
-                {"ridge_method": "butterfly_curvature", "butterfly": settings},
+                self._butterfly_page_analysis(settings),
                 trigger_preview=False,
             )
             self.request_geometry_measure()
@@ -797,7 +1010,7 @@ if QT_AVAILABLE:
             """Commit evaluate settings, then reuse the existing refine worker."""
 
             self.set_analysis_settings(
-                {"ridge_method": "butterfly_curvature", "butterfly": settings},
+                self._butterfly_page_analysis(settings),
                 trigger_preview=False,
             )
             self.request_geometry_refine()
@@ -926,6 +1139,10 @@ if QT_AVAILABLE:
                     ("no selected frames; add frames in the existing Batch page",),
                 )
                 return
+            butterfly_index = self.batch_stage_combo.findData("butterfly")
+            if butterfly_index >= 0:
+                self.batch_stage_combo.setCurrentIndex(butterfly_index)
+            self.pages.setCurrentWidget(self.batch_page)
             self.run_batch()
 
         def _on_butterfly_frame_selected(self, frame: Any) -> None:
@@ -1509,6 +1726,7 @@ if QT_AVAILABLE:
             self.ellipse_preset_combo.setObjectName("ellipsePresetCombo")
             self.ellipse_preset_combo.addItem("Standard", "standard")
             self.ellipse_preset_combo.addItem("Flat ellipse", "flat_ellipse")
+            self.ellipse_preset_combo.addItem("Very flat ellipse", "very_flat_ellipse")
             ellipse_form.addRow("preset", self.ellipse_preset_combo)
 
             def optional_spin(object_name: str, maximum: float = 1e9) -> Any:
@@ -1779,10 +1997,26 @@ if QT_AVAILABLE:
             self.batch_add_button.setObjectName("batchAddButton")
             self.batch_add_button.clicked.connect(self._choose_batch_files)
             toolbar.addWidget(self.batch_add_button)
+            self.batch_add_folder_button = QtWidgets.QPushButton("Add folder…")
+            self.batch_add_folder_button.setObjectName("batchAddFolderButton")
+            self.batch_add_folder_button.clicked.connect(self._choose_batch_folder)
+            toolbar.addWidget(self.batch_add_folder_button)
+            self.batch_remove_button = QtWidgets.QPushButton("Remove")
+            self.batch_remove_button.setObjectName("batchRemoveButton")
+            self.batch_remove_button.clicked.connect(self._remove_selected_batch_frames)
+            toolbar.addWidget(self.batch_remove_button)
+            self.batch_clear_button = QtWidgets.QPushButton("Clear")
+            self.batch_clear_button.setObjectName("batchClearButton")
+            self.batch_clear_button.clicked.connect(self._clear_batch_frames)
+            toolbar.addWidget(self.batch_clear_button)
             self.batch_run_button = QtWidgets.QPushButton("Run batch")
             self.batch_run_button.setObjectName("batchRunButton")
             self.batch_run_button.clicked.connect(self.run_batch)
             toolbar.addWidget(self.batch_run_button)
+            self.batch_cancel_button = QtWidgets.QPushButton("Cancel")
+            self.batch_cancel_button.setObjectName("batchCancelButton")
+            self.batch_cancel_button.clicked.connect(self.cancel_jobs)
+            toolbar.addWidget(self.batch_cancel_button)
             toolbar.addStretch(1)
             layout.addLayout(toolbar)
             self.batch_form = QtWidgets.QFormLayout()
@@ -1794,9 +2028,10 @@ if QT_AVAILABLE:
             options.addRow("Mode", self.batch_mode_combo)
             self.batch_stage_combo = QtWidgets.QComboBox(self.batch_page)
             self.batch_stage_combo.setObjectName("batchStageCombo")
+            self.batch_stage_combo.addItem("Butterfly arcs / ellipses", "butterfly")
             self.batch_stage_combo.addItem("Geometry measurement", "geometry")
             self.batch_stage_combo.addItem("Full2D refinement", "full2d")
-            self.batch_stage_combo.setCurrentIndex(1)
+            self.batch_stage_combo.setCurrentIndex(0)
             self.batch_stage_combo.setAccessibleName(self._tr("a11y.batch_stage"))
             options.addRow("Stage", self.batch_stage_combo)
             self.batch_stream_check = QtWidgets.QCheckBox(
@@ -1855,9 +2090,11 @@ if QT_AVAILABLE:
             self.batch_output_edit.setPlaceholderText("optional output directory")
             options.addRow("Output", self.batch_output_edit)
             layout.addLayout(options)
-            self.batch_table = QtWidgets.QTableWidget(0, 3, self.batch_page)
+            self.batch_table = QtWidgets.QTableWidget(0, len(_BATCH_TABLE_HEADERS), self.batch_page)
             self.batch_table.setObjectName("batchTable")
-            self.batch_table.setHorizontalHeaderLabels(["Frame", "Status", "RMSE"])
+            self.batch_table.setHorizontalHeaderLabels(
+                ["Frame", "Status", "a", "b", "b/a", "θ (deg)", "arcs", "Ln", "Lz", "RMSE", "flags"]
+            )
             self.batch_table.horizontalHeader().setStretchLastSection(True)
             self.batch_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
             layout.addWidget(self.batch_table, 1)
@@ -2089,7 +2326,11 @@ if QT_AVAILABLE:
                 (self.snapshot_combo, "tooltip.snapshot_selector"),
                 (self.restore_snapshot_button, "tooltip.restore_snapshot"),
                 (self.batch_add_button, "tooltip.batch_add"),
+                (self.batch_add_folder_button, "tooltip.batch_add_folder"),
+                (self.batch_remove_button, "tooltip.batch_remove"),
+                (self.batch_clear_button, "tooltip.batch_clear"),
                 (self.batch_run_button, "tooltip.batch_run"),
+                (self.batch_cancel_button, "tooltip.batch_cancel"),
                 (self.batch_resume_check, "tooltip.resume_checkpoint"),
                 (self.measure_geometry_button, "tooltip.measure_geometry"),
                 (self.refine_geometry_button, "tooltip.refine_geometry"),
@@ -2207,6 +2448,7 @@ if QT_AVAILABLE:
                 (self.display_scale_combo, "asinh", "tooltip.combo.display_asinh"),
                 (self.batch_mode_combo, "independent", "tooltip.combo.independent"),
                 (self.batch_mode_combo, "warm_start", "tooltip.combo.warm_start"),
+                (self.batch_stage_combo, "butterfly", "tooltip.combo.batch_butterfly"),
                 (self.batch_stage_combo, "geometry", "tooltip.combo.batch_geometry"),
                 (self.batch_stage_combo, "full2d", "tooltip.combo.batch_full2d"),
             ):
@@ -2447,7 +2689,11 @@ if QT_AVAILABLE:
                 (self.save_snapshot_button, "button.save_snapshot"),
                 (self.restore_snapshot_button, "button.restore_snapshot"),
                 (self.batch_add_button, "button.add_frames"),
+                (self.batch_add_folder_button, "button.add_folder"),
+                (self.batch_remove_button, "button.remove_frames"),
+                (self.batch_clear_button, "button.clear_frames"),
                 (self.batch_run_button, "button.run_batch"),
+                (self.batch_cancel_button, "button.cancel"),
                 (self.measure_geometry_button, "button.remeasure_geometry"),
                 (self.refine_geometry_button, "button.refine_geometry"),
                 (self.focus_q_window_button, "button.q_view_focus"),
@@ -2578,6 +2824,7 @@ if QT_AVAILABLE:
             self._ellipse_center_labels["qy"].setText("qy")
             self._set_combo_text(self.ellipse_preset_combo, "standard", "combo.standard")
             self._set_combo_text(self.ellipse_preset_combo, "flat_ellipse", "combo.flat_ellipse")
+            self._set_combo_text(self.ellipse_preset_combo, "very_flat_ellipse", "combo.very_flat_ellipse")
             self._set_combo_text(self.ellipse_residual_combo, "sampson", "combo.sampson")
             self._set_combo_text(self.ellipse_residual_combo, "geometric", "combo.geometric")
 
@@ -2597,6 +2844,7 @@ if QT_AVAILABLE:
                 self._set_form_label(self.batch_form, field, key)
             self._set_combo_text(self.batch_mode_combo, "independent", "combo.independent")
             self._set_combo_text(self.batch_mode_combo, "warm_start", "combo.warm_start")
+            self._set_combo_text(self.batch_stage_combo, "butterfly", "combo.batch_butterfly")
             self._set_combo_text(self.batch_stage_combo, "geometry", "combo.batch_geometry")
             self._set_combo_text(self.batch_stage_combo, "full2d", "combo.batch_full2d")
             self.batch_stream_check.setText(self._tr("check.batch_stream"))
@@ -2607,7 +2855,7 @@ if QT_AVAILABLE:
             self.batch_series_edit.setPlaceholderText(self._tr("placeholder.batch_series"))
             self.batch_range_edit.setPlaceholderText(self._tr("placeholder.batch_range"))
             self.batch_table.setHorizontalHeaderLabels(
-                [self._tr("header.frame"), self._tr("header.status"), "RMSE"]
+                [self._tr(key) for key in _BATCH_TABLE_HEADERS]
             )
             for row in range(self.batch_table.rowCount()):
                 item = self.batch_table.item(row, 1)
@@ -2732,6 +2980,10 @@ if QT_AVAILABLE:
                 "ellipse.theta",
                 "ellipse.ln",
                 "ellipse.lz",
+                "ellipse.l_major",
+                "ellipse.l_radial",
+                "ellipse.q_star",
+                "ellipse.q_star_source",
                 "ellipse.rmse",
                 "ellipse.rss",
                 "ellipse.n_points",
@@ -2918,7 +3170,7 @@ if QT_AVAILABLE:
                 values[name] = number
             if values["q_min"] is not None and values["q_max"] is not None and values["q_min"] >= values["q_max"]:
                 raise ValueError("q min must be smaller than q max")
-            if self.ellipse_preset_combo.currentData() == "flat_ellipse":
+            if self.ellipse_preset_combo.currentData() in {"flat_ellipse", "very_flat_ellipse"}:
                 if self.ellipse_ratio_min_spin.value() > self.ellipse_ratio_max_spin.value() and self.ellipse_ratio_max_spin.value() > 0:
                     raise ValueError("ellipse axis ratio min must not exceed max")
                 if self.ellipse_angle_min_spin.value() > self.ellipse_angle_max_spin.value():
@@ -4797,13 +5049,39 @@ if QT_AVAILABLE:
             completed = int(payload.get("completed", payload.get("index", 0)) or 0)
             total = int(payload.get("total", len(self.batch_frames)) or 0)
             elapsed_s = float(payload.get("elapsed_s", 0.0) or 0.0)
+            phase = str(payload.get("phase") or "analyze")
+            hashed = payload.get("hashed")
             self._batch_progress_state = {
                 "completed": completed,
                 "total": total,
                 "elapsed_s": elapsed_s,
+                "phase": phase,
             }
             self.batch_progress.setRange(0, max(1, total))
             self.batch_progress.setValue(min(max(0, completed), max(1, total)))
+            if phase == "input_fingerprint":
+                hashed_n = int(hashed if hashed is not None else completed)
+                self.batch_progress_label.setText(
+                    self._tr(
+                        "progress.batch_hashing",
+                        completed=hashed_n,
+                        total=total,
+                        elapsed_s=elapsed_s,
+                    )
+                )
+                self._set_status(
+                    "status.batch_hashing",
+                    completed=hashed_n,
+                    total=total,
+                    elapsed_s=elapsed_s,
+                )
+                return
+            if phase == "config_fingerprint":
+                self.batch_progress_label.setText(
+                    self._tr("progress.batch_config", elapsed_s=elapsed_s)
+                )
+                self._set_status("status.batch_config", elapsed_s=elapsed_s)
+                return
             self.batch_progress_label.setText(
                 self._tr(
                     "progress.batch_running",
@@ -5075,6 +5353,9 @@ if QT_AVAILABLE:
                 ellipses = _result_value(ellipse_result, ("ellipses", "ellipse_pair"), [])
             if ellipses and isinstance(ellipses, Mapping):
                 ellipses = [ellipses]
+            ring = first_order_ring_overlay(result)
+            if ring is not None:
+                ellipses = ring
             ridge_points, ellipses = self._decorate_symmetry_overlay(
                 result,
                 ridge_points,
@@ -5120,25 +5401,82 @@ if QT_AVAILABLE:
                     context_signature=self._fit_state_signature(),
                 )
 
+        def _fill_batch_table_row(self, row_index: int, frame: Any, record: Mapping[str, Any] | None = None) -> None:
+            mapping = record if isinstance(record, Mapping) else {}
+            geometry = _batch_record_geometry(mapping)
+            status = mapping.get("status", "ready" if not mapping else "ok")
+            raw_status = str(status)
+            status_key = _BATCH_STATUS_KEYS.get(raw_status.casefold())
+            status_item = QtWidgets.QTableWidgetItem(
+                self._tr(status_key) if status_key is not None else raw_status
+            )
+            status_item.setData(QtCore.Qt.ItemDataRole.UserRole, raw_status)
+            kind = str(geometry.get("ellipse_kind") or "")
+            quality = geometry.get("quality")
+            if kind == "ring" and quality == "WARN":
+                quality_text = self._tr("quality.warn_ring")
+                quality_tip = self._tr("tooltip.batch_quality_ring")
+            elif kind == "ellipse" and quality == "WARN":
+                quality_text = self._tr("quality.warn_ellipse")
+                quality_tip = self._tr("tooltip.batch_quality_ellipse")
+            else:
+                quality_text = str(quality or "—")
+                quality_tip = ""
+            values = (
+                str(mapping.get("frame", mapping.get("path", frame))),
+                status_item,
+                quality_text,
+                _format_metric(geometry["a"]),
+                _format_metric(geometry["b"]),
+                _format_metric(geometry["axis_ratio"]),
+                _format_metric(geometry["theta_deg"]),
+                str(geometry["arcs"] or "—"),
+                _format_metric(geometry["ln"]),
+                _format_metric(geometry["lz"]),
+                _format_metric(geometry["l_radial"]),
+                _format_metric(geometry["rmse"] if geometry["rmse"] is not None else mapping.get("rmse")),
+                geometry["flags"] or "—",
+            )
+            if geometry["ln"] is None and geometry.get("ln_candidate") is not None:
+                ln_tip = self._tr(
+                    "tooltip.batch_ln_candidate",
+                    ln=_format_metric(geometry.get("ln_candidate")),
+                    lz=_format_metric(geometry.get("lz_candidate")),
+                    l_major=_format_metric(geometry.get("l_major_candidate")),
+                )
+            elif geometry["ln"] is None:
+                ln_tip = self._tr("tooltip.batch_ln_empty")
+            else:
+                ln_tip = ""
+            tips = {
+                2: quality_tip,
+                5: self._tr("tooltip.batch_ratio_empty") if geometry["axis_ratio"] is None else "",
+                6: (
+                    self._tr("tooltip.batch_theta_empty")
+                    if geometry["theta_deg"] is None
+                    and "axis_ratio_at_bound" in (geometry.get("flags") or "")
+                    else ""
+                ),
+                8: ln_tip,
+                9: ln_tip if geometry["lz"] is None else "",
+            }
+            for column, value in enumerate(values):
+                item = value if isinstance(value, QtWidgets.QTableWidgetItem) else QtWidgets.QTableWidgetItem(str(value))
+                tip = tips.get(column)
+                if tip:
+                    item.setToolTip(tip)
+                self.batch_table.setItem(row_index, column, item)
+
         def _update_batch_rows(self, records: Iterable[Any]) -> None:
             rows = list(records)
             if not rows:
                 return
+            self.batch_table.setColumnCount(len(_BATCH_TABLE_HEADERS))
             self.batch_table.setRowCount(len(rows))
             for row_index, record in enumerate(rows):
                 mapping = record if isinstance(record, Mapping) else {"value": record}
                 frame = mapping.get("frame", mapping.get("path", row_index))
-                status = mapping.get("status", "ok")
-                rmse = mapping.get("rmse", mapping.get("metrics", {}).get("rmse") if isinstance(mapping.get("metrics"), Mapping) else None)
-                self.batch_table.setItem(row_index, 0, QtWidgets.QTableWidgetItem(str(frame)))
-                raw_status = str(status)
-                status_key = _BATCH_STATUS_KEYS.get(raw_status.casefold())
-                status_item = QtWidgets.QTableWidgetItem(
-                    self._tr(status_key) if status_key is not None else raw_status
-                )
-                status_item.setData(QtCore.Qt.ItemDataRole.UserRole, raw_status)
-                self.batch_table.setItem(row_index, 1, status_item)
-                self.batch_table.setItem(row_index, 2, QtWidgets.QTableWidgetItem(_format_metric(rmse)))
+                self._fill_batch_table_row(row_index, frame, mapping)
 
         def _update_measurements(self, result: Any) -> None:
             """Render measured profiles and quality tables from plain results."""
@@ -5473,16 +5811,55 @@ if QT_AVAILABLE:
             quality_flags = _sequence(_read(quality_payload, ("flags",), ()))
             ellipse_flags = _sequence(_read(ellipse, ("flags",), ()))
             p4_flags = list(dict.fromkeys(str(item) for item in (*quality_flags, *ellipse_flags)))
+            bound_flags = _read(ellipse, ("bound_flags", "bound_status"), {}) or {}
+            unpublished_shape = bool(
+                isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio")
+            ) or bool(
+                {
+                    "axis_ratio_at_bound",
+                    "axis_ratio_collapsed_to_line",
+                    "major_axis_exceeds_observed_extent",
+                }
+                & {str(item) for item in (*ellipse_flags, *p4_flags)}
+            )
             ellipse_rows = (
-                ("ellipse.a", _read(ellipse, ("a",), None)),
-                ("ellipse.b", _read(ellipse, ("b",), None)),
-                ("ellipse.axis_ratio", _read(ellipse, ("axis_ratio", "axes_ratio"), None)),
-                ("ellipse.ellipticity", _read(ellipse, ("ellipticity", "eccentricity"), None)),
+                ("ellipse.a", None if unpublished_shape else _read(ellipse, ("a",), None)),
+                ("ellipse.b", None if unpublished_shape else _read(ellipse, ("b",), None)),
+                (
+                    "ellipse.axis_ratio",
+                    None
+                    if unpublished_shape
+                    else _read(ellipse, ("axis_ratio", "axes_ratio"), None),
+                ),
+                (
+                    "ellipse.ellipticity",
+                    None
+                    if unpublished_shape
+                    else _read(ellipse, ("ellipticity", "eccentricity"), None),
+                ),
                 # Keep ellipse theta semantically separate from lobe-derived
                 # phi/alpha/psi; no relabelling is performed here.
-                ("ellipse.theta", _read(ellipse, ("theta_deg", "angle_deg"), None)),
-                ("ellipse.ln", _read(ellipse, ("Ln_from_minor_axis_nm",), None)),
-                ("ellipse.lz", _read(ellipse, ("Lz_from_draw_axis_nm",), None)),
+                (
+                    "ellipse.theta",
+                    None
+                    if unpublished_shape
+                    else _read(ellipse, ("theta_deg", "angle_deg"), None),
+                ),
+                (
+                    "ellipse.ln",
+                    None if unpublished_shape else _read(ellipse, ("Ln_from_minor_axis_nm",), None),
+                ),
+                (
+                    "ellipse.lz",
+                    None if unpublished_shape else _read(ellipse, ("Lz_from_draw_axis_nm",), None),
+                ),
+                (
+                    "ellipse.l_major",
+                    None if unpublished_shape else _read(ellipse, ("L_from_major_axis_nm",), None),
+                ),
+                ("ellipse.l_radial", _read(ellipse, ("L_from_observed_radius_nm",), None)),
+                ("ellipse.q_star", _read(ellipse, ("q_star_from_arcs",), None)),
+                ("ellipse.q_star_source", _read(ellipse, ("q_star_source",), None)),
                 ("ellipse.rmse", _read(ellipse, ("rmse", "residual_rms"), None)),
                 ("ellipse.rss", _read(ellipse, ("rss",), None)),
                 ("ellipse.n_points", _read(ellipse, ("n_points", "n_data"), None)),
@@ -6266,17 +6643,49 @@ if QT_AVAILABLE:
                 ),
             )
             if files:
-                self.set_batch_frames(files)
+                self.set_batch_frames(list(self.batch_frames) + list(files))
+
+        def _choose_batch_folder(self) -> None:
+            directory = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                self._tr("dialog.select_frame_folder"),
+                "",
+            )
+            if not directory:
+                return
+            from ..path_utils import filter_supported_image_paths
+
+            found = filter_supported_image_paths(Path(directory).iterdir())
+            if not found:
+                self._set_status("status.batch_folder_empty", flags="batch_folder_empty", path=directory)
+                return
+            self.set_batch_frames(list(self.batch_frames) + [str(path) for path in found])
+
+        def _remove_selected_batch_frames(self) -> None:
+            selected = sorted({index.row() for index in self.batch_table.selectedIndexes()}, reverse=True)
+            frames = list(self.batch_frames)
+            for row in selected:
+                if 0 <= row < len(frames):
+                    del frames[row]
+            self.set_batch_frames(frames)
+
+        def _clear_batch_frames(self) -> None:
+            self.set_batch_frames([])
 
         def set_batch_frames(self, frames: Iterable[Any]) -> None:
-            self.batch_frames = list(frames)
+            seen: set[str] = set()
+            unique: list[Any] = []
+            for frame in frames:
+                key = str(frame)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append(frame)
+            self.batch_frames = unique
+            self.batch_table.setColumnCount(len(_BATCH_TABLE_HEADERS))
             self.batch_table.setRowCount(len(self.batch_frames))
             for row, frame in enumerate(self.batch_frames):
-                self.batch_table.setItem(row, 0, QtWidgets.QTableWidgetItem(str(frame)))
-                status_item = QtWidgets.QTableWidgetItem(self._tr("status.ready"))
-                status_item.setData(QtCore.Qt.ItemDataRole.UserRole, "ready")
-                self.batch_table.setItem(row, 1, status_item)
-                self.batch_table.setItem(row, 2, QtWidgets.QTableWidgetItem(""))
+                self._fill_batch_table_row(row, frame, {"status": "ready", "frame": frame})
             if hasattr(self, "butterfly_workbench"):
                 self.butterfly_workbench.set_frames(
                     self.batch_frames,
@@ -6413,6 +6822,11 @@ if QT_AVAILABLE:
             self.measure_geometry_button.setEnabled(not busy)
             self.refine_geometry_button.setEnabled(not busy)
             self.batch_run_button.setEnabled(not busy)
+            self.batch_add_button.setEnabled(not busy)
+            self.batch_add_folder_button.setEnabled(not busy)
+            self.batch_remove_button.setEnabled(not busy)
+            self.batch_clear_button.setEnabled(not busy)
+            self.batch_cancel_button.setEnabled(bool(busy))
             self.cancel_button.setEnabled(bool(busy))
             self.ignore_late_result_button.setEnabled(bool(busy))
             if hasattr(self, "butterfly_workbench"):
@@ -6574,6 +6988,13 @@ def _flatten_evolution_record(record: Any, index: int) -> dict[str, Any]:
             if scalar is None and not isinstance(value, Mapping):
                 scalar = value
             row[str(name)] = scalar
+    geometry = row.get("geometry_parameters")
+    if isinstance(geometry, Mapping):
+        for name, value in geometry.items():
+            scalar = _read(value, ("value", "val", "initial", "best"), None)
+            if scalar is None and not isinstance(value, Mapping):
+                scalar = value
+            row.setdefault(str(name), scalar)
     metrics = row.get("metrics")
     if isinstance(metrics, Mapping):
         for name, value in metrics.items():

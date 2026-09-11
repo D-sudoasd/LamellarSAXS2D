@@ -7,7 +7,11 @@ pytest.importorskip("PySide6")
 
 from PySide6 import QtCore, QtTest
 
-from butterfly_saxs.ui.qspace import QSpaceView
+from butterfly_saxs.ui.qspace import (
+    QSpaceView,
+    overlay_ring_radius,
+    overlay_uses_first_order_ring,
+)
 
 
 def _curved_map(shape: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
@@ -110,3 +114,35 @@ def test_qspace_window_and_arc_visibility_share_branch_state(qtbot):
     assert not view._arc_is_extrapolated({"supported": True})
     assert view._arc_is_extrapolated({"supported": False})
     assert view._arc_is_extrapolated({"extrapolated": True, "supported": True})
+
+
+def test_qspace_overlay_uses_first_order_ring_when_shape_is_unpublished() -> None:
+    ring = {
+        "quality": {"status": "WARN", "flags": ["axis_ratio_at_bound"]},
+        "candidate_fit": {
+            "a": 0.27,
+            "axis_ratio": 0.35,
+            "theta_deg": 32.0,
+            "q_star_from_arcs": 0.09296,
+            "bound_flags": {"axis_ratio": True},
+            "flags": ["axis_ratio_at_bound"],
+            "ellipses": [
+                {"a": 0.27, "b": 0.095, "theta_deg": 32.0, "center": [0.0, 0.0]},
+            ],
+        },
+    }
+    ellipse = {
+        "quality": {"status": "WARN", "flags": []},
+        "candidate_fit": {
+            "a": 0.121,
+            "axis_ratio": 0.30,
+            "theta_deg": 1.6,
+            "q_star_from_arcs": 0.09296,
+        },
+    }
+    assert overlay_uses_first_order_ring(ring) is True
+    assert overlay_ring_radius(ring) == pytest.approx(0.09296)
+    assert overlay_uses_first_order_ring(ellipse) is False
+    nested = {"butterfly": ring}
+    assert overlay_uses_first_order_ring(nested) is True
+    assert overlay_ring_radius(nested) == pytest.approx(0.09296)

@@ -58,6 +58,59 @@ def _finite_pair(value: Any) -> tuple[float, float] | None:
     return pair if all(math.isfinite(item) for item in pair) else None
 
 
+def overlay_uses_first_order_ring(payload: Mapping[str, Any] | None) -> bool:
+    """True when the canvas should stroke q* as a ring, not the capped ellipse."""
+
+    from ..butterfly_quality import unpublished_ellipse_shape
+
+    mapping = payload if isinstance(payload, Mapping) else {}
+    nested = mapping.get("butterfly")
+    if isinstance(nested, Mapping) and "candidate_fit" not in mapping:
+        mapping = nested
+    fit = mapping.get("candidate_fit")
+    if not isinstance(fit, Mapping):
+        fit = mapping
+    quality = mapping.get("quality")
+    flags: list[str] = []
+    if isinstance(fit, Mapping):
+        nested = fit.get("flags") or ()
+        if isinstance(nested, str):
+            flags.extend(part.strip() for part in nested.split(",") if part.strip())
+        else:
+            flags.extend(str(item) for item in nested if item)
+        bound_flags = fit.get("bound_flags")
+        if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
+            flags.append("axis_ratio_at_bound")
+    if isinstance(quality, Mapping):
+        flags.extend(str(item) for item in (quality.get("flags") or ()) if item)
+    return unpublished_ellipse_shape(
+        quality_status=quality.get("status") if isinstance(quality, Mapping) else None,
+        axis_ratio=fit.get("axis_ratio") if isinstance(fit, Mapping) else None,
+        flags=flags,
+    )
+
+
+def overlay_ring_radius(payload: Mapping[str, Any] | None) -> float | None:
+    mapping = payload if isinstance(payload, Mapping) else {}
+    nested = mapping.get("butterfly")
+    if isinstance(nested, Mapping) and "candidate_fit" not in mapping:
+        mapping = nested
+    fit = mapping.get("candidate_fit")
+    if not isinstance(fit, Mapping):
+        fit = mapping
+    for source in (fit, mapping):
+        if not isinstance(source, Mapping):
+            continue
+        raw = source.get("q_star_from_arcs", source.get("q_star"))
+        try:
+            radius = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(radius) and radius > 0.0:
+            return radius
+    return None
+
+
 def _point_q(point: Any) -> tuple[float, float] | None:
     if isinstance(point, Mapping):
         return _finite_pair(
@@ -1057,6 +1110,27 @@ if QT_AVAILABLE:
                 self._draw_polyline_segments(painter, screen_points)
 
             fit = self._butterfly.get("candidate_fit", {})
+            if not isinstance(fit, Mapping):
+                fit = {}
+            ring_overlay = overlay_uses_first_order_ring(self._butterfly)
+            ring_radius = overlay_ring_radius(self._butterfly) if ring_overlay else None
+            if ring_radius is not None:
+                center_pair = _finite_pair(
+                    (
+                        _read(fit, ("center_qx", "cx"), 0.0),
+                        _read(fit, ("center_qy", "cy"), 0.0),
+                    )
+                ) or (0.0, 0.0)
+                screen_points = [
+                    self._q_to_screen(
+                        center_pair[0] + ring_radius * math.cos(2.0 * math.pi * step / 120.0),
+                        center_pair[1] + ring_radius * math.sin(2.0 * math.pi * step / 120.0),
+                    )
+                    for step in range(121)
+                ]
+                painter.setPen(QtGui.QPen(QtGui.QColor(230, 220, 140, 200), 1.4, QtCore.Qt.PenStyle.DashLine))
+                painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                self._draw_polyline_segments(painter, screen_points)
             ellipses = _read(fit, ("ellipses", "ellipse_pair"), [])
             if isinstance(ellipses, Mapping):
                 ellipses = [ellipses]
@@ -1077,6 +1151,8 @@ if QT_AVAILABLE:
                 if not visible:
                     continue
                 raw_curve = _read(ellipse, ("points", "path", "vertices"), None)
+                if ring_radius is not None and raw_curve is None:
+                    continue
                 screen_points: list[Any] = []
                 if raw_curve is not None:
                     for item in raw_curve or ():

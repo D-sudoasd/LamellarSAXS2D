@@ -345,8 +345,9 @@ def test_chinese_locale_retranslates_public_tabs_controls_and_geometry_hint(qtbo
     assert window.preview_button.text() == "预览"
     assert window.analysis_group.title() == "分析 / 测量"
     assert window.ellipse_group.title() == "观测椭圆约束"
-    assert window.batch_stage_combo.itemText(0) == "几何测量"
-    assert window.batch_stage_combo.itemText(1) == "Full2D 强度精修"
+    assert window.batch_stage_combo.itemText(0) == "蝴蝶弧 / 椭圆"
+    assert window.batch_stage_combo.itemText(1) == "几何测量"
+    assert window.batch_stage_combo.itemText(2) == "Full2D 强度精修"
     assert window.views.observed.title_label.text() == "观测"
     assert "下限" in window.ellipse_a_min_spin.accessibleName()
     assert "快照" in window.snapshot_note_edit.accessibleName()
@@ -357,7 +358,8 @@ def test_chinese_locale_retranslates_public_tabs_controls_and_geometry_hint(qtbo
     assert window.parameters_dock.windowTitle() == "Parameters"
     assert window.preview_button.text() == "Preview"
     assert window.analysis_group.title() == "Analysis / Measurement"
-    assert window.batch_stage_combo.itemText(0) == "Geometry measurement"
+    assert window.batch_stage_combo.itemText(0) == "Butterfly arcs / ellipses"
+    assert window.batch_stage_combo.itemText(1) == "Geometry measurement"
     assert "min" in window.ellipse_a_min_spin.accessibleName()
     assert window.cancel_button.shortcut().toString() == "Esc"
     window.set_language("zh_CN", persist=False)
@@ -373,6 +375,7 @@ def test_batch_stage_forwards_geometry_or_full2d_explicitly(qtbot) -> None:
     window.set_batch_frames(["frame-001.tif"])
     window.batch_output_edit.setText("results")
     window.batch_stream_check.setChecked(True)
+    assert window.batch_stage_combo.currentData() == "butterfly"
     window.batch_stage_combo.setCurrentIndex(
         window.batch_stage_combo.findData("geometry")
     )
@@ -389,6 +392,174 @@ def test_batch_stage_forwards_geometry_or_full2d_explicitly(qtbot) -> None:
     payload = window.project_to_dict()["batch"]
     assert payload["stage"] == "full2d"
     assert payload["full2d"] is True
+    window.batch_stage_combo.setCurrentIndex(
+        window.batch_stage_combo.findData("butterfly")
+    )
+    assert window.project_to_dict()["batch"]["stage"] == "butterfly"
+    assert window.project_to_dict()["batch"]["full2d"] is False
+    window.close()
+
+
+def test_batch_table_shows_ellipse_parameters_and_folder_controls(qtbot) -> None:
+    window = MainWindow(engine=_BatchEngine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    assert window.batch_add_folder_button.objectName() == "batchAddFolderButton"
+    assert window.batch_remove_button.objectName() == "batchRemoveButton"
+    assert window.batch_clear_button.objectName() == "batchClearButton"
+    assert window.batch_cancel_button.objectName() == "batchCancelButton"
+    assert window.batch_table.columnCount() == 13
+    window.set_batch_frames(["frame-a.tif", "frame-b.tif", "frame-a.tif"])
+    assert window.batch_table.rowCount() == 2
+    window.batch_table.selectRow(1)
+    window._remove_selected_batch_frames()
+    assert [str(item) for item in window.batch_frames] == ["frame-a.tif"]
+    window._update_batch_rows(
+        [
+            {
+                "frame": "frame-a.tif",
+                "status": "ok",
+                "quality_status": "WARN",
+                "geometry_parameters": {
+                    "a": 1.25,
+                    "b": 0.20,
+                    "axis_ratio": 0.16,
+                    "theta_deg": 18.5,
+                    "Ln_from_minor_axis_nm": 31.4,
+                    "Lz_from_draw_axis_nm": 8.2,
+                },
+                "arc_sides": "4/4",
+                "metrics": {"rmse": 0.012},
+                "flags": ["geometry_refined"],
+            }
+        ]
+    )
+    assert window.batch_table.item(0, 2).text() == "WARN · ellipse"
+    assert window.batch_table.item(0, 3).text() == "1.25"
+    assert window.batch_table.item(0, 4).text() == "0.2"
+    assert window.batch_table.item(0, 6).text() == "18.5"
+    assert window.batch_table.item(0, 7).text() == "4/4"
+    assert window.batch_table.item(0, 8).text() == "31.4"
+    assert window.batch_table.item(0, 9).text() == "8.2"
+    assert window.batch_table.item(0, 10).text() == "—"
+    assert "geometry_refined" in window.batch_table.item(0, 12).text()
+    window._update_batch_rows(
+        [
+            {
+                "frame": "frame-a.tif",
+                "status": "ok",
+                "quality_status": "WARN",
+                "geometry_parameters": {
+                    "a": 0.12,
+                    "b": 0.036,
+                    "axis_ratio": 0.30,
+                    "Ln_candidate_from_minor_axis_nm": 174.5,
+                    "Lz_candidate_from_draw_axis_nm": 52.0,
+                    "L_from_observed_radius_nm": 68.3,
+                },
+            }
+        ]
+    )
+    assert window.batch_table.item(0, 8).text() == "—"
+    assert "174.5" in window.batch_table.item(0, 8).toolTip()
+    assert "Unpublished" in window.batch_table.item(0, 8).toolTip()
+    window._update_batch_rows(
+        [
+            {
+                "frame": "frame-a.tif",
+                "status": "ok",
+                "quality_status": "WARN",
+                "geometry_parameters": {
+                    "a": 0.11,
+                    "b": 0.038,
+                    "axis_ratio": 0.35,
+                    "theta_deg": 32.0,
+                    "L_from_observed_radius_nm": 68.3,
+                },
+                "arc_sides": "4/4",
+                "flags": ["axis_ratio_at_bound"],
+            }
+        ]
+    )
+    assert window.batch_table.item(0, 2).text() == "WARN · ring"
+    assert window.batch_table.item(0, 3).text() == "—"
+    assert window.batch_table.item(0, 4).text() == "—"
+    assert window.batch_table.item(0, 5).text() == "—"
+    assert window.batch_table.item(0, 6).text() == "—"
+    assert "no measured major-axis tilt" in window.batch_table.item(0, 6).toolTip()
+    assert window.batch_table.item(0, 8).text() == "—"
+    assert window.batch_table.item(0, 10).text() == "68.3"
+    assert "first-order period" in window.batch_table.item(0, 8).toolTip()
+    window._clear_batch_frames()
+    assert window.batch_frames == []
+    window.close()
+
+
+def test_workflow_guide_points_loaded_frames_at_butterfly_identify(qtbot) -> None:
+    from butterfly_saxs.ui.workbench import _refresh_workflow_guide
+
+    window = MainWindow(engine=_Engine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    observed = np.ones((6, 6), dtype=float)
+    yy, xx = np.indices(observed.shape, dtype=float)
+    window.set_observed_data(
+        observed,
+        qx=(xx - 2.5) / 10.0,
+        qy=(yy - 2.5) / 10.0,
+        qmap={"qx": (xx - 2.5) / 10.0, "qy": (yy - 2.5) / 10.0, "q_unit": "nm^-1"},
+    )
+    _refresh_workflow_guide(window)
+    assert "Identify arcs" in window.workflow_status_label.text()
+    assert "L ring" in window.workflow_status_label.text()
+    assert "Ln" in window.workflow_status_label.text()
+    window.close()
+
+
+def test_apply_result_replaces_capped_ellipse_overlay_with_first_order_ring(qtbot) -> None:
+    from butterfly_saxs.ui.main_window import first_order_ring_overlay
+
+    ring = first_order_ring_overlay(
+        {
+            "butterfly": {
+                "quality": {"status": "WARN", "flags": ["axis_ratio_at_bound"]},
+                "candidate_fit": {
+                    "a": 0.27,
+                    "axis_ratio": 0.35,
+                    "theta_deg": 32.0,
+                    "q_star_from_arcs": 0.09296,
+                    "bound_flags": {"axis_ratio": True},
+                    "flags": ["axis_ratio_at_bound"],
+                    "ellipses": [{"a": 0.27, "b": 0.095, "theta_deg": 32.0}],
+                },
+            }
+        }
+    )
+    assert ring is not None
+    assert ring[0]["a"] == pytest.approx(0.09296)
+    assert ring[0]["b"] == pytest.approx(0.09296)
+    assert ring[0]["angle_deg"] == pytest.approx(0.0)
+    window = MainWindow(engine=_Engine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((4, 4), dtype=float))
+    window._apply_result(
+        {
+            "observed": np.ones((4, 4), dtype=float),
+            "butterfly": {
+                "quality": {"status": "WARN", "flags": ["axis_ratio_at_bound"]},
+                "candidate_fit": {
+                    "q_star_from_arcs": 0.09296,
+                    "bound_flags": {"axis_ratio": True},
+                    "flags": ["axis_ratio_at_bound"],
+                    "ellipses": [{"a": 0.27, "b": 0.095, "theta_deg": 32.0}],
+                },
+            },
+            "ellipse_fit": {
+                "ellipses": [{"a": 0.27, "b": 0.095, "theta_deg": 32.0}],
+            },
+        }
+    )
+    drawn = window._observed_fit_ellipses
+    assert drawn[0]["a"] == pytest.approx(0.09296)
+    assert drawn[0]["source"] == "first_order_ring"
     window.close()
 
 
@@ -655,3 +826,77 @@ def test_export_diagnostics_supports_display_only_contrast(tmp_path) -> None:
     assert figure.axes[0].images[0].get_array().max() == pytest.approx(
         np.arcsinh(observed).max()
     )
+
+
+def test_batch_table_does_not_promote_radial_period_to_published_ln() -> None:
+    from butterfly_saxs.ui.main_window import _batch_record_geometry
+
+    geometry = _batch_record_geometry(
+        {
+            "geometry_parameters": {
+                "a": 0.11,
+                "b": 0.038,
+                "axis_ratio": 0.35,
+                "Ln_from_minor_axis_nm": None,
+                "Lz_from_draw_axis_nm": None,
+                "L_from_observed_radius_nm": 63.2,
+            },
+            "arc_sides": "4/4",
+            "flags": ["apparent_geometry_only"],
+        }
+    )
+    assert geometry["ln"] is None
+    assert geometry["lz"] is None
+    assert geometry["l_radial"] == pytest.approx(63.2)
+    assert geometry["quality"] is None
+    assert geometry["axis_ratio"] == pytest.approx(0.35)
+    bound = _batch_record_geometry(
+        {
+            "geometry_parameters": {
+                "a": 0.11,
+                "b": 0.038,
+                "axis_ratio": 0.35,
+                "theta_deg": 32.0,
+            },
+            "flags": ["axis_ratio_at_bound"],
+        }
+    )
+    assert bound["axis_ratio"] is None
+    assert bound["theta_deg"] is None
+    assert bound["a"] is None
+    assert bound["b"] is None
+    nested = _batch_record_geometry(
+        {
+            "geometry_parameters": {"a": 0.11, "b": 0.038, "axis_ratio": 0.35},
+            "butterfly": {
+                "candidate_fit": {"bound_flags": {"axis_ratio": True}},
+            },
+        }
+    )
+    assert nested["axis_ratio"] is None
+    assert bound["ellipse_kind"] == "ring"
+    assert nested["ellipse_kind"] == "ring"
+    free = _batch_record_geometry(
+        {
+            "quality_status": "WARN",
+            "geometry_parameters": {"a": 0.12, "b": 0.036, "axis_ratio": 0.30},
+        }
+    )
+    assert free["ellipse_kind"] == "ellipse"
+    candidate_ln = _batch_record_geometry(
+        {
+            "quality_status": "WARN",
+            "geometry_parameters": {
+                "a": 0.12,
+                "b": 0.036,
+                "axis_ratio": 0.30,
+                "Ln_from_minor_axis_nm": None,
+                "Ln_candidate_from_minor_axis_nm": 174.5,
+                "Lz_candidate_from_draw_axis_nm": 52.0,
+                "L_from_observed_radius_nm": 68.3,
+            },
+        }
+    )
+    assert candidate_ln["ln"] is None
+    assert candidate_ln["ln_candidate"] == pytest.approx(174.5)
+    assert candidate_ln["l_radial"] == pytest.approx(68.3)

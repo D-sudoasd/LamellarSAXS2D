@@ -52,6 +52,7 @@ from .analysis_config import (
     validate_analysis_settings as _validated_analysis_settings,
 )
 from .serialization import json_safe as _canonical_json_safe
+from .butterfly_quality import classify_ellipse_publication
 
 DEFAULT_MEASUREMENT_SETTINGS = DEFAULT_ANALYSIS_SETTINGS
 
@@ -142,6 +143,148 @@ _Q_PARAMETER_NAMES = frozenset(
         "lamellar_spacing",
     }
 )
+
+
+def _arc_side_summary(result: Mapping[str, Any] | None) -> str | None:
+    """Compact observed-side count, e.g. ``3/4``, from butterfly evidence."""
+
+    if not isinstance(result, Mapping):
+        return None
+    sources: list[Any] = [result.get("butterfly"), result.get("ellipse_fit")]
+    observables = result.get("observables")
+    if isinstance(observables, Mapping):
+        sources.extend((observables.get("butterfly"), observables.get("ellipse")))
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        quality = source.get("quality")
+        metrics = quality.get("metrics") if isinstance(quality, Mapping) else source.get("metrics")
+        counts = metrics.get("side_counts") if isinstance(metrics, Mapping) else None
+        if isinstance(counts, Mapping) and counts:
+            present = sum(
+                1
+                for value in counts.values()
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+            )
+            return f"{present}/4"
+    return None
+
+
+_ENGINEERING_QUALITY_FLAGS = {
+    "major_axis_exceeds_observed_extent",
+    "axis_ratio_collapsed_to_line",
+    "insufficient_occupied_sides",
+}
+
+
+def _batch_record_flags(result: Mapping[str, Any] | None, metrics: Any) -> list[str]:
+    """Keep bound/quality flags on the compact batch row, not only nested fits."""
+
+    tokens: list[str] = []
+    metric_flags = _read(metrics, ("flags",), []) if isinstance(metrics, Mapping) else []
+    if isinstance(metric_flags, str):
+        tokens.extend(part.strip() for part in metric_flags.split(",") if part.strip())
+    elif metric_flags:
+        tokens.extend(str(item) for item in metric_flags if item)
+    if isinstance(result, Mapping):
+        tokens.extend(str(item) for item in (result.get("flags") or ()) if item)
+        sources = [
+            result.get("ellipse_fit"),
+            result.get("butterfly"),
+        ]
+        butterfly = result.get("butterfly")
+        if isinstance(butterfly, Mapping):
+            sources.append(butterfly.get("candidate_fit"))
+            quality = butterfly.get("quality")
+            if isinstance(quality, Mapping):
+                tokens.extend(
+                    str(item)
+                    for item in (quality.get("flags") or ())
+                    if str(item) in _ENGINEERING_QUALITY_FLAGS
+                )
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            nested = source.get("flags")
+            if isinstance(nested, str):
+                tokens.extend(part.strip() for part in nested.split(",") if part.strip())
+            elif nested:
+                tokens.extend(str(item) for item in nested if item)
+            bound_flags = source.get("bound_flags")
+            if isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"):
+                tokens.append("axis_ratio_at_bound")
+    return sorted(set(tokens))
+
+
+def _stash_unpublished_periods(
+    geometry_parameters: dict[str, Any],
+    *,
+    butterfly: Any = None,
+    ellipse: Any = None,
+    candidate: Any = None,
+    allow_candidates: bool = True,
+) -> None:
+    """Keep interior-ellipse Ln/Lz as candidates when they are not publishable."""
+
+    quantitative = {}
+    if isinstance(butterfly, Mapping):
+        quantitative = butterfly.get("quantitative_parameters") or {}
+    if not isinstance(quantitative, Mapping) and isinstance(ellipse, Mapping):
+        quantitative = ellipse.get("quantitative_parameters") or {}
+    published_b = quantitative.get("b") if isinstance(quantitative, Mapping) else None
+    bound_flags = ellipse.get("bound_flags") if isinstance(ellipse, Mapping) else {}
+    if isinstance(candidate, Mapping) and candidate.get("bound_flags"):
+        bound_flags = candidate.get("bound_flags")
+    if isinstance(published_b, Mapping) and published_b.get("value") is not None:
+        return
+    ln_candidate = geometry_parameters.get("Ln_from_minor_axis_nm")
+    lz_candidate = geometry_parameters.get("Lz_from_draw_axis_nm")
+    l_major_candidate = geometry_parameters.get("L_from_major_axis_nm")
+    for name in (
+        "Ln_from_minor_axis_nm",
+        "Lz_from_draw_axis_nm",
+        "L_from_major_axis_nm",
+        "L_N",
+        "L_z",
+    ):
+        geometry_parameters.pop(name, None)
+    at_bound = isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio")
+    if at_bound or not allow_candidates:
+        return
+    if ln_candidate is not None:
+        geometry_parameters["Ln_candidate_from_minor_axis_nm"] = ln_candidate
+    if lz_candidate is not None:
+        geometry_parameters["Lz_candidate_from_draw_axis_nm"] = lz_candidate
+    if l_major_candidate is not None:
+        geometry_parameters["L_candidate_from_major_axis_nm"] = l_major_candidate
+
+
+def _withhold_unpublished_shape_parameters(geometry_parameters: dict[str, Any]) -> None:
+    """A cap, floor, or runaway major axis is not a measured ellipse."""
+
+    geometry_parameters["a"] = None
+    geometry_parameters["b"] = None
+    geometry_parameters["axis_ratio"] = None
+    geometry_parameters["theta_deg"] = None
+    geometry_parameters.pop("theta", None)
+    geometry_parameters.pop("angle_deg", None)
+    geometry_parameters.pop("ellipticity", None)
+    geometry_parameters.pop("eccentricity", None)
+
+
+def _ellipse_kind_for_record(result: Mapping[str, Any] | None) -> str:
+    payload = result if isinstance(result, Mapping) else {}
+    geometry = payload.get("geometry_parameters")
+    if not isinstance(geometry, Mapping):
+        geometry = {}
+    quality = _read(_read(payload.get("butterfly"), ("quality",), {}), ("status",), None)
+    if quality is None:
+        quality = payload.get("quality_status")
+    return classify_ellipse_publication(
+        quality_status=quality,
+        axis_ratio=geometry.get("axis_ratio"),
+        flags=_batch_record_flags(payload, payload.get("metrics")),
+    )
 
 
 def _q_unit(qmap: Any) -> str:
@@ -1012,7 +1155,11 @@ class ButterflyAnalysisService:
     ) -> Any:
         """Return cached q/chi arrays with an optional frame-local mask."""
 
-        key = (tuple(int(item) for item in shape), id(poni))
+        identity = str(self.poni_path or "")
+        key = (
+            tuple(int(item) for item in shape),
+            identity if identity and identity.casefold() not in {"in-memory", "in_memory"} else id(poni),
+        )
         base = self._geometry_cache.get(key)
         if base is None:
             base = build_geometry(shape, poni)
@@ -1081,6 +1228,7 @@ class ButterflyAnalysisService:
             candidate_poni_path = (
                 str(poni) if isinstance(poni, (str, Path)) else "in-memory"
             )
+            self.poni_path = candidate_poni_path
         loaded = read_image(
             path,
             frame=frame,
@@ -1784,6 +1932,39 @@ class ButterflyAnalysisService:
             geometry_parameters = dict(
                 ellipse.get("parameters", ellipse.get("parameter_values", {})) or {}
             )
+            butterfly = result.get("butterfly") if isinstance(result, Mapping) else {}
+            candidate = butterfly.get("candidate_fit") if isinstance(butterfly, Mapping) else {}
+            for source in (ellipse, candidate if isinstance(candidate, Mapping) else {}):
+                for name in (
+                    "Ln_from_minor_axis_nm",
+                    "Lz_from_draw_axis_nm",
+                    "L_from_major_axis_nm",
+                    "L_N",
+                    "L_z",
+                    "ellipticity",
+                ):
+                    if geometry_parameters.get(name) is None and source.get(name) is not None:
+                        geometry_parameters[name] = source[name]
+            bound_flags = ellipse.get("bound_flags") if isinstance(ellipse, Mapping) else {}
+            ellipse_flags = {
+                str(item)
+                for item in ((ellipse.get("flags") if isinstance(ellipse, Mapping) else None) or ())
+                if item
+            }
+            withhold_shape = bool(
+                (isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"))
+                or "major_axis_exceeds_observed_extent" in ellipse_flags
+                or "axis_ratio_collapsed_to_line" in ellipse_flags
+            )
+            _stash_unpublished_periods(
+                geometry_parameters,
+                butterfly=butterfly,
+                ellipse=ellipse,
+                candidate=candidate,
+                allow_candidates=not withhold_shape,
+            )
+            if withhold_shape:
+                _withhold_unpublished_shape_parameters(geometry_parameters)
             try:
                 geometry_rmse = float(ellipse.get("rmse"))
             except (TypeError, ValueError):
@@ -1881,6 +2062,47 @@ class ButterflyAnalysisService:
             except (TypeError, ValueError):
                 pass
         geometry_parameters.pop("theta", None)
+        butterfly = result.get("butterfly") if isinstance(result, Mapping) else None
+        candidate = butterfly.get("candidate_fit") if isinstance(butterfly, Mapping) else None
+        for source in (ellipse, candidate if isinstance(candidate, Mapping) else {}):
+            for name in (
+                "Ln_from_minor_axis_nm",
+                "Lz_from_draw_axis_nm",
+                "L_from_major_axis_nm",
+                "L_N",
+                "L_z",
+                "ellipticity",
+                "q_star_from_arcs",
+                "L_from_observed_radius_nm",
+                "q_star_source",
+            ):
+                if geometry_parameters.get(name) is None and source.get(name) is not None:
+                    geometry_parameters[name] = source[name]
+        bound_flags = ellipse.get("bound_flags") if isinstance(ellipse, Mapping) else {}
+        if isinstance(candidate, Mapping) and candidate.get("bound_flags"):
+            bound_flags = candidate.get("bound_flags")
+        quality = butterfly.get("quality") if isinstance(butterfly, Mapping) else {}
+        quality_flags = {
+            str(item)
+            for item in ((quality.get("flags") if isinstance(quality, Mapping) else None) or ())
+            if item
+        }
+        withhold_shape = bool(
+            (isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"))
+            or "major_axis_exceeds_observed_extent" in quality_flags
+            or "axis_ratio_collapsed_to_line" in quality_flags
+        )
+        _stash_unpublished_periods(
+            geometry_parameters,
+            butterfly=butterfly,
+            ellipse=ellipse,
+            candidate=candidate,
+            allow_candidates=not withhold_shape,
+        )
+        if withhold_shape:
+            # Solver values stay on candidate_fit.  A bound hit or a major
+            # axis longer than the first-order scale is not a measured ellipse.
+            _withhold_unpublished_shape_parameters(geometry_parameters)
         intensity_parameters = deepcopy(result.get("parameters", {}))
         try:
             geometry_rmse = float(ellipse.get("rmse"))
@@ -1906,6 +2128,19 @@ class ButterflyAnalysisService:
             "center_qx": geometry_q_unit,
             "center_qy": geometry_q_unit,
             "theta_deg": "degree",
+            "L_N": "nm",
+            "L_z": "nm",
+            "Ln_from_minor_axis_nm": "nm",
+            "Lz_from_draw_axis_nm": "nm",
+            "L_from_major_axis_nm": "nm",
+            "Ln_candidate_from_minor_axis_nm": "nm",
+            "Lz_candidate_from_draw_axis_nm": "nm",
+            "L_candidate_from_major_axis_nm": "nm",
+            "q_star_from_arcs": geometry_q_unit,
+            "L_from_observed_radius_nm": "nm",
+            "q_star_source": "",
+            "ellipticity": "1",
+            "eccentricity": "1",
         }
         result["geometry_metrics"] = {
             "rmse": geometry_rmse,
@@ -2013,8 +2248,14 @@ class ButterflyAnalysisService:
                 stage = "geometry"
             elif stage in {"intensity", "pixel", "pixel_fit", "optimize", "full_2d"}:
                 stage = "full2d"
-            if stage not in {"geometry", "full2d"}:
-                raise ValueError("batch stage must be 'geometry' or 'full2d'")
+            elif stage in {"butterfly_evaluate", "arcs", "ellipse", "butterfly_arcs"}:
+                stage = "butterfly"
+            elif stage in {"butterfly_trace", "trace_only"}:
+                stage = "butterfly_trace"
+            if stage not in {"geometry", "full2d", "butterfly", "butterfly_trace"}:
+                raise ValueError(
+                    "batch stage must be 'geometry', 'full2d', 'butterfly', or 'butterfly_trace'"
+                )
             if "full2d" in payload_mapping and bool(payload_mapping["full2d"]) != (stage == "full2d"):
                 raise ValueError("batch stage and full2d disagree")
         if not frames:
@@ -2085,6 +2326,12 @@ class ButterflyAnalysisService:
             if not isinstance(source, Mapping):
                 ellipse_fit = _read(initial, ("ellipse_fit", "ellipse"), None)
                 source = _read(ellipse_fit, ("parameters", "parameter_values"), None)
+                if not isinstance(source, Mapping):
+                    source = ellipse_fit if isinstance(ellipse_fit, Mapping) else None
+            if not isinstance(source, Mapping):
+                candidate = _read(initial, ("butterfly", "candidate_fit"), None)
+                if isinstance(candidate, Mapping):
+                    source = candidate
             if not isinstance(source, Mapping):
                 source = initial if isinstance(initial, Mapping) else {}
             if not source:
@@ -2103,6 +2350,47 @@ class ButterflyAnalysisService:
                 ellipse["angle_deg"] = theta
             if ellipse:
                 analysis["ellipse"] = ellipse
+            return analysis
+
+        def butterfly_analysis(initial: Any, *, recipe_stage: str) -> dict[str, Any]:
+            """Force the observed-arc recipe without changing other analysis keys."""
+
+            analysis = geometry_seed_analysis(initial) if recipe_stage == "evaluate" else dict(original_analysis)
+            analysis["ridge_method"] = "butterfly_curvature"
+            explicit_butterfly = analysis.get("butterfly") if isinstance(analysis.get("butterfly"), Mapping) else {}
+            butterfly = dict(explicit_butterfly)
+            butterfly["stage"] = recipe_stage
+            # Batch evaluate publishes arcs and the candidate ellipse.  The
+            # interactive sensitivity / resample study is opt-in; leaving it
+            # on makes a detector-sized in-situ series look hung.
+            if "sensitivity" not in explicit_butterfly:
+                butterfly["sensitivity"] = False
+            if "resamples" not in explicit_butterfly:
+                butterfly["resamples"] = 0
+            if "run_wang_check" not in explicit_butterfly:
+                butterfly["run_wang_check"] = False
+            if "companion_observables" not in explicit_butterfly:
+                butterfly["companion_observables"] = False
+            analysis["butterfly"] = butterfly
+            window = analysis.get("q_window", analysis.get("q_range"))
+            if (
+                analysis.get("q_min") is None
+                and analysis.get("q_max") is None
+                and isinstance(window, (list, tuple))
+                and len(window) == 2
+            ):
+                analysis["q_min"], analysis["q_max"] = window[0], window[1]
+            ellipse = dict(analysis.get("ellipse") or {})
+            preset = str(ellipse.get("preset", analysis.get("ellipse_preset", "standard")) or "standard")
+            if preset.strip().lower().replace("-", "_") in {"", "standard"}:
+                seeded = {
+                    name: ellipse[name]
+                    for name in ("a", "b", "axis_ratio", "center_qx", "center_qy", "angle_deg")
+                    if name in ellipse and ellipse[name] is not None
+                }
+                seeded["preset"] = "flat_ellipse"
+                analysis["ellipse"] = seeded
+                analysis["ellipse_preset"] = "flat_ellipse"
             return analysis
 
         def analyze_with_state(frame: Any, initial: Any = None, *, warm_start: bool = False, config: Any = None) -> dict[str, Any]:
@@ -2146,16 +2434,26 @@ class ButterflyAnalysisService:
                 frame_payload["valid_mask"] = state.get("valid_mask")
             if original_rois:
                 frame_payload["rois"] = original_rois
-            frame_payload["analysis"] = geometry_seed_analysis(initial_seed) if stage == "geometry" else dict(original_analysis)
+            if stage == "butterfly":
+                frame_payload["analysis"] = butterfly_analysis(initial_seed, recipe_stage="evaluate")
+            elif stage == "butterfly_trace":
+                frame_payload["analysis"] = butterfly_analysis(initial_seed, recipe_stage="trace")
+            elif stage == "geometry":
+                frame_payload["analysis"] = geometry_seed_analysis(initial_seed)
+            else:
+                frame_payload["analysis"] = dict(original_analysis)
             frame_payload["commit_parameters"] = False
             frame_payload["stage"] = stage
             frame_payload["cancel_event"] = payload_mapping.get("cancel_event")
-            if stage == "geometry":
+            if stage in {"geometry", "butterfly", "butterfly_trace"}:
                 # Keep the intensity parameter table intact.  The measured
                 # ellipse settings live in ``analysis.ellipse`` and the
                 # returned batch result is adapted to use geometry params for
                 # longitudinal exports.
-                result = self.refine_geometry(
+                geometry_action = (
+                    self.measure_geometry if stage == "butterfly_trace" else self.refine_geometry
+                )
+                result = geometry_action(
                     parameters=specs,
                     parameter_specs=specs,
                     payload=frame_payload,
@@ -2168,11 +2466,11 @@ class ButterflyAnalysisService:
                 )
                 result["intensity_parameters"] = deepcopy(result.get("parameters", {}))
                 result["parameter_stage"] = "full2d"
-            if stage == "geometry":
+            if stage in {"geometry", "butterfly", "butterfly_trace"}:
                 result["intensity_parameters"] = deepcopy(result.get("parameters", {}))
                 result["geometry_parameters"] = deepcopy(result.get("geometry_parameters", {}))
                 result["parameters"] = deepcopy(result["geometry_parameters"])
-                result["parameter_stage"] = "geometry"
+                result["parameter_stage"] = stage
             result["stage"] = stage
             result["frame"] = str(path)
             result["frame_selector"] = frame_selector
@@ -2292,7 +2590,7 @@ class ButterflyAnalysisService:
                     "geometry_parameter_units": _read(
                         result, ("geometry_parameter_units",), {}
                     ),
-                    "flags": _read(metrics, ("flags",), []),
+                    "flags": _batch_record_flags(result, metrics),
                     "parameters": _read(result, ("parameters",), {}),
                     "geometry_parameters": _read(
                         result, ("geometry_parameters",), {}
@@ -2300,6 +2598,43 @@ class ButterflyAnalysisService:
                     "intensity_parameters": _read(
                         result, ("intensity_parameters",), {}
                     ),
+                    "arc_sides": _arc_side_summary(result),
+                    "q_star_from_arcs": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("q_star_from_arcs",),
+                        None,
+                    ),
+                    "L_from_observed_radius_nm": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("L_from_observed_radius_nm",),
+                        None,
+                    ),
+                    "q_star_source": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("q_star_source",),
+                        None,
+                    ),
+                    "Ln_candidate_from_minor_axis_nm": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("Ln_candidate_from_minor_axis_nm",),
+                        None,
+                    ),
+                    "Lz_candidate_from_draw_axis_nm": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("Lz_candidate_from_draw_axis_nm",),
+                        None,
+                    ),
+                    "L_candidate_from_major_axis_nm": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("L_candidate_from_major_axis_nm",),
+                        None,
+                    ),
+                    "quality_status": _read(
+                        _read(_read(result, ("butterfly",), {}), ("quality",), {}),
+                        ("status",),
+                        _read(_read(result, ("ellipse_fit",), {}), ("quality_status",), None),
+                    ),
+                    "ellipse_kind": _ellipse_kind_for_record(result),
                 }
             )
         if output_dir and stream_writer is None:

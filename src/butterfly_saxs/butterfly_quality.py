@@ -10,8 +10,63 @@ from collections.abc import Mapping, Sequence
 import math
 import numpy as np
 
+from .butterfly_ridge import FIRST_ORDER_FAMILY_SPAN
+
+# A first-order Wang ellipse can extend past q*, but a major axis more than
+# twice q* is fitting a larger-q continuum, not the Bragg ellipse.
+MAJOR_AXIS_TO_QSTAR_MAX = 2.0
+
 
 PARAMETERS = ("a", "b", "axis_ratio", "theta_deg")
+
+
+def classify_ellipse_publication(
+    *,
+    quality_status=None,
+    axis_ratio=None,
+    flags=None,
+) -> str:
+    """Say whether the published row is a ring period, an interior ellipse, or a fail.
+
+    A cap/floor ``b/a`` is not a measured ellipticity.  Those frames still have
+    a first-order ring period; they are not a quantitative Wang ellipse.
+    """
+
+    quality = str(quality_status or "").strip().upper()
+    if isinstance(flags, Mapping):
+        flag_tokens = [str(item) for item in (flags.get("flags") or ()) if item]
+        if flags.get("axis_ratio"):
+            flag_tokens.append("axis_ratio_at_bound")
+    elif isinstance(flags, str):
+        flag_tokens = [part.strip() for part in flags.split(",") if part.strip()]
+    else:
+        flag_tokens = [str(item) for item in (flags or ()) if item]
+    flag_text = ",".join(flag_tokens)
+    if quality in {"FAIL", "FAILED", "INVALID"}:
+        return "fail"
+    if any(
+        token in flag_text
+        for token in (
+            "axis_ratio_at_bound",
+            "axis_ratio_collapsed_to_line",
+            "major_axis_exceeds_observed_extent",
+        )
+    ):
+        return "ring"
+    ratio = _finite(axis_ratio)
+    if ratio is not None:
+        return "ellipse"
+    return "undetermined"
+
+
+def unpublished_ellipse_shape(*, quality_status=None, axis_ratio=None, flags=None) -> bool:
+    """True when the canvas/table should show a first-order ring, not an ellipse."""
+
+    return classify_ellipse_publication(
+        quality_status=quality_status,
+        axis_ratio=axis_ratio,
+        flags=flags,
+    ) == "ring"
 
 
 def _finite(value):
@@ -89,10 +144,61 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
                                     for p in points)
               for branch in (0, 1) for side in ("upper", "lower")}
     common = []
+    occupied_sides = sum(
+        1 for count in groups.values() if isinstance(count, (int, float)) and count > 0
+    )
     if not candidate or not candidate.get("success"):
         common.append("solver_or_arc_support_unavailable")
+    if occupied_sides < 3:
+        common.append("insufficient_occupied_sides")
     if any(count < 3 for count in groups.values()):
         common.append("insufficient_independent_side_support")
+    ratio = _finite(candidate.get("axis_ratio"))
+    bound_flags = candidate.get("bound_flags", {}) or {}
+    flag_names = {str(item) for item in (candidate.get("flags") or ())}
+    line_collapsed = (
+        ratio is not None
+        and ratio <= 0.02
+        and (
+            bool(bound_flags.get("axis_ratio"))
+            or "axis_ratio_at_bound" in flag_names
+        )
+    )
+    if line_collapsed:
+        common.append("axis_ratio_collapsed_to_line")
+    qs = []
+    for point in points:
+        qx = _finite(point.get("qx"))
+        qy = _finite(point.get("qy"))
+        if qx is not None and qy is not None:
+            qs.append(math.hypot(qx, qy))
+    hint = None
+    diagnostics = trace.get("diagnostics")
+    if isinstance(diagnostics, Mapping):
+        first_order = diagnostics.get("first_order_q_hint")
+        if isinstance(first_order, Mapping):
+            hint = _finite(first_order.get("q_star"))
+    if hint is not None and hint > 0.0:
+        family = [radius for radius in qs if radius <= FIRST_ORDER_FAMILY_SPAN * hint]
+        if family:
+            qs = family
+    q_extent = max(qs) if qs else None
+    a_value = _finite(candidate.get("a"))
+    major_exceeds_extent = (
+        a_value is not None
+        and q_extent is not None
+        and q_extent > 0
+        and a_value > 1.2 * q_extent
+    )
+    if (
+        a_value is not None
+        and hint is not None
+        and hint > 0.0
+        and a_value > MAJOR_AXIS_TO_QSTAR_MAX * hint
+    ):
+        major_exceeds_extent = True
+    if major_exceeds_extent:
+        common.append("major_axis_exceeds_observed_extent")
     arc_rows = _arc_rows(trace, candidate)
     arc_metrics = _arc_support_quality(arc_rows)
     if not arc_rows:
@@ -230,13 +336,24 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
         "measurement_status": status,
         "warm_start_eligible": status == "supported",
         "quality": {
-            "status": "WARN" if candidate.get("success") else "FAIL",
+            "status": (
+                "FAIL"
+                if not candidate.get("success") or occupied_sides < 3
+                else "WARN"
+            ),
             "engineering_status": "WARN" if status != "supported" else "PASS",
             "scientific_status": "NOT_ACCEPTED",
             "scientific_reason": "Independent human/instrument evidence and a frozen dataset-specific gate are required",
             "thresholds_version": "butterfly-arcs-engineering-provisional-v1",
             "thresholds_frozen": False,
-            "metrics": {"side_counts": groups, "median_localization_sigma_q": median_sigma,
+            "metrics": {"side_counts": groups, "occupied_sides": occupied_sides,
+                        "observed_q_extent": q_extent,
+                        "a_over_observed_extent": (
+                            a_value / q_extent
+                            if a_value is not None and q_extent not in (None, 0)
+                            else None
+                        ),
+                        "median_localization_sigma_q": median_sigma,
                         "median_normal_fwhm_q": float(np.median(width_scales)) if width_scales else None,
                         "residual_sigma_ratio": rmse / median_sigma if rmse is not None and median_sigma else None,
                         "arc_support": arc_metrics},

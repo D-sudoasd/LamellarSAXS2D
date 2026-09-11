@@ -950,8 +950,8 @@ def _bound_diagnostics(parameters: ParameterSet, values: Mapping[str, float]) ->
     for name, spec in parameters.spec_items():
         value = values[name]
         scale = 1.0 + abs(value)
-        at_lower = spec.min is not None and np.isfinite(spec.min) and abs(value - spec.min) <= 1e-8 * scale
-        at_upper = spec.max is not None and np.isfinite(spec.max) and abs(value - spec.max) <= 1e-8 * scale
+        at_lower = spec.min is not None and np.isfinite(spec.min) and abs(value - spec.min) <= 1e-6 * scale
+        at_upper = spec.max is not None and np.isfinite(spec.max) and abs(value - spec.max) <= 1e-6 * scale
         state = "lower" if at_lower else "upper" if at_upper else None
         status[name] = state
         flags[name] = state is not None

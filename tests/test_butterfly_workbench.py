@@ -232,12 +232,92 @@ def test_evaluated_undetermined_keeps_reason_and_exposes_unvalidated_candidate(q
                     "interval": None,
                 }
             },
+            "quality": {
+                "status": "WARN",
+                "metrics": {
+                    "side_counts": {
+                        "0:upper": 4,
+                        "0:lower": 3,
+                        "1:upper": 5,
+                        "1:lower": 4,
+                    }
+                },
+                "flags": ["apparent_geometry_only"],
+            },
+            "candidate_fit": {
+                "q_star_from_arcs": 0.099,
+                "L_from_observed_radius_nm": 63.2,
+                "Ln_from_minor_axis_nm": 173.0,
+                "Lz_from_draw_axis_nm": 52.0,
+            },
         }
     )
     assert window.butterfly_workbench.quantity_table.item(0, 2).text() == "未确定"
     assert window.butterfly_workbench.quantity_table.item(0, 3).text() == "0.42"
     assert "ill-conditioned" in window.butterfly_workbench.quantity_table.item(0, 5).text()
     assert "追踪阶段" not in window.butterfly_workbench.quantity_table.item(0, 5).text()
+    labels = [
+        window.butterfly_workbench.quantity_table.item(row, 0).text()
+        for row in range(window.butterfly_workbench.quantity_table.rowCount())
+    ]
+    assert "判读" in labels
+    reading_row = labels.index("判读")
+    assert window.butterfly_workbench.quantity_table.item(reading_row, 1).text() == "椭圆"
+    assert "质量" in labels
+    assert "弧" in labels
+    assert "一阶 q*" in labels
+    assert "环 L（nm）" in labels
+    assert "Ln 候选（nm）" in labels
+    assert "Lz 候选（nm）" in labels
+    window.close()
+
+
+def test_workbench_reads_runaway_major_axis_as_ring_only(qtbot, tmp_path):
+    window = MainWindow(engine=_ButterflyEngine(), auto_preview=False, language="zh_CN")
+    qtbot.addWidget(window)
+    window.butterfly_workbench.set_analysis_settings({"stage": "evaluate", "resamples": 0})
+    window.butterfly_workbench.set_result(
+        {
+            "points": [],
+            "profiles": {},
+            "quantitative_parameters": {},
+            "quality": {
+                "status": "WARN",
+                "metrics": {
+                    "side_counts": {
+                        "0:upper": 4,
+                        "0:lower": 3,
+                        "1:upper": 5,
+                        "1:lower": 4,
+                    }
+                },
+                "flags": ["major_axis_exceeds_observed_extent"],
+            },
+            "candidate_fit": {
+                "a": 0.27,
+                "axis_ratio": 0.18,
+                "theta_deg": 24.0,
+                "q_star_from_arcs": 0.09296,
+                "L_from_observed_radius_nm": 67.58,
+                "Ln_from_minor_axis_nm": 125.0,
+                "L_from_major_axis_nm": 23.0,
+            },
+        }
+    )
+    labels = [
+        window.butterfly_workbench.quantity_table.item(row, 0).text()
+        for row in range(window.butterfly_workbench.quantity_table.rowCount())
+    ]
+    reading_row = labels.index("判读")
+    assert window.butterfly_workbench.quantity_table.item(reading_row, 1).text() == "仅一阶环"
+    assert "Ln 候选（nm）" not in labels
+    assert "环 L（nm）" in labels
+    window.resize(980, 680)
+    window.show()
+    qtbot.waitForWindowShown(window)
+    shot = tmp_path / "workbench-ring-only.png"
+    window.butterfly_workbench.save_screenshot(shot)
+    assert shot.stat().st_size > 0
     window.close()
 
 

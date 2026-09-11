@@ -140,7 +140,21 @@ def deep_merge_mapping(base: Mapping[str, Any], update: Mapping[str, Any]) -> di
         key_text = str(key)
         previous = result.get(key_text)
         if isinstance(previous, Mapping) and isinstance(value, Mapping):
-            result[key_text] = deep_merge_mapping(previous, value)
+            incoming_preset = value.get("preset")
+            previous_preset = previous.get("preset")
+            if (
+                key_text == "ellipse"
+                and incoming_preset is not None
+                and str(incoming_preset).strip().lower().replace("-", "_")
+                != str(previous_preset or "").strip().lower().replace("-", "_")
+            ):
+                # A named preset is a replace, not a field-wise merge.  The
+                # service stores a materialized standard ellipse; merging
+                # ``{preset: flat_ellipse}`` into that mapping would keep
+                # ``axis_ratio_max=None`` and ``fixed_center=False``.
+                result[key_text] = dict(value)
+            else:
+                result[key_text] = deep_merge_mapping(previous, value)
         else:
             result[key_text] = value
     return result

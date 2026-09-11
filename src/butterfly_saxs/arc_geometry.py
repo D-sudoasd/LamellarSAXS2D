@@ -699,7 +699,30 @@ def _rectangle_value(
     vector: np.ndarray,
     origin: np.ndarray,
 ) -> float:
-    return float(np.dot(vector, geometry.point(float(t)) - origin))
+    base, coefficient_cos, coefficient_sin = _ellipse_linear_coefficients(geometry, vector, origin)
+    angle = float(t)
+    return float(base + coefficient_cos * math.cos(angle) + coefficient_sin * math.sin(angle))
+
+
+def _rectangle_reachable(
+    geometry: EllipseGeometry,
+    rectangle: Mapping[str, Any],
+    *,
+    tolerance: float = 0.0,
+) -> bool:
+    """Return whether the ellipse can enter the rectangle's tangent/normal slab."""
+
+    origin = np.asarray(rectangle["frame_origin_q"], dtype=float)
+    for axis, bounds in (
+        (np.asarray(rectangle["tangent_q"], dtype=float), rectangle["tangent_bounds"]),
+        (np.asarray(rectangle["normal_q"], dtype=float), rectangle["normal_bounds"]),
+    ):
+        base, coefficient_cos, coefficient_sin = _ellipse_linear_coefficients(geometry, axis, origin)
+        amplitude = math.hypot(coefficient_cos, coefficient_sin)
+        low, high = float(bounds[0]), float(bounds[1])
+        if base + amplitude < low - tolerance or base - amplitude > high + tolerance:
+            return False
+    return True
 
 
 def _rectangle_contains(
@@ -749,6 +772,9 @@ def _rectangle_intervals(
 ) -> list[dict[str, Any]]:
     """Intersect one observed rectangle and manual/domain intervals analytically."""
 
+    scale = max(1.0, abs(geometry.a), abs(geometry.b))
+    if not _rectangle_reachable(geometry, rectangle, tolerance=2.0e-10 * scale):
+        return []
     origin = np.asarray(rectangle["frame_origin_q"], dtype=float)
     axes = (
         (np.asarray(rectangle["tangent_q"], dtype=float), rectangle["tangent_bounds"]),
@@ -856,11 +882,12 @@ def _support_violation_q(
             ]
         )
         if domain_hi > domain_lo:
-            for value in np.linspace(domain_lo, domain_hi, 33):
-                candidates.append(np.asarray(geometry.point(value), dtype=float).reshape(2))
+            candidates.extend(np.asarray(geometry.point(np.linspace(domain_lo, domain_hi, 33)), dtype=float).reshape(-1, 2))
     if not candidates:
         return float(max(geometry.a, geometry.b, 1.0))
-    distances = np.asarray([np.linalg.norm(candidate - point) for candidate in candidates], dtype=float)
+    samples = np.asarray(candidates, dtype=float).reshape(-1, 2)
+    origin = np.asarray(point, dtype=float).reshape(2)
+    distances = np.linalg.norm(samples - origin, axis=1)
     finite = distances[np.isfinite(distances)]
     return float(max(np.min(finite) if finite.size else max(geometry.a, geometry.b, 1.0), 1.0e-12))
 
@@ -879,13 +906,15 @@ def _project_point_to_support(
         domain = []
     candidates: list[dict[str, Any]] = []
     local_candidates: list[tuple[float, float, dict[str, Any]]] = []
+    unconstrained: list[dict[str, Any]] = []
+    point_array = np.asarray([point], dtype=float)
+    local_u, local_v = _local_coordinates(point_array, geometry) if domain else (None, None)
     if rectangles:
         # Fast path for the common case: the unconstrained closest point in a
         # manual/side domain already lies inside an observed rectangle.  A
         # point that is feasible for the global domain is necessarily the
         # constrained optimum, so no sinusoid boundary enumeration is needed.
-        u, v = _local_coordinates(np.asarray([point], dtype=float), geometry)
-        unconstrained: list[dict[str, Any]] = []
+        u, v = local_u, local_v
         for domain_index, (domain_lo, domain_hi) in enumerate(domain):
             raw_projection = _project_ellipse_arc(
                 u,
@@ -906,8 +935,14 @@ def _project_point_to_support(
                     "domain_index": domain_index,
                 }
             )
+        scale = max(1.0, abs(geometry.a), abs(geometry.b))
+        reachable = [
+            rectangle
+            for rectangle in rectangles
+            if _rectangle_reachable(geometry, rectangle, tolerance=2.0e-10 * scale)
+        ]
         for candidate in sorted(unconstrained, key=lambda item: (item["distance"], item["t"])):
-            for rectangle in rectangles:
+            for rectangle in reachable:
                 if _rectangle_contains(geometry, candidate["t"], rectangle):
                     return {
                         "projection_valid": True,
@@ -924,9 +959,11 @@ def _project_point_to_support(
                         "support_violation_q": 0.0,
                         "objective_distance": candidate["distance"],
                     }
-        for rectangle in rectangles:
-            for item in _rectangle_intervals(geometry, rectangle, domain):
-                local_candidates.append((float(item["lo"]), float(item["hi"]), item))
+        # The unconstrained t is the closest domain-arc point.  Any later
+        # rectangle-clipped t is a worse residual.  Enumerating sinusoid
+        # roots for that farther point on every Jacobian sample is what
+        # made detector-sized butterfly fits look hung; keep the exact
+        # domain-arc distance as the infeasible penalty instead.
     elif manual_intervals is not None:
         for index, (lo, hi) in enumerate(domain):
             local_candidates.append(
@@ -946,10 +983,9 @@ def _project_point_to_support(
     for lo, hi, metadata in local_candidates:
         # The helper above works in a branch-local frame.  Convert the observed
         # q point to that frame before evaluating it.
-        u, v = _local_coordinates(np.asarray([point], dtype=float), geometry)
         projection = _project_ellipse_arc(
-            u,
-            v,
+            local_u,
+            local_v,
             geometry.a,
             geometry.b,
             np.asarray([lo]),
@@ -967,7 +1003,15 @@ def _project_point_to_support(
             }
         )
     if not candidates:
-        penalty = _support_violation_q(point, geometry, rectangles, domain)
+        if unconstrained:
+            # Rectangle intersection can be empty while the side/manual domain
+            # still has a closest ellipse point.  That exact domain-arc
+            # distance is the finite penalty; resampling the same arc on a
+            # 33-point grid is a slower approximation of the same quantity.
+            best = min(unconstrained, key=lambda item: (item["distance"], item["t"]))
+            penalty = float(max(best["distance"], 1.0e-12))
+        else:
+            penalty = _support_violation_q(point, geometry, rectangles, domain)
         return {
             "projection_valid": False,
             "t": float("nan"),
@@ -1082,6 +1126,20 @@ def _parameter_set_for_arcs(
         result["cy"] = result["cy"].copy(value=0.0, vary=False, name="cy")
         relative = (result["theta"].value - reference_axis + _HALF_PI) % math.pi - _HALF_PI
         result["theta"].set_value(relative)
+        # Short-arc closest-point fits collapse onto a line unless the
+        # butterfly very-flat prior keeps b/a away from zero.  Callers that
+        # pass an explicit mapping keep their own bounds.
+        ratio = result["axis_ratio"]
+        ratio_min = 0.005 if ratio.min is None or float(ratio.min) <= 10.0 * np.finfo(float).eps else float(ratio.min)
+        ratio_max = 0.35 if ratio.max is None or float(ratio.max) >= 1.0 else float(ratio.max)
+        if ratio_min > ratio_max:
+            ratio_min, ratio_max = 0.005, 0.35
+        result["axis_ratio"] = ratio.copy(
+            value=float(np.clip(ratio.value, ratio_min, ratio_max)),
+            min=ratio_min,
+            max=ratio_max,
+            name="axis_ratio",
+        )
 
     theta_spec = result["theta"]
     lower = max(0.0, theta_spec.min if theta_spec.min is not None else 0.0)
@@ -1222,6 +1280,60 @@ def _algebraic_arc_seed(
             spec.set_value(value)
         except ValueError:
             return parameters
+    return seeded
+
+
+def _observed_radius_seed(points: np.ndarray, parameters: ParameterSet) -> ParameterSet:
+    """Replace the chord-length ``a`` guess with the observed |q-c| envelope.
+
+    Butterfly wings sit near the major-axis tips.  The covariance / algebraic
+    seeds can follow the upper–lower chord (~2a).  When the centre is fixed,
+    the high quantile of observed radii is the physically consistent scale.
+    When the caller left ``a`` unbounded, a tight envelope around the
+    outer-radius quantile is applied.  Short-arc closest-point fits otherwise
+    wander to a larger-a family.  Caller-supplied finite bounds are preserved.
+    """
+
+    if points.shape[0] < 5:
+        return parameters
+    spec = parameters["a"]
+    if spec.expr is not None or not spec.vary:
+        return parameters
+    values = parameters.resolve()
+    try:
+        cx, cy = float(values["cx"]), float(values["cy"])
+    except (KeyError, TypeError, ValueError):
+        return parameters
+    if not (parameters["cx"].is_fixed and parameters["cy"].is_fixed):
+        return parameters
+    if not np.isfinite(cx) or not np.isfinite(cy):
+        return parameters
+    radii = np.hypot(points[:, 0] - cx, points[:, 1] - cy)
+    finite = radii[np.isfinite(radii) & (radii > 0.0)]
+    if finite.size < 5:
+        return parameters
+    r_hi = float(np.quantile(finite, 0.90))
+    r_max = float(np.max(finite))
+    if not all(np.isfinite((r_hi, r_max))) or r_hi <= 0.0 or r_max <= 0.0:
+        return parameters
+    a_seed = r_hi
+    default_min = spec.min is None or float(spec.min) <= 10.0 * np.finfo(float).eps
+    default_max = spec.max is None or not np.isfinite(float(spec.max))
+    lower = float(spec.min) if not default_min else max(0.97 * r_hi, np.finfo(float).eps)
+    upper = float(spec.max) if not default_max else None
+    if default_max:
+        # Short-arc closest-point costs decrease as a grows, so any loose
+        # envelope is saturated.  Pin a to the observed outer-radius
+        # quantile; that is the origin-centred tip scale.
+        upper = 1.03 * r_hi
+    if upper is not None and lower > upper:
+        return parameters
+    value = float(a_seed if upper is None else np.clip(a_seed, lower, upper))
+    try:
+        seeded = parameters.copy()
+        seeded["a"] = spec.copy(value=value, min=lower, max=upper, name="a")
+    except ValueError:
+        return parameters
     return seeded
 
 
@@ -1572,6 +1684,7 @@ def fit_arc_ellipses(
     ]
     parameter_set = _parameter_set_for_arcs(xy, parameters, reference_axis)
     parameter_set = _algebraic_arc_seed(xy, source_labels, parameter_set, reference_axis)
+    parameter_set = _observed_radius_seed(xy, parameter_set)
     sigma_weights = 1.0 / sigmas
 
     def objective(candidate: ParameterSet, labels: np.ndarray) -> np.ndarray:

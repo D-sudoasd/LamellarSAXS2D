@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import json
+import math
 import sys
 import threading
 from types import SimpleNamespace
@@ -27,6 +28,54 @@ from butterfly_saxs.pipeline import batch_analyze, run_project_bounded
 from butterfly_saxs.service import ButterflyAnalysisService
 from butterfly_saxs.export import StreamingBatchExporter
 from butterfly_saxs.cancellation import AnalysisCancelled
+
+
+def test_butterfly_refine_passes_flat_ellipse_bounds_to_solver(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_measure(frame, qmap, q_window, **kwargs):
+        del frame, qmap, q_window
+        captured.update(kwargs)
+        return SimpleNamespace(flags=(), ridge=None, ellipse=None, butterfly=None)
+
+    monkeypatch.setattr(service_module, "measure_observables", fake_measure)
+    image = np.ones((12, 14), dtype=float)
+    yy, xx = np.indices(image.shape, dtype=float)
+    service = ButterflyAnalysisService()
+    state = service.set_observed(
+        image,
+        qmap={
+            "qx": (xx - 6.5) / 10.0,
+            "qy": (yy - 5.5) / 10.0,
+            "q_unit": "nm^-1",
+        },
+    )
+    service.refine_geometry(
+        payload={
+            **state,
+            "stage": "butterfly",
+            "analysis": {
+                "ridge_method": "butterfly_curvature",
+                "q_window": [0.05, 0.80],
+                "q_min": 0.05,
+                "q_max": 0.80,
+                "ellipse_preset": "flat_ellipse",
+                "ellipse": {"preset": "flat_ellipse"},
+                "butterfly": {
+                    "stage": "evaluate",
+                    "resamples": 0,
+                    "sensitivity": False,
+                    "run_wang_check": False,
+                    "companion_observables": False,
+                },
+            },
+        }
+    )
+    specs = captured["ellipse_parameters"]
+    assert isinstance(specs, dict)
+    assert specs["axis_ratio"]["max"] == pytest.approx(0.35)
+    assert specs["cx"]["vary"] is False
+    assert specs["cy"]["vary"] is False
 
 
 def test_flat_ellipse_settings_reach_measured_ridge_solver(monkeypatch) -> None:
@@ -115,6 +164,86 @@ def test_geometry_action_uses_ellipse_rmse_and_marks_model_unfitted(monkeypatch)
     assert result["geometry_parameters"]["axis_ratio"] == pytest.approx(0.08)
     assert result["intensity_parameters"]["amplitude_plus"]["value"] == pytest.approx(12.0)
     assert "intensity_model_unfitted" in result["flags"]
+
+
+def test_geometry_action_withholds_axis_ratio_at_explicit_bound(monkeypatch) -> None:
+    service = ButterflyAnalysisService()
+
+    def fake_preview(**kwargs):
+        del kwargs
+        return {
+            "observed": np.ones((2, 3)),
+            "model": np.full((2, 3), 0.5),
+            "residual": np.full((2, 3), 0.5),
+            "parameters": {},
+            "metrics": {"rmse": 0.01, "ndata": 6, "success": True},
+            "ellipse_fit": {
+                "rmse": 0.0045,
+                "n_points": 47,
+                "q_unit": "nm^-1",
+                "success": True,
+                "parameters": {"a": 0.11, "axis_ratio": 0.35, "b": 0.0385, "theta_deg": 32.0},
+                "bound_flags": {"axis_ratio": True},
+                "flags": ["axis_ratio_at_bound"],
+            },
+            "flags": ["apparent_geometry_only"],
+        }
+
+    monkeypatch.setattr(service, "preview", fake_preview)
+    result = service.measure_geometry()
+    assert result["geometry_parameters"]["a"] is None
+    assert result["geometry_parameters"]["b"] is None
+    assert result["geometry_parameters"]["axis_ratio"] is None
+    assert result["geometry_parameters"]["theta_deg"] is None
+    assert "axis_ratio_at_bound" in service_module._batch_record_flags(
+        result, result.get("metrics")
+    )
+    assert "Ln_candidate_from_minor_axis_nm" not in result["geometry_parameters"]
+
+
+def test_geometry_action_keeps_interior_ln_as_unpublished_candidate(monkeypatch) -> None:
+    service = ButterflyAnalysisService()
+
+    def fake_preview(**kwargs):
+        del kwargs
+        return {
+            "observed": np.ones((2, 3)),
+            "model": np.full((2, 3), 0.5),
+            "residual": np.full((2, 3), 0.5),
+            "parameters": {},
+            "metrics": {"rmse": 0.01, "ndata": 6, "success": True},
+            "ellipse_fit": {
+                "rmse": 0.0045,
+                "n_points": 47,
+                "q_unit": "nm^-1",
+                "success": True,
+                "parameters": {"a": 0.12, "axis_ratio": 0.30, "b": 0.036},
+                "Ln_from_minor_axis_nm": 174.5,
+                "Lz_from_draw_axis_nm": 52.0,
+                "bound_flags": {},
+            },
+            "butterfly": {
+                "quantitative_parameters": {
+                    "b": {"value": None, "candidate_value": 0.036},
+                },
+                "candidate_fit": {
+                    "axis_ratio": 0.30,
+                    "Ln_from_minor_axis_nm": 174.5,
+                    "Lz_from_draw_axis_nm": 52.0,
+                    "bound_flags": {},
+                },
+            },
+            "flags": ["apparent_geometry_only"],
+        }
+
+    monkeypatch.setattr(service, "preview", fake_preview)
+    result = service.measure_geometry()
+    geometry = result["geometry_parameters"]
+    assert "Ln_from_minor_axis_nm" not in geometry
+    assert geometry["Ln_candidate_from_minor_axis_nm"] == pytest.approx(174.5)
+    assert geometry["Lz_candidate_from_draw_axis_nm"] == pytest.approx(52.0)
+    assert geometry.get("L_candidate_from_major_axis_nm") is None
+    assert geometry["axis_ratio"] == pytest.approx(0.30)
 
 
 def test_service_result_exposes_multistart_cost_audit_fields(monkeypatch) -> None:
@@ -229,6 +358,177 @@ def test_service_batch_geometry_stage_exports_measured_parameters(monkeypatch, t
     assert result["records"][0]["intensity_parameters"]["amplitude_plus"]["value"] == pytest.approx(99.0)
 
 
+def test_service_batch_butterfly_stage_uses_geometry_path_and_forced_recipe(monkeypatch, tmp_path: Path) -> None:
+    service = ButterflyAnalysisService()
+    source = tmp_path / "frame.npy"
+    source.write_bytes(b"frame")
+    seen: list[str] = []
+
+    monkeypatch.setattr(
+        service,
+        "load_image",
+        lambda path, **kwargs: service.set_observed(np.ones((2, 3))),
+    )
+
+    def fake_geometry(**kwargs):
+        payload = kwargs.get("payload") or {}
+        analysis = payload.get("analysis") or {}
+        seen.append(str(analysis.get("ridge_method")))
+        assert analysis.get("butterfly", {}).get("stage") == "evaluate"
+        return {
+            "parameters": {"amplitude_plus": {"value": 1.0}},
+            "geometry_parameters": {"a": 1.2, "b": 0.18, "axis_ratio": 0.15, "theta_deg": 28.0},
+            "ellipse_fit": {"rmse": 0.02, "success": True, "q_unit": "nm^-1"},
+            "metrics": {"rmse": 0.02, "success": True},
+            "flags": [],
+        }
+
+    monkeypatch.setattr(service, "refine_geometry", fake_geometry)
+    monkeypatch.setattr(service, "optimize", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full2d")))
+    result = service.batch(
+        payload={
+            "frames": [source],
+            "stage": "butterfly",
+            "full2d": False,
+            "mode": "independent",
+        }
+    )
+    assert seen == ["butterfly_curvature"]
+    assert result["stage"] == "butterfly"
+    assert result["records"][0]["stage"] == "butterfly"
+    assert result["records"][0]["parameters"]["a"] == pytest.approx(1.2)
+    assert result["records"][0]["parameters"]["theta_deg"] == pytest.approx(28.0)
+
+
+def test_service_batch_butterfly_stage_applies_flat_ellipse_and_keeps_periods(monkeypatch, tmp_path: Path) -> None:
+    service = ButterflyAnalysisService()
+    source = tmp_path / "frame.npy"
+    source.write_bytes(b"frame")
+    seen: list[dict] = []
+
+    monkeypatch.setattr(
+        service,
+        "load_image",
+        lambda path, **kwargs: service.set_observed(np.ones((2, 3))),
+    )
+
+    def fake_geometry(**kwargs):
+        payload = kwargs.get("payload") or {}
+        analysis = payload.get("analysis") or {}
+        seen.append(analysis)
+        return {
+            "parameters": {"amplitude_plus": {"value": 1.0}},
+            "geometry_parameters": {
+                "a": 0.72,
+                "b": 0.0144,
+                "axis_ratio": 0.02,
+                "theta_deg": 17.0,
+                "Ln_from_minor_axis_nm": 436.0,
+                "Lz_from_draw_axis_nm": 8.7,
+            },
+            "ellipse_fit": {
+                "rmse": 0.01,
+                "success": True,
+                "q_unit": "nm^-1",
+                "Ln_from_minor_axis_nm": 436.0,
+                "Lz_from_draw_axis_nm": 8.7,
+            },
+            "butterfly": {
+                "quality": {"metrics": {"side_counts": {
+                    "0_upper": 12, "0_lower": 11, "1_upper": 10, "1_lower": 9,
+                }}},
+            },
+            "metrics": {"rmse": 0.01, "success": True},
+            "flags": [],
+        }
+
+    monkeypatch.setattr(service, "refine_geometry", fake_geometry)
+    monkeypatch.setattr(service, "optimize", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full2d")))
+    result = service.batch(
+        payload={
+            "frames": [source],
+            "stage": "butterfly",
+            "full2d": False,
+            "mode": "independent",
+        }
+    )
+    analysis = seen[0]
+    assert analysis["ridge_method"] == "butterfly_curvature"
+    assert analysis["ellipse_preset"] == "flat_ellipse"
+    assert analysis["ellipse"]["preset"] == "flat_ellipse"
+    assert analysis["butterfly"]["sensitivity"] is False
+    assert analysis["butterfly"]["resamples"] == 0
+    assert analysis["butterfly"]["run_wang_check"] is False
+    assert analysis["butterfly"]["companion_observables"] is False
+    record = result["records"][0]
+    assert record["arc_sides"] == "4/4"
+    assert record["geometry_parameters"]["Ln_from_minor_axis_nm"] == pytest.approx(436.0)
+    assert record["geometry_parameters"]["Lz_from_draw_axis_nm"] == pytest.approx(8.7)
+
+
+def test_service_batch_butterfly_warm_start_seeds_next_ellipse(monkeypatch, tmp_path: Path) -> None:
+    service = ButterflyAnalysisService()
+    frames = [tmp_path / "frame_a.npy", tmp_path / "frame_b.npy"]
+    for path in frames:
+        path.write_bytes(b"frame")
+    seen: list[dict] = []
+
+    monkeypatch.setattr(
+        service,
+        "load_image",
+        lambda path, **kwargs: service.set_observed(np.ones((2, 3))),
+    )
+
+    def fake_geometry(**kwargs):
+        payload = kwargs.get("payload") or {}
+        analysis = payload.get("analysis") or {}
+        seen.append(analysis)
+        return {
+            "parameters": {},
+            "geometry_parameters": {
+                "a": 0.72,
+                "b": 0.0144,
+                "axis_ratio": 0.02,
+                "theta_deg": 17.0,
+            },
+            "ellipse_fit": {"rmse": 0.01, "success": True, "q_unit": "nm^-1"},
+            "butterfly": {
+                "warm_start_eligible": True,
+                "candidate_fit": {
+                    "success": True,
+                    "a": 0.72,
+                    "b": 0.0144,
+                    "axis_ratio": 0.02,
+                    "theta_deg": 17.0,
+                },
+                "quality": {
+                    "status": "supported",
+                    "metrics": {"side_counts": {
+                        "0_upper": 12, "0_lower": 11, "1_upper": 10, "1_lower": 9,
+                    }},
+                },
+            },
+            "metrics": {"rmse": 0.01, "success": True},
+            "flags": [],
+        }
+
+    monkeypatch.setattr(service, "refine_geometry", fake_geometry)
+    monkeypatch.setattr(service, "optimize", lambda **kwargs: (_ for _ in ()).throw(AssertionError("full2d")))
+    result = service.batch(
+        payload={
+            "frames": frames,
+            "stage": "butterfly",
+            "full2d": False,
+            "mode": "warm_start",
+        }
+    )
+    assert [item["status"] for item in result["records"]] == ["ok", "ok"]
+    assert seen[1]["ellipse"]["a"] == pytest.approx(0.72)
+    assert seen[1]["ellipse"]["b"] == pytest.approx(0.0144)
+    assert seen[1]["ellipse"]["axis_ratio"] == pytest.approx(0.02)
+    assert seen[1]["ellipse"]["angle_deg"] == pytest.approx(17.0)
+
+
 def test_stream_export_includes_lobe_scalar_measurements(tmp_path: Path) -> None:
     source = tmp_path / "frame.npy"
     source.write_bytes(b"frame")
@@ -315,6 +615,7 @@ def test_batch_cancel_reports_progress_and_checkpoint_state(tmp_path: Path) -> N
     assert run.total_count == 3
     assert checkpoint.exists() and checkpoint.stat().st_size > 0
     assert progress and progress[-1]["cancelled"] is True
+    assert progress[0]["phase"] == "input_fingerprint"
 
 
 def test_config_fingerprint_changes_when_mask_contents_change(tmp_path: Path) -> None:
@@ -689,6 +990,96 @@ def test_bounded_project_stream_keeps_arrays_in_sink_not_frame_results(
     assert (output / "results.npz").exists()
 
 
+def test_canonical_ellipse_payload_derives_origin_centered_periods() -> None:
+    from butterfly_saxs.public_ellipse import canonical_ellipse_payload
+
+    fit = SimpleNamespace(
+        success=True,
+        a=1.0,
+        b=0.2,
+        axes_ratio=0.2,
+        theta_deg=0.0,
+        center=(0.0, 0.0),
+        parameter_values={"a": 1.0, "b": 0.2, "axis_ratio": 0.2},
+        ellipses=(),
+        flags=(),
+        L_N=float("nan"),
+        L_z=float("nan"),
+        ellipticity=float("nan"),
+        q_unit="nm^-1",
+    )
+    payload = canonical_ellipse_payload(fit)
+    assert payload["Ln_from_minor_axis_nm"] == pytest.approx(2.0 * np.pi / 0.2)
+    assert payload["Lz_from_draw_axis_nm"] == pytest.approx(2.0 * np.pi / 0.2)
+    assert payload["L_from_major_axis_nm"] == pytest.approx(2.0 * np.pi / 1.0)
+    rotated = canonical_ellipse_payload(
+        SimpleNamespace(
+            success=True,
+            a=1.0,
+            b=0.2,
+            axes_ratio=0.2,
+            theta_deg=90.0,
+            center=(0.0, 0.0),
+            parameter_values={"a": 1.0, "b": 0.2, "axis_ratio": 0.2},
+            ellipses=(),
+            flags=(),
+            L_N=float("nan"),
+            L_z=float("nan"),
+            ellipticity=float("nan"),
+            q_unit="nm^-1",
+        )
+    )
+    assert rotated["Ln_from_minor_axis_nm"] == pytest.approx(2.0 * np.pi / 0.2)
+    assert rotated["Lz_from_draw_axis_nm"] == pytest.approx(2.0 * np.pi / 1.0)
+    assert rotated["L_from_major_axis_nm"] == pytest.approx(2.0 * np.pi / 1.0)
+    assert payload["ellipticity"] == pytest.approx(np.sqrt(1.0 - 0.04))
+    assert "spacing_requires_origin_centered_ellipse_assumption" in payload["flags"]
+
+    pixel = canonical_ellipse_payload(
+        SimpleNamespace(
+            success=True,
+            a=1.0,
+            b=0.2,
+            axes_ratio=0.2,
+            theta_deg=0.0,
+            center=(0.0, 0.0),
+            parameter_values={"a": 1.0, "b": 0.2, "axis_ratio": 0.2},
+            ellipses=(),
+            flags=(),
+            q_unit="pixel-q",
+        )
+    )
+    assert np.isnan(pixel["L_N"])
+    assert "spacing_unavailable_unknown_q_unit" in pixel["flags"]
+
+
+def test_observed_arc_radius_period_uses_median_q() -> None:
+    from butterfly_saxs.public_ellipse import observed_arc_radius_period
+
+    points = [
+        {"qx": 0.40, "qy": 0.0},
+        {"qx": 0.0, "qy": 0.42},
+        {"qx": -0.41, "qy": 0.0},
+        {"qx": 0.0, "qy": -0.39},
+        {"qx": 0.30, "qy": 0.30},
+    ]
+    q_star, period, flags = observed_arc_radius_period(points, "nm^-1")
+    assert q_star == pytest.approx(0.40, abs=0.03)
+    assert period == pytest.approx(2.0 * np.pi / q_star)
+    assert "spacing_from_observed_arc_radius" in flags
+    hinted_q, hinted_L, hinted_flags = observed_arc_radius_period(
+        points, "nm^-1", first_order_q=0.092
+    )
+    assert hinted_q == pytest.approx(0.092)
+    assert hinted_L == pytest.approx(2.0 * np.pi / 0.092)
+    assert "spacing_from_first_order_iq" in hinted_flags
+    assert "arc_radius_on_secondary_population" in hinted_flags
+    unknown_q, unknown_L, unknown_flags = observed_arc_radius_period(points, "pixel-q")
+    assert unknown_q == pytest.approx(q_star)
+    assert math.isnan(unknown_L)
+    assert "spacing_unavailable_unknown_q_unit" in unknown_flags
+
+
 def test_service_and_pipeline_ellipse_payloads_share_compatibility_aliases() -> None:
     fit = SimpleNamespace(
         success=True,
@@ -754,3 +1145,37 @@ def test_pipeline_branch_descriptor_keeps_lossless_values_and_indices() -> None:
     assert payload["branch_assignment"]["shape"] == [3]
     np.testing.assert_array_equal(payload["branch_assignment_values"], [0, 1, 1])
     np.testing.assert_array_equal(payload["branch_assignment_indices"], [4, 8, 9])
+
+
+def test_batch_record_flags_keep_axis_ratio_bound() -> None:
+    flags = service_module._batch_record_flags(
+        {
+            "flags": ["geometry_remeasured"],
+            "ellipse_fit": {"bound_flags": {"axis_ratio": True}, "flags": []},
+            "butterfly": {
+                "candidate_fit": {
+                    "flags": ["fixed_observed_arc_topology"],
+                    "bound_flags": {"axis_ratio": True},
+                }
+            },
+        },
+        {"flags": ["ellipse_constraints_active"]},
+    )
+    assert "axis_ratio_at_bound" in flags
+    assert "ellipse_constraints_active" in flags
+    assert "geometry_remeasured" in flags
+    fail_flags = service_module._batch_record_flags(
+        {
+            "butterfly": {
+                "quality": {
+                    "flags": [
+                        "major_axis_exceeds_observed_extent",
+                        "image_resampling_interval_unavailable",
+                    ]
+                }
+            }
+        },
+        {},
+    )
+    assert "major_axis_exceeds_observed_extent" in fail_flags
+    assert "image_resampling_interval_unavailable" not in fail_flags

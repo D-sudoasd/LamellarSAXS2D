@@ -17,12 +17,30 @@ import numpy as np
 from .butterfly_settings import METHOD_VERSION, normalize_butterfly_settings
 from .butterfly_quality import PARAMETERS, evaluate_arc_evidence
 from .cancellation import raise_if_cancelled
-from .public_ellipse import canonical_ellipse_payload
+from .public_ellipse import canonical_ellipse_payload, observed_arc_radius_period
 from .serialization import strict_jsonable
 
 
 def _read(value, name, default=None):
     return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+
+def _qmap_unit(qmap: Any) -> str:
+    """Read a declared q unit without inferring one from numeric arrays.
+
+    PONI ``GeometryMaps`` keep the unit in ``metadata`` rather than a public
+    constructor field.  Treating that as missing made calibrated frames report
+    ``unknown`` and drop Ln/Lz.
+    """
+
+    unit = _read(qmap, "q_unit", None)
+    if unit in (None, "", "unknown"):
+        metadata = _read(qmap, "metadata", {}) or {}
+        if isinstance(metadata, Mapping):
+            nested = metadata.get("q_unit", metadata.get("unit"))
+            if nested not in (None, ""):
+                unit = nested
+    return str(unit or "unknown")
 
 
 def _image(frame):
@@ -154,6 +172,9 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
                 "a", "b", "semi_major", "semi_minor", "axis_ratio",
                 "center_qx", "center_qy", "q_unit", "eccentricity",
                 "ellipticity", "reference_axis_deg",
+                "L_N", "L_z", "Ln_from_minor_axis_nm", "Lz_from_draw_axis_nm",
+                "L_from_major_axis_nm",
+                "q_star_from_arcs", "L_from_observed_radius_nm",
             )
             if key in payload
         }
@@ -167,6 +188,30 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
             }
         )
         members.append(member)
+    diagnostics = trace.get("diagnostics") if isinstance(trace, Mapping) else {}
+    first_order = diagnostics.get("first_order_q_hint") if isinstance(diagnostics, Mapping) else {}
+    hint = first_order.get("q_star") if isinstance(first_order, Mapping) else None
+    q_star, radius_period, radius_flags = observed_arc_radius_period(
+        supported, unit, first_order_q=hint
+    )
+    bound_flags = getattr(fit, "bound_flags", {}) or {}
+    extra_flags = list(radius_flags)
+    if bound_flags.get("axis_ratio"):
+        extra_flags.append("axis_ratio_at_bound")
+    payload["q_star_from_arcs"] = q_star
+    payload["L_from_observed_radius_nm"] = radius_period
+    payload["q_star_source"] = (
+        "first_order_iq"
+        if "spacing_from_first_order_iq" in radius_flags
+        else "observed_arc_radius"
+    )
+    values["q_star_from_arcs"] = q_star
+    values["L_from_observed_radius_nm"] = radius_period
+    values["q_star_source"] = payload["q_star_source"]
+    for member in members:
+        member["q_star_from_arcs"] = q_star
+        member["L_from_observed_radius_nm"] = radius_period
+        member["q_star_source"] = payload["q_star_source"]
     payload.update(
         {
             "success": bool(fit.success),
@@ -190,6 +235,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
                 }
             },
             "arc_diagnostics": result.get("arc_diagnostics", []),
+            "bound_flags": dict(bound_flags),
             "flags": list(
                 dict.fromkeys(
                     tuple(payload.get("flags", ()))
@@ -197,6 +243,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
                         "fixed_observed_arc_topology",
                         "local_covariance_not_complete_uncertainty",
                     )
+                    + tuple(extra_flags)
                 )
             ),
         }
@@ -808,7 +855,7 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
     image = _image(image)
     if image.ndim != 2:
         raise ValueError("butterfly analysis requires a 2D image")
-    q_unit = str(_read(qmap, "q_unit", _read(qmap, "unit", "unknown")))
+    q_unit = _qmap_unit(qmap)
     for qname, pname in (("center_qx", "cx"), ("center_qy", "cy")):
         if isinstance(parameters, Mapping) and pname in parameters:
             spec = parameters[pname]
@@ -877,7 +924,7 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
                                  fit_ellipse=True, n_angular_bins=360, n_radial_bins=256,
                                  snr_threshold=None, cancel_event=None):
     """Adapter into the existing observable bundle without changing old methods."""
-    from .observables import (ObservableSet, _measure_lobe_radial_observables,
+    from .observables import (AngularSpectrum, ObservableSet, _measure_lobe_radial_observables,
                               apparent_lamellar_tilt, measure_angular_spectrum,
                               measure_four_lobe_peaks)
     settings = dict(options or {})
@@ -888,20 +935,37 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
     result = analyze_butterfly(frame, qmap, q_window, mask=mask, options=settings,
                               parameters=ellipse_parameters, reference_axis_deg=draw_axis_deg - 90.,
                               multistart=multistart, cancel_event=cancel_event)
-    raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
-    angular = measure_angular_spectrum(frame, qmap, q_window, n_bins=n_angular_bins, mask=mask)
-    raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
-    lobes = measure_four_lobe_peaks(angular, symmetric_refine=True,
-                                   reference_axis_deg=draw_axis_deg - 90.)
-    raise_if_cancelled(cancel_event, "butterfly:lobe-peaks")
-    profiles, radial_peaks = _measure_lobe_radial_observables(frame, qmap, q_window, lobes,
-        n_radial_bins=n_radial_bins, snr_threshold=float(result["settings"]["snr_threshold"]),
-        min_coverage=0., mask=mask, cancel_event=cancel_event)
-    raise_if_cancelled(cancel_event, "butterfly:lobe-profiles")
-    tilt, spread = apparent_lamellar_tilt(lobes, draw_axis_deg=draw_axis_deg)
-    raise_if_cancelled(cancel_event, "butterfly:lobe-summary")
-    points = result.get("points", [])
     unit = str(_read(qmap, "q_unit", "unknown"))
+    if settings.get("companion_observables", True):
+        raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
+        angular = measure_angular_spectrum(frame, qmap, q_window, n_bins=n_angular_bins, mask=mask)
+        raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
+        lobes = measure_four_lobe_peaks(angular, symmetric_refine=True,
+                                       reference_axis_deg=draw_axis_deg - 90.)
+        raise_if_cancelled(cancel_event, "butterfly:lobe-peaks")
+        profiles, radial_peaks = _measure_lobe_radial_observables(frame, qmap, q_window, lobes,
+            n_radial_bins=n_radial_bins, snr_threshold=float(result["settings"]["snr_threshold"]),
+            min_coverage=0., mask=mask, cancel_event=cancel_event)
+        raise_if_cancelled(cancel_event, "butterfly:lobe-profiles")
+        tilt, spread = apparent_lamellar_tilt(lobes, draw_axis_deg=draw_axis_deg)
+        raise_if_cancelled(cancel_event, "butterfly:lobe-summary")
+    else:
+        angular = AngularSpectrum(
+            angle=np.zeros(0, dtype=float),
+            intensity=np.zeros(0, dtype=float),
+            counts=np.zeros(0, dtype=int),
+            candidate_counts=np.zeros(0, dtype=int),
+            coverage=np.zeros(0, dtype=float),
+            q_min=float("nan"),
+            q_max=float("nan"),
+            q_center=float("nan"),
+            flags=(),
+            q_unit=unit,
+        )
+        lobes = []
+        profiles, radial_peaks = [], []
+        tilt, spread = float("nan"), float("nan")
+    points = result.get("points", [])
     ridge = {"points": points, "q_unit": unit, "flags": [METHOD_VERSION],
              "valid_fraction": sum(bool(p.get("accepted")) for p in points) / max(1, len(points)),
              "method": "butterfly_curvature"}

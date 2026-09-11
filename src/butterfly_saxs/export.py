@@ -572,6 +572,81 @@ def _frame_summary_rows(results: Sequence[FrameFitResult]) -> list[dict[str, Any
         for parameter in params:
             name = parameter["parameter"]
             row.setdefault(name, parameter["value"])
+        geometry = _as_mapping(_value(result, "geometry_parameters", default=None))
+        # Public a/b/θ come from geometry_parameters.  Intensity or solver
+        # leftovers must not fill a ring row with a capped-fit angle.
+        if geometry:
+            for name in (
+                "a",
+                "b",
+                "axis_ratio",
+                "theta_deg",
+                "ellipticity",
+                "eccentricity",
+            ):
+                if name in geometry:
+                    row[name] = _scalar(geometry[name])
+        butterfly = _as_mapping(_value(result, "butterfly", default=None))
+        quality = _as_mapping(_value(butterfly, "quality", default=None)) or _as_mapping(
+            _value(result, "quality", default=None)
+        )
+        row.setdefault(
+            "quality_status",
+            _scalar(
+                _value(quality, "status", default=None)
+                or _value(result, "quality_status", default=None)
+            ),
+        )
+        row.setdefault("arc_sides", _scalar(_value(result, "arc_sides", default=None)))
+        row.setdefault(
+            "q_star_from_arcs",
+            _scalar(
+                _value(geometry, "q_star_from_arcs", default=None)
+                or _value(result, "q_star_from_arcs", default=None)
+            ),
+        )
+        row.setdefault(
+            "L_from_observed_radius_nm",
+            _scalar(
+                _value(geometry, "L_from_observed_radius_nm", default=None)
+                or _value(result, "L_from_observed_radius_nm", default=None)
+            ),
+        )
+        row.setdefault(
+            "q_star_source",
+            _scalar(
+                _value(geometry, "q_star_source", default=None)
+                or _value(result, "q_star_source", default=None)
+            ),
+        )
+        row.setdefault(
+            "ellipse_kind",
+            _scalar(
+                _value(result, "ellipse_kind", default=None)
+                or _value(geometry, "ellipse_kind", default=None)
+            ),
+        )
+        row.setdefault(
+            "Ln_candidate_from_minor_axis_nm",
+            _scalar(
+                _value(geometry, "Ln_candidate_from_minor_axis_nm", default=None)
+                or _value(result, "Ln_candidate_from_minor_axis_nm", default=None)
+            ),
+        )
+        row.setdefault(
+            "Lz_candidate_from_draw_axis_nm",
+            _scalar(
+                _value(geometry, "Lz_candidate_from_draw_axis_nm", default=None)
+                or _value(result, "Lz_candidate_from_draw_axis_nm", default=None)
+            ),
+        )
+        row.setdefault(
+            "L_candidate_from_major_axis_nm",
+            _scalar(
+                _value(geometry, "L_candidate_from_major_axis_nm", default=None)
+                or _value(result, "L_candidate_from_major_axis_nm", default=None)
+            ),
+        )
         row["parameters_json"] = _json_text(params)
         row["frame_metadata_json"] = _json_text(item.frame.metadata)
         rows.append(row)
@@ -1576,6 +1651,11 @@ def export_batch(
             "dataset",
             "time",
             "status",
+            "quality_status",
+            "arc_sides",
+            "q_star_from_arcs",
+            "L_from_observed_radius_nm",
+            "q_star_source",
             "error",
             "warm_start_from",
             "elapsed_s",

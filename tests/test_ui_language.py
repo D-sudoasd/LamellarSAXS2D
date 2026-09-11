@@ -435,14 +435,18 @@ def test_measurement_terms_and_booleans_retranslate_without_changing_raw_data(
     assert window.ellipse_table.item(4, 0).text() == "椭圆轴角（deg）"
     assert window.ellipse_table.item(5, 0).text() == "短轴换算 Ln（nm）"
     assert window.ellipse_table.item(6, 0).text() == "拉伸轴换算 Lz（nm）"
-    assert window.ellipse_table.item(9, 0).text() == "点数"
-    assert window.ellipse_table.item(10, 0).text() == "求解成功"
-    assert window.ellipse_table.item(10, 1).text() == "False"
-    assert window.ellipse_table.item(10, 1).data(user_role) is False
-    assert window.ellipse_table.item(11, 1).text() == "raw_ellipse_flag"
-    assert window.ellipse_table.item(12, 0).text() == "phi_app_deg"
-    assert window.ellipse_table.item(13, 0).text() == "alpha_candidate_deg"
-    assert window.ellipse_table.item(14, 0).text() == "psi_candidate_deg"
+    assert window.ellipse_table.item(7, 0).text() == "长轴换算 L（nm）"
+    assert window.ellipse_table.item(8, 0).text() == "一阶环 L（nm）"
+    assert window.ellipse_table.item(9, 0).text() == "一阶 q*"
+    assert window.ellipse_table.item(10, 0).text() == "q* 来源"
+    assert window.ellipse_table.item(13, 0).text() == "点数"
+    assert window.ellipse_table.item(14, 0).text() == "求解成功"
+    assert window.ellipse_table.item(14, 1).text() == "False"
+    assert window.ellipse_table.item(14, 1).data(user_role) is False
+    assert window.ellipse_table.item(15, 1).text() == "raw_ellipse_flag"
+    assert window.ellipse_table.item(16, 0).text() == "phi_app_deg"
+    assert window.ellipse_table.item(17, 0).text() == "alpha_candidate_deg"
+    assert window.ellipse_table.item(18, 0).text() == "psi_candidate_deg"
 
     raw_observables = window.measurement_observables
     window.set_language("en", persist=False)
@@ -453,12 +457,15 @@ def test_measurement_terms_and_booleans_retranslate_without_changing_raw_data(
     assert window.lobe_table.item(0, 6).text() == "False"
     assert window.lobe_table.item(0, 6).data(user_role) is False
     assert window.lobe_table.item(0, 7).text() == "raw_lobe_flag"
-    assert window.ellipse_table.item(10, 1).text() == "False"
-    assert window.ellipse_table.item(10, 1).data(user_role) is False
-    assert window.ellipse_table.item(11, 1).text() == "raw_ellipse_flag"
+    assert window.ellipse_table.item(14, 1).text() == "False"
+    assert window.ellipse_table.item(14, 1).data(user_role) is False
+    assert window.ellipse_table.item(15, 1).text() == "raw_ellipse_flag"
     assert window.ellipse_table.item(2, 0).text() == "axis ratio"
     assert window.ellipse_table.item(4, 0).text() == "theta (ellipse axis, deg)"
     assert window.ellipse_table.item(5, 0).text() == "Ln from minor axis (nm)"
+    assert window.ellipse_table.item(7, 0).text() == "L from major axis (nm)"
+    assert window.ellipse_table.item(8, 0).text() == "L from first-order ring (nm)"
+    assert window.ellipse_table.item(9, 0).text() == "q* (first-order)"
     assert window.measurement_observables is raw_observables
     window.close()
 
