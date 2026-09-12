@@ -18,6 +18,7 @@ import json
 import math
 import sys
 import threading
+import time
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, Callable
@@ -27,9 +28,11 @@ from .models import ParameterRow, ParameterTableModel
 from .project_document import ProjectDocumentController
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .butterfly_workbench import ButterflyWorkbench
+from .butterfly_figure_export import new_figure_export_target, run_butterfly_figure_export
 from .qspace import overlay_ring_radius, overlay_uses_first_order_ring
 from .views import PLOT_AVAILABLE, ViewGrid, _disable_auto_si_prefix
 from .workers import AnalysisWorker, GenerationGuard
+from ..cancellation import AnalysisCancelled
 from ..service import DEFAULT_ANALYSIS_SETTINGS
 
 try:
@@ -253,6 +256,99 @@ def symmetric_ellipses(ellipse: Any, *, axis: str = "y") -> list[Any]:
 def _result_value(result: Any, names: tuple[str, ...], default: Any = None) -> Any:
     value = _read(result, names, default)
     return default if value is None else value
+
+
+def _full2d_model_context(result: Any) -> dict[str, Any]:
+    """Extract the actual Optimize fit context from service and legacy results.
+
+    Current ButterflyAnalysisService results put solver diagnostics in metrics.
+    Older adapters may expose the same values at the root under pixel_model_*
+    names, so those remain fallbacks.
+    """
+
+    metrics = _result_value(result, ("metrics", "statistics", "summary"), {})
+    if not isinstance(metrics, Mapping):
+        metrics = {}
+
+    def metric_or_root(metric_name: str, root_names: tuple[str, ...]) -> Any:
+        value = metrics.get(metric_name)
+        if value is not None:
+            return value
+        return _result_value(result, root_names, None)
+
+    success = metric_or_root("success", ("pixel_model_success", "success"))
+    explicit_status = _result_value(
+        result, ("status", "solver_status", "pixel_model_status"), None
+    )
+    if explicit_status in (None, ""):
+        explicit_status = _read(metrics, ("status", "solver_status"), None)
+    if explicit_status not in (None, "") and str(explicit_status).lower() != "unknown":
+        status = str(explicit_status)
+    elif success is not None:
+        if isinstance(success, str):
+            normalized = success.strip().lower()
+            if normalized in {"false", "fail", "failed", "no", "0"}:
+                success = False
+            elif normalized in {"true", "success", "ok", "yes", "1"}:
+                success = True
+        status = "success" if bool(success) else "failed"
+    else:
+        status = "unknown"
+
+    parameters = _result_value(
+        result, ("parameters", "fitted_parameters", "params"), None
+    )
+    if isinstance(parameters, Mapping):
+        parameters = {
+            str(name): (
+                _read(value, ("value", "val", "initial"), None)
+                if isinstance(value, Mapping)
+                else value
+            )
+            for name, value in parameters.items()
+        }
+    diagnostics = {
+        "rmse": metric_or_root(
+            "rmse", ("pixel_model_rmse", "full2d_rmse", "rmse")
+        ),
+        "weighted_rmse": metric_or_root(
+            "weighted_rmse", ("pixel_model_weighted_rmse", "weighted_rmse")
+        ),
+        "condition_number": metric_or_root(
+            "condition_number",
+            ("pixel_model_condition_number", "condition_number"),
+        ),
+        "bound_flags": deepcopy(
+            metric_or_root(
+                "bound_flags",
+                ("pixel_model_bound_flags", "bound_flags"),
+            )
+        ),
+        "effective_bounds": deepcopy(
+            metric_or_root(
+                "effective_bounds",
+                ("pixel_model_effective_bounds", "effective_bounds"),
+            )
+        ),
+        "bound_flag_intensity_scale": metric_or_root(
+            "bound_flag_intensity_scale",
+            (
+                "pixel_model_bound_flag_intensity_scale",
+                "bound_flag_intensity_scale",
+            ),
+        ),
+    }
+    reference_axis_deg = metric_or_root(
+        "reference_axis_deg",
+        ("pixel_model_reference_axis_deg", "reference_axis_deg"),
+    )
+    return {
+        "status": status,
+        "success": success,
+        "parameters": parameters,
+        "reference_axis_deg": reference_axis_deg,
+        "diagnostics": diagnostics,
+    }
 
 
 def _analysis_scalar(value: Any, *, default: Any = None) -> Any:
@@ -794,6 +890,7 @@ if QT_AVAILABLE:
             self._config_path: str | None = None
             self._last_result: Any = None
             self._last_result_signature: str | None = None
+            self._last_model_diagnostic_signature: str | None = None
             self._last_result_kind: str | None = None
             self._geometry_only_result = False
             self._last_result_input_records: dict[str, Any] | None = None
@@ -803,6 +900,8 @@ if QT_AVAILABLE:
                 for role in ("source", "poni", "mask")
             }
             self._last_evidence_paths: dict[str, Path] = {}
+            self._last_butterfly_figure_paths: dict[str, Path] = {}
+            self._figure_export_result_revisions: dict[int, int] = {}
             self._last_error: str | None = None
             self._fit_ridge_points: Any = []
             self._rejected_ridge_points: list[Any] = []
@@ -818,6 +917,9 @@ if QT_AVAILABLE:
             self.batch_frames: list[Any] = []
             self._batch_cancel_event: Any = None
             self._busy_focus_widget: Any = None
+            self._job_started_at: float | None = None
+            self._active_job_kind = ""
+            self._cancel_pending = False
             self._fit_session: dict[str, Any] = _new_fit_session()
             # Project loading and programmatic restoration update several
             # widgets in sequence.  The flag keeps those internal updates
@@ -853,6 +955,9 @@ if QT_AVAILABLE:
             self._debounce_timer = QtCore.QTimer(self)
             self._debounce_timer.setSingleShot(True)
             self._debounce_timer.timeout.connect(self._on_debounce_timeout)
+            self._job_elapsed_timer = QtCore.QTimer(self)
+            self._job_elapsed_timer.setInterval(250)
+            self._job_elapsed_timer.timeout.connect(self._refresh_worker_elapsed)
             self.parameter_model.parameterChanged.connect(self._on_parameter_changed)
 
             self.setMinimumSize(980, 680)
@@ -967,6 +1072,9 @@ if QT_AVAILABLE:
             self.butterfly_workbench.displayChanged.connect(self._on_butterfly_display_changed)
             self.butterfly_workbench.analysisChanged.connect(self._on_butterfly_analysis_changed)
             self.butterfly_workbench.exportRequested.connect(self._on_butterfly_export_requested)
+            self.butterfly_workbench.figureExportRequested.connect(
+                self._on_butterfly_figure_export_requested
+            )
             self.butterfly_workbench.applyToBatchRequested.connect(self._on_butterfly_apply_batch)
             self.butterfly_workbench.cancelRequested.connect(self.cancel_jobs)
             self.butterfly_workbench.frameSelected.connect(self._on_butterfly_frame_selected)
@@ -1126,6 +1234,152 @@ if QT_AVAILABLE:
                 return
             self._last_evidence_paths = dict(written)
             self._set_status("status.evidence_exported", flags="butterfly_exported", path=chosen)
+
+        def _on_butterfly_figure_export_requested(self) -> None:
+            page = self.butterfly_workbench
+            if not page.result_fresh:
+                self._set_status("status.evidence_stale", flags="butterfly_figure_stale")
+                return
+            parent = QtWidgets.QFileDialog.getExistingDirectory(
+                self,
+                self._tr("dialog.export_butterfly_figure"),
+                "",
+            )
+            if not parent:
+                return
+            choices = [
+                self._tr("figure.single_column"),
+                self._tr("figure.double_column"),
+            ]
+            choice, accepted = QtWidgets.QInputDialog.getItem(
+                self,
+                self._tr("dialog.export_butterfly_figure"),
+                self._tr("dialog.figure_export_width"),
+                choices,
+                1,
+                False,
+            )
+            if not accepted:
+                return
+            width_mm = 89.0 if choice == choices[0] else 183.0
+            dpi, accepted = QtWidgets.QInputDialog.getInt(
+                self,
+                self._tr("dialog.export_butterfly_figure"),
+                self._tr("dialog.figure_export_dpi"),
+                600,
+                72,
+                2400,
+                50,
+            )
+            if not accepted:
+                return
+            target = new_figure_export_target(parent)
+            try:
+                snapshot = page.figure_export_snapshot(context=self._butterfly_export_context())
+                self._start_butterfly_figure_export(
+                    target,
+                    snapshot,
+                    width_mm=width_mm,
+                    dpi=dpi,
+                )
+            except (FileExistsError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                self._set_status(
+                    "status.butterfly_figure_export_failed",
+                    flags="butterfly_figure_export_error",
+                    error=exc,
+                )
+
+        def _start_butterfly_figure_export(
+            self,
+            target: str | Path,
+            snapshot: Mapping[str, Any],
+            *,
+            width_mm: float,
+            dpi: int = 600,
+        ) -> int:
+            """Queue a detached measurement-figure snapshot on the shared pool."""
+
+            if self._workers:
+                raise RuntimeError("wait for the active task to finish before exporting a figure")
+            page = self.butterfly_workbench
+            result_revision = int(snapshot.get("result_revision", -1))
+            if not page.result_fresh or page.result_revision != result_revision:
+                raise ValueError("the butterfly result changed before figure export started")
+            generation = self._generation.next()
+            cancel_event = threading.Event()
+            payload = {
+                key: value
+                for key, value in snapshot.items()
+                if key != "result_revision"
+            }
+            if (
+                self._last_result_kind == "optimize"
+                and not self._is_geometry_only_result()
+                and self._last_model_diagnostic_signature is not None
+                and self._last_model_diagnostic_signature == self._fit_state_signature()
+            ):
+                model_context = _full2d_model_context(self._last_result)
+                model_diagnostics = model_context["diagnostics"]
+                model = _result_value(self._last_result, ("model_image", "model"), None)
+                if model is not None and _np is not None:
+                    model = _np.array(model, copy=True, subok=True)
+                    if model.shape != payload["observed"].shape:
+                        raise ValueError("fitted intensity and observed image shapes differ")
+                    model.setflags(write=False)
+                    payload["model"] = model
+                    payload["context"] = {
+                        **dict(payload.get("context") or {}),
+                        "pixel_model_source": "full2d optimize output",
+                        "pixel_model_status": model_context["status"],
+                        "pixel_model_success": model_context["success"],
+                        "pixel_model_parameters": deepcopy(model_context["parameters"]),
+                        "pixel_model_reference_axis_deg": (
+                            model_context["reference_axis_deg"]
+                            if model_context["reference_axis_deg"] is not None
+                            else self._reference_axis_deg()
+                        ),
+                        "pixel_model_bound_flags": deepcopy(
+                            model_diagnostics["bound_flags"]
+                        ),
+                        "pixel_model_condition_number": model_diagnostics[
+                            "condition_number"
+                        ],
+                        "pixel_model_rmse": model_diagnostics["rmse"],
+                        "pixel_model_weighted_rmse": model_diagnostics[
+                            "weighted_rmse"
+                        ],
+                        "pixel_model_effective_bounds": deepcopy(
+                            model_diagnostics["effective_bounds"]
+                        ),
+                        "pixel_model_bound_flag_intensity_scale": (
+                            model_diagnostics["bound_flag_intensity_scale"]
+                        ),
+                    }
+            payload.update(
+                {
+                    "target": Path(target).expanduser().resolve(),
+                    "width_mm": float(width_mm),
+                    "dpi": int(dpi),
+                    "cancel_event": cancel_event,
+                }
+            )
+            worker = AnalysisWorker(
+                run_butterfly_figure_export,
+                generation=generation,
+                kind="butterfly_figure_export",
+                payload=payload,
+            )
+            payload["progress"] = worker.report_progress
+            worker.signals.progress.connect(self._on_worker_progress)
+            worker.signals.finished.connect(self._on_worker_finished)
+            worker.signals.error.connect(self._on_worker_error)
+            self._workers[generation] = worker
+            self._cancel_events[generation] = cancel_event
+            self._figure_export_result_revisions[generation] = result_revision
+            self._last_butterfly_figure_paths = {}
+            self._set_busy(True, "butterfly_figure_export")
+            self._thread_pool.start(worker)
+            return generation
 
         def _on_butterfly_apply_batch(self, payload: Any) -> None:
             """Apply the page recipe to the existing batch flow."""
@@ -3519,6 +3773,7 @@ if QT_AVAILABLE:
                 self._model_ellipses = []
                 self._last_result = None
                 self._last_result_signature = None
+                self._last_model_diagnostic_signature = None
                 self._last_result_kind = None
                 self._geometry_only_result = False
                 self._last_result_input_records = None
@@ -3650,19 +3905,19 @@ if QT_AVAILABLE:
                 allow_nan=False,
             )
 
-        def _result_has_fit_images(self, result: Any) -> bool:
+        def _result_has_fit_images(self, result: Any, *, include_failed: bool = False) -> bool:
             """Return whether one result can support visual human review."""
 
             if (
                 result is None
-                or _result_has_failure(result)
+                or (_result_has_failure(result) and not include_failed)
                 or self._is_geometry_only_result(result)
             ):
                 return False
             observed = _result_value(result, ("observed", "data", "image"), self._observed)
             model = _result_value(
                 result,
-                ("model", "predicted", "fit", "intensity", "simulation"),
+                ("model", "model_image", "predicted", "fit", "intensity", "simulation"),
                 result if not isinstance(result, Mapping) else None,
             )
             if observed is None or model is None:
@@ -3926,6 +4181,7 @@ if QT_AVAILABLE:
             self._fit_session["review_notes"] = ""
             self._fit_session["accepted_parameters"] = None
             self._last_result_signature = None
+            self._last_model_diagnostic_signature = None
             self._last_result_input_records = None
             if clear_candidate:
                 self._fit_session["optimize_after"] = None
@@ -4919,7 +5175,12 @@ if QT_AVAILABLE:
                 self._pending_input_records[generation] = deepcopy(
                     self._loaded_input_records
                 )
-                if hasattr(self, "butterfly_workbench") and kind in {"measure_geometry", "refine_geometry"}:
+                if hasattr(self, "butterfly_workbench") and kind in {
+                    "preview",
+                    "optimize",
+                    "measure_geometry",
+                    "refine_geometry",
+                }:
                     self.butterfly_workbench.invalidate_result()
             if kind == "optimize":
                 # Freeze every editable field and the complete current input
@@ -5010,14 +5271,24 @@ if QT_AVAILABLE:
             self._generation.next()
             self._pending_input_records.clear()
             self._last_result_signature = None
+            self._last_model_diagnostic_signature = None
             self._last_result_input_records = None
             self.lamellar_page.invalidate()
             self._sync_fit_session_controls()
             active = next(iter(self._workers.values()), None)
-            self._set_busy(bool(active), getattr(active, "kind", "cancelled"))
-            if hasattr(self, "butterfly_workbench"):
-                self.butterfly_workbench.set_job_status("cancelled", "analysis")
-            self._set_status("status.cancelled_late")
+            self._cancel_pending = bool(active)
+            if active is None:
+                self._set_busy(False, "cancelled")
+                self._set_status("status.cancelled")
+            else:
+                self._set_busy(True, active.kind)
+                if hasattr(self, "butterfly_workbench"):
+                    self.butterfly_workbench.set_job_status(
+                        "cancelling",
+                        active.kind,
+                        elapsed_s=self._current_job_elapsed(),
+                    )
+                self._set_status("status.cancelling", kind_key=f"job.{active.kind}")
 
         def ignore_late_result(self) -> None:
             """Advance the generation gate while preserving the current view."""
@@ -5025,6 +5296,7 @@ if QT_AVAILABLE:
             self._generation.next()
             self._pending_input_records.clear()
             self._last_result_signature = None
+            self._last_model_diagnostic_signature = None
             self._last_result_input_records = None
             self.lamellar_page.invalidate()
             self._sync_fit_session_controls()
@@ -5042,9 +5314,33 @@ if QT_AVAILABLE:
         ) -> None:
             """Apply structured worker progress on the GUI thread only."""
 
-            if not self._generation.is_current(generation) or kind != "batch":
+            if not self._generation.is_current(generation):
                 return
             if not isinstance(payload, Mapping):
+                return
+            if kind == "butterfly_figure_export":
+                try:
+                    percent = max(0, min(100, int(payload.get("percent", 0))))
+                except (TypeError, ValueError):
+                    percent = 0
+                phase = str(payload.get("phase", "render"))
+                elapsed_s = self._current_job_elapsed()
+                state = "cancelling" if self._cancel_pending else "running"
+                self.butterfly_workbench.set_job_status(
+                    state,
+                    kind,
+                    elapsed_s=elapsed_s,
+                    progress_percent=percent,
+                    progress_phase=phase,
+                )
+                self._set_status(
+                    "status.butterfly_figure_export_progress",
+                    percent=percent,
+                    phase=phase,
+                    elapsed_s=elapsed_s,
+                )
+                return
+            if kind != "batch":
                 return
             completed = int(payload.get("completed", payload.get("index", 0)) or 0)
             total = int(payload.get("total", len(self.batch_frames)) or 0)
@@ -5099,11 +5395,19 @@ if QT_AVAILABLE:
 
         def _on_worker_finished(self, generation: int, kind: str, result: Any) -> None:
             self._workers.pop(generation, None)
-            self._cancel_events.pop(generation, None)
+            cancel_event = self._cancel_events.pop(generation, None)
             input_records = self._pending_input_records.pop(generation, None)
+            if kind == "butterfly_figure_export":
+                self._finish_butterfly_figure_export(generation, result, cancel_event=cancel_event)
+                return
             if not self._generation.is_current(generation):
                 if not self._workers:
-                    self._set_busy(False, "cancelled")
+                    state = "cancelled" if self._cancel_pending else "ignored"
+                    self._cancel_pending = False
+                    self._set_busy(False, state)
+                elif self._cancel_pending:
+                    active_kind = next(iter(self._workers.values())).kind
+                    self._set_busy(True, active_kind)
                 return
             self._last_error = None
             if kind == "batch":
@@ -5161,6 +5465,31 @@ if QT_AVAILABLE:
                     # deliberately left unreviewed until the user presses
                     # Accept current or Reject current.
                     self._fit_session["manual_status"] = "unreviewed"
+                self._last_model_diagnostic_signature = (
+                    self._fit_state_signature()
+                    if kind == "optimize" and self._result_has_fit_images(result, include_failed=True)
+                    else None
+                )
+                if hasattr(self, "butterfly_workbench"):
+                    current_signature = self._fit_state_signature()
+                    if (
+                        kind == "optimize"
+                        and self._last_model_diagnostic_signature is not None
+                        and self._last_model_diagnostic_signature == current_signature
+                    ):
+                        model_context = _full2d_model_context(result)
+                        self.butterfly_workbench.set_model_fit_context(
+                            model_context["parameters"],
+                            reference_axis_deg=(
+                                model_context["reference_axis_deg"]
+                                if model_context["reference_axis_deg"] is not None
+                                else self._reference_axis_deg()
+                            ),
+                            solver_status=model_context["status"],
+                            diagnostics=model_context["diagnostics"],
+                        )
+                    else:
+                        self.butterfly_workbench.clear_model_fit_context()
                 self._sync_fit_session_controls()
             if self._workers:
                 active_kind = next(iter(self._workers.values())).kind
@@ -5170,15 +5499,29 @@ if QT_AVAILABLE:
 
         def _on_worker_error(self, generation: int, kind: str, error: Exception) -> None:
             self._workers.pop(generation, None)
-            self._cancel_events.pop(generation, None)
+            cancel_event = self._cancel_events.pop(generation, None)
             self._pending_input_records.pop(generation, None)
+            if kind == "butterfly_figure_export":
+                self._finish_butterfly_figure_export(
+                    generation,
+                    None,
+                    error=error,
+                    cancel_event=cancel_event,
+                )
+                return
             if not self._generation.is_current(generation):
                 if not self._workers:
-                    self._set_busy(False, "cancelled")
+                    state = "cancelled" if self._cancel_pending else "ignored"
+                    self._cancel_pending = False
+                    self._set_busy(False, state)
+                elif self._cancel_pending:
+                    active_kind = next(iter(self._workers.values())).kind
+                    self._set_busy(True, active_kind)
                 return
             self._last_error = str(error)
             self.lamellar_page.invalidate()
             self._last_result_signature = None
+            self._last_model_diagnostic_signature = None
             self._last_result_input_records = None
             self._last_result = None
             self._last_result_kind = None
@@ -5199,6 +5542,95 @@ if QT_AVAILABLE:
                 "status.job_error",
                 flags="error",
                 kind_key=f"job.{kind}",
+                error=error,
+            )
+
+        def _finish_butterfly_figure_export(
+            self,
+            generation: int,
+            result: Any,
+            *,
+            error: Exception | None = None,
+            cancel_event: Any = None,
+        ) -> None:
+            """Handle a frozen figure export without committing it as analysis."""
+
+            page = self.butterfly_workbench
+            result_revision = self._figure_export_result_revisions.pop(generation, None)
+            page_result_is_current = bool(
+                result_revision is not None
+                and page.result_revision == result_revision
+                and page.result_fresh
+            )
+            if error is None:
+                if not isinstance(result, Mapping) or not result:
+                    error = TypeError("figure exporter returned no output paths")
+                else:
+                    try:
+                        self._last_butterfly_figure_paths = {
+                            str(name): Path(path).expanduser().resolve()
+                            for name, path in result.items()
+                        }
+                    except (TypeError, ValueError, OSError) as exc:
+                        error = TypeError(f"figure exporter returned invalid paths: {exc}")
+
+            cancelled = isinstance(error, AnalysisCancelled) and (
+                cancel_event is None or bool(cancel_event.is_set())
+            )
+            if self._workers:
+                active_kind = next(iter(self._workers.values())).kind
+                self._set_busy(True, active_kind)
+                if self._cancel_pending:
+                    page.set_job_status(
+                        "cancelling",
+                        active_kind,
+                        elapsed_s=self._current_job_elapsed(),
+                    )
+                return
+
+            self._cancel_pending = False
+            if cancelled:
+                self._set_busy(
+                    False,
+                    "cancelled",
+                    update_butterfly_status=page_result_is_current,
+                )
+                if not page_result_is_current:
+                    page.finish_detached_job_if_active("butterfly_figure_export")
+                self._set_status("status.cancelled")
+                return
+
+            if error is None:
+                self._set_busy(
+                    False,
+                    "butterfly_figure_export",
+                    result_ok=True,
+                    update_butterfly_status=page_result_is_current,
+                )
+                if not page_result_is_current:
+                    page.finish_detached_job_if_active("butterfly_figure_export")
+                manifest = self._last_butterfly_figure_paths.get("manifest")
+                output_dir = manifest.parent if manifest is not None else next(
+                    iter(self._last_butterfly_figure_paths.values())
+                ).parent
+                self._set_status(
+                    "status.butterfly_figure_exported",
+                    flags="butterfly_figure_exported",
+                    path=output_dir,
+                )
+                return
+
+            self._set_busy(
+                False,
+                "butterfly_figure_export",
+                result_ok=False,
+                update_butterfly_status=page_result_is_current,
+            )
+            if not page_result_is_current:
+                page.finish_detached_job_if_active("butterfly_figure_export")
+            self._set_status(
+                "status.butterfly_figure_export_failed",
+                flags="butterfly_figure_export_error",
                 error=error,
             )
 
@@ -6223,6 +6655,7 @@ if QT_AVAILABLE:
                 "_external_mask",
                 "_last_result",
                 "_last_result_signature",
+                "_last_model_diagnostic_signature",
                 "_last_result_kind",
                 "_geometry_only_result",
                 "_last_error",
@@ -6351,6 +6784,7 @@ if QT_AVAILABLE:
                 "_external_mask",
                 "_last_result",
                 "_last_result_signature",
+                "_last_model_diagnostic_signature",
                 "_last_result_kind",
                 "_geometry_only_result",
                 "_last_error",
@@ -6816,7 +7250,31 @@ if QT_AVAILABLE:
             if focus_target is not None and focus_target.isVisible() and focus_target.isEnabled():
                 QtCore.QTimer.singleShot(0, focus_target.setFocus)
 
-        def _set_busy(self, busy: bool, kind: str = "", *, result_ok: bool | None = None) -> None:
+        def _current_job_elapsed(self) -> float:
+            if self._job_started_at is None:
+                return 0.0
+            return max(0.0, time.monotonic() - self._job_started_at)
+
+        def _refresh_worker_elapsed(self) -> None:
+            if not self._workers:
+                self._job_elapsed_timer.stop()
+                return
+            active = next(iter(self._workers.values()))
+            state = "cancelling" if self._cancel_pending else "running"
+            self.butterfly_workbench.set_job_status(
+                state,
+                active.kind,
+                elapsed_s=self._current_job_elapsed(),
+            )
+
+        def _set_busy(
+            self,
+            busy: bool,
+            kind: str = "",
+            *,
+            result_ok: bool | None = None,
+            update_butterfly_status: bool = True,
+        ) -> None:
             self.preview_button.setEnabled(not busy)
             self.optimize_button.setEnabled(not busy)
             self.measure_geometry_button.setEnabled(not busy)
@@ -6834,6 +7292,10 @@ if QT_AVAILABLE:
             self.batch_progress.setVisible(busy and kind == "batch")
             self.batch_progress_label.setVisible(busy and kind == "batch")
             if busy:
+                if self._job_started_at is None or self._active_job_kind != kind:
+                    self._job_started_at = time.monotonic()
+                    self._active_job_kind = str(kind)
+                self._job_elapsed_timer.start()
                 if self._busy_focus_widget is None:
                     self._busy_focus_widget = self.focusWidget()
                 page_is_butterfly = (
@@ -6848,14 +7310,30 @@ if QT_AVAILABLE:
                 )
                 QtCore.QTimer.singleShot(0, focus_target.setFocus)
                 if hasattr(self, "butterfly_workbench"):
-                    self.butterfly_workbench.set_job_status("running", kind)
-                self._set_status("status.running", kind_key=f"job.{kind}")
+                    self.butterfly_workbench.set_job_status(
+                        "cancelling" if self._cancel_pending else "running",
+                        kind,
+                        elapsed_s=self._current_job_elapsed(),
+                    )
+                if self._cancel_pending:
+                    self._set_status("status.cancelling", kind_key=f"job.{kind}")
+                else:
+                    self._set_status("status.running", kind_key=f"job.{kind}")
             elif kind:
-                if hasattr(self, "butterfly_workbench"):
+                self._job_elapsed_timer.stop()
+                self._job_started_at = None
+                self._active_job_kind = ""
+                if not self._workers:
+                    self._cancel_pending = False
+                if hasattr(self, "butterfly_workbench") and update_butterfly_status:
                     if kind in {"cancelled", "canceled"}:
                         self.butterfly_workbench.set_job_status("cancelled", kind)
                     elif result_ok is False:
                         self.butterfly_workbench.set_job_status("error", kind)
+                    elif kind == "ignored":
+                        self.butterfly_workbench.set_job_status(
+                            "result" if self.butterfly_workbench.result_fresh else "ready"
+                        )
                     elif kind not in {"edited", "ignored"}:
                         self.butterfly_workbench.set_job_status("completed", kind, result_ok=result_ok)
                 if kind in {"measure_geometry", "refine_geometry"} and _is_butterfly_trace_result(self._last_result):
@@ -6882,6 +7360,7 @@ if QT_AVAILABLE:
                     "measure_geometry": "status.geometry_measure_complete",
                     "refine_geometry": "status.geometry_refine_complete",
                     "batch": "status.batch_complete",
+                    "butterfly_figure_export": "status.butterfly_figure_exported",
                     "cancelled": "status.cancelled",
                     "ignored": "status.late_ignored",
                 }.get(kind, "status.ready")
@@ -6906,8 +7385,14 @@ if QT_AVAILABLE:
                         q_unit=self._active_q_unit(result),
                         quality=quality,
                     )
-                else:
+                elif kind != "butterfly_figure_export":
                     self._set_status(status_key)
+            else:
+                self._job_elapsed_timer.stop()
+                self._job_started_at = None
+                self._active_job_kind = ""
+                if not self._workers:
+                    self._cancel_pending = False
             if not busy:
                 self._restore_busy_focus()
 

@@ -9,10 +9,10 @@ import math
 from .settings import strict_int
 
 
-# v2 records the all-arc holdout and per-arc support diagnostics in the
-# public evidence payload.  Keep v1 outputs as historical artifacts rather
-# than silently presenting the changed contract as the same method.
-METHOD_VERSION = "butterfly-curvature-arcs-v2"
+# v2 records all-arc holdout and per-arc support diagnostics; v2.1 preserves
+# the input validity domain through include edits and records the prominence-
+# gated radial hint selection. Keep earlier outputs identifiable.
+METHOD_VERSION = "butterfly-curvature-arcs-v2.1"
 MAX_RESAMPLES = 10_000
 
 

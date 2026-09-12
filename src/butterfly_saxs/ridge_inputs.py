@@ -214,8 +214,9 @@ def coordinate_derivatives(
         inv11 = qx_x / determinant
     step_x = np.hypot(qx_x, qy_x)
     step_y = np.hypot(qx_y, qy_y)
-    representative = representative_q_step(qx_array, qy_array)
-    q_step = float(representative) if representative is not None else 1.0
+    steps = np.concatenate((step_x.ravel(), step_y.ravel()))
+    finite_steps = steps[np.isfinite(steps) & (steps > np.finfo(float).eps)]
+    q_step = float(np.median(finite_steps)) if finite_steps.size else 1.0
     derivatives = {
         "qx_x": qx_x,
         "qx_y": qx_y,

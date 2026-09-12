@@ -2273,6 +2273,15 @@ def _result_arrays(result: PipelineResult) -> dict[str, np.ndarray]:
     return arrays
 
 
+def _result_output_paths(result: PipelineResult, output: str | os.PathLike[str]) -> list[Path]:
+    """Resolve output names without writing, for export and CLI preflight."""
+    target = Path(output)
+    if target.suffix.lower() in {".json", ".npz", ".csv"}:
+        return [target]
+    stem = _result_output_stem(result)
+    return [target / f"{stem}.json", target / f"{stem}.npz"]
+
+
 def export_result(
     result: PipelineResult | Mapping[str, Any],
     output: str | os.PathLike[str],
@@ -2327,13 +2336,7 @@ def export_result(
                 if name in mapping
             },
         )
-    target = Path(output)
-    suffix = target.suffix.lower()
-    if suffix in {".json", ".npz", ".csv"}:
-        paths = [target]
-    else:
-        stem = _result_output_stem(result)
-        paths = [target / f"{stem}.json", target / f"{stem}.npz"]
+    paths = _result_output_paths(result, output)
     existing = [path for path in paths if path.exists()]
     if existing and not force:
         joined = "、".join(os.fspath(path) for path in existing)

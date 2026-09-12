@@ -25,13 +25,23 @@ from butterfly_saxs.benchmark_arcs import (  # noqa: E402
     generate_arc_case,
 )
 from butterfly_saxs.geometry import build_geometry  # noqa: E402
+from butterfly_saxs.butterfly_settings import METHOD_VERSION  # noqa: E402
 from butterfly_saxs.pipeline import _jsonable, analyze_frame  # noqa: E402
 from butterfly_saxs.project import load_project  # noqa: E402
-from butterfly_saxs.io import combine_masks  # noqa: E402
+from butterfly_saxs.io import load_image  # noqa: E402
 
 
 def digest(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def mask_digest(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, Path)):
+        return digest(value)
+    return hashlib.sha256(json.dumps(_jsonable(value, array_summary=False),
+                                     sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
 def code_hashes():
@@ -44,13 +54,15 @@ def record_fit(name, data, qmap, mask, window, options, reference, multistart, a
     analysis = {**(analysis or {}), "ridge_method": "butterfly_curvature", "q_window": window,
                 "draw_axis_deg": reference + 90., "ellipse_multistart": multistart,
                 "butterfly": {**((analysis or {}).get("butterfly") or {}), **options}}
-    result = analyze_frame(data, qmap=qmap, mask=mask, config={"analysis": analysis},
-                           full2d=False).butterfly
+    pipeline_result = analyze_frame(data, qmap=qmap, mask=mask, config={"analysis": analysis},
+                                    full2d=False)
+    result = pipeline_result.butterfly
     if result is None:
         raise RuntimeError("shared application pipeline returned no butterfly result")
     fit = result["candidate_fit"]
     summary = {"id": name, "elapsed_s": time.perf_counter() - start,
                "execution_status": "complete", "solver_success": bool(fit.get("success")),
+               "effective_analysis": pipeline_result.analysis,
                "candidate": {key: fit.get(key) for key in ("a", "b", "axis_ratio", "theta_deg", "rmse", "condition")},
                "point_count": len(result.get("points", [])),
                "side_counts": dict(Counter(f"{p['branch_id']}:{p['side']}" for p in result.get("points", []) if p.get("accepted"))),
@@ -70,11 +82,16 @@ def make_parser():
     parser.add_argument("--seeds", default="20260906")
     parser.add_argument("--shape", type=int, default=96)
     parser.add_argument("--project", type=Path)
-    parser.add_argument("--frames", default="110")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--frames", help="numeric suffix IDs, default: 110")
+    selection.add_argument("--all-project-inputs", action="store_true",
+                           help="use every explicitly listed project input without guessing filenames")
     parser.add_argument("--split", choices=("development", "holdout"), default="development")
     parser.add_argument("--resamples", type=int, default=0)
     parser.add_argument("--sensitivity", action="store_true")
     parser.add_argument("--multistart", type=int, default=3)
+    parser.add_argument("--ellipse-preset", choices=("standard", "flat_ellipse", "very_flat_ellipse"),
+                        help="explicit prior; keep unchanged between development and holdout")
     parser.add_argument("--freeze", action="store_true")
     parser.add_argument("--frozen-recipe", type=Path)
     return parser
@@ -84,7 +101,11 @@ def main(argv=None):
     args = make_parser().parse_args(argv)
     if bool(args.benchmark) == bool(args.project):
         raise ValueError("choose exactly one of --benchmark and --project")
+    if args.benchmark and args.all_project_inputs:
+        raise ValueError("--all-project-inputs requires --project")
     output = args.output.resolve()
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise FileExistsError(f"use a new empty output directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
     report = output / "report.json"
     if report.exists():
@@ -92,9 +113,10 @@ def main(argv=None):
     options = {"stage": "evaluate", "resamples": args.resamples,
                "seed": 20260906, "sensitivity": args.sensitivity}
     hashes = code_hashes()
-    context = {"method_version": "butterfly-curvature-arcs-v1", "code_sha256": hashes,
+    context = {"method_version": METHOD_VERSION, "code_sha256": hashes,
                "generator_sha256": GENERATOR_HASH,
                "options": options, "multistart": args.multistart, "split": args.split,
+               "ellipse_preset_override": args.ellipse_preset,
                "calibrated_confidence": False,
                "versions": {name: version(name) for name in ("numpy", "scipy", "pyFAI", "fabio", "tifffile")},
                "python": sys.version}
@@ -115,22 +137,34 @@ def main(argv=None):
         context["project_analysis"] = config
         context.update(kind="real_frames", project_sha256=digest(args.project),
                        poni_sha256=digest(project.poni_path),
-                       mask_sha256=digest(config["mask"]) if config.get("mask") else None,
+                       mask_sha256=mask_digest(config.get("mask")),
+                       valid_mask_sha256=mask_digest(config.get("valid_mask")),
                        reference_axis_deg=float(config.get("draw_axis_deg", 90.)) - 90.,
                        q_window=list(config.get("q_window", [.1, .5])))
         sample_path = Path(project.input_paths[0])
-        if re.search(r"\d+$", sample_path.stem) is None:
-            raise ValueError("frame selection requires a numeric filename suffix")
         context["dataset_directory"] = str(sample_path.parent.resolve())
-        context["filename_pattern"] = re.sub(r"\d+$", "<frame>", sample_path.stem) + sample_path.suffix
-        frame_ids = [int(x) for x in args.frames.split(",")]
-        for frame_id in frame_ids:
-            stem = re.sub(r"\d+$", f"{frame_id:05d}", sample_path.stem)
-            path = sample_path.with_name(stem + sample_path.suffix)
-            if not path.is_file():
-                raise FileNotFoundError(path)
-            jobs.append((str(frame_id), path, None))
-        context["frame_ids"] = frame_ids
+        if args.all_project_inputs:
+            context["filename_pattern"] = "explicit_project_inputs"
+            for value in project.input_paths:
+                path = Path(value)
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+                jobs.append((path.stem, path, None))
+        else:
+            suffix_match = re.search(r"\d+$", sample_path.stem)
+            if suffix_match is None:
+                raise ValueError("frame selection requires a numeric filename suffix; use --all-project-inputs for named sources")
+            context["filename_pattern"] = re.sub(r"\d+$", "<frame>", sample_path.stem) + sample_path.suffix
+            frame_ids = [int(x) for x in (args.frames or "110").split(",")]
+            if any(value < 0 for value in frame_ids):
+                raise ValueError("frame IDs must be non-negative")
+            for frame_id in frame_ids:
+                stem = re.sub(r"\d+$", str(frame_id).zfill(len(suffix_match.group())), sample_path.stem)
+                path = sample_path.with_name(stem + sample_path.suffix)
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+                jobs.append((str(frame_id), path, None))
+            context["frame_ids"] = frame_ids
     context["job_ids"] = [job[0] for job in jobs]
     if len(set(context["job_ids"])) != len(jobs):
         raise ValueError("duplicate case/seed or frame identity in requested jobs")
@@ -139,7 +173,7 @@ def main(argv=None):
             raise ValueError("holdout requires --frozen-recipe")
         frozen = json.loads(args.frozen_recipe.read_text(encoding="utf-8"))
         for key in ("kind", "shape", "dataset_directory", "filename_pattern", "project_analysis", "method_version",
-                    "code_sha256", "generator_sha256", "versions", "python", "options", "multistart", "poni_sha256", "mask_sha256", "reference_axis_deg", "q_window"):
+                    "code_sha256", "generator_sha256", "versions", "python", "options", "multistart", "ellipse_preset_override", "poni_sha256", "mask_sha256", "valid_mask_sha256", "reference_axis_deg", "q_window"):
             if frozen.get(key) != context.get(key):
                 raise ValueError(f"frozen recipe differs at {key}; holdout must be replanned, not relabelled")
         if not frozen.get("job_ids"):
@@ -163,18 +197,26 @@ def main(argv=None):
                 window, reference = (.05, 1.1), 0.
                 local_options = {**options, "seed": seed}
             else:
-                import tifffile
                 before = digest(source)
-                data = tifffile.imread(source)
+                loaded = load_image(
+                    source, frame=config.get("frame"), dataset=config.get("dataset"),
+                    external_mask=config.get("mask"), valid_mask=config.get("valid_mask"),
+                    mask_frame=config.get("mask_frame"), mask_dataset=config.get("mask_dataset"),
+                )
+                data = loaded.data
+                mask = None if loaded.valid_mask is None else ~loaded.valid_mask
                 if qmap is None:
                     qmap = build_geometry(data.shape, project.poni_path)
-                    mask = ~combine_masks(data.shape, external_mask=config.get("mask"))
                 if data.shape != qmap.q.shape:
                     raise ValueError("frame/geometry shape changed")
                 window, reference = context["q_window"], context["reference_axis_deg"]
                 local_options = options
+            fit_analysis = {} if args.benchmark else dict(config)
+            if args.ellipse_preset:
+                fit_analysis["ellipse_preset"] = args.ellipse_preset
+                fit_analysis["ellipse"] = {**(fit_analysis.get("ellipse") or {}), "preset": args.ellipse_preset}
             result, summary = record_fit(name, data, qmap, mask, window, local_options, reference, args.multistart,
-                                         analysis=None if args.benchmark else config)
+                                         analysis=fit_analysis)
             if args.benchmark:
                 truth = case["truth"]
                 summary["truth"] = {key: truth.get(key) for key in ("a", "b", "axis_ratio", "branch_axes", "is_elliptic", "category")}
@@ -217,10 +259,12 @@ def main(argv=None):
     context["code_unchanged"] = code_hashes() == hashes
     if not args.benchmark:
         context["calibration_unchanged"] = (digest(project.poni_path) == context["poni_sha256"]
-                                             and (digest(config["mask"]) if config.get("mask") else None) == context["mask_sha256"])
+                                             and mask_digest(config.get("mask")) == context["mask_sha256"]
+                                             and mask_digest(config.get("valid_mask")) == context["valid_mask_sha256"])
     report.write_text(json.dumps(_jsonable({"context": context, "frames": summaries}, array_summary=False),
                                 ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-    return int(any(row["execution_status"] == "error" for row in summaries) or not context["code_unchanged"])
+    return int(any(row["execution_status"] == "error" for row in summaries)
+               or not context["code_unchanged"] or not context.get("calibration_unchanged", True))
 
 
 if __name__ == "__main__":

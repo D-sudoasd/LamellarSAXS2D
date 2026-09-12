@@ -82,6 +82,11 @@ class IntensityFitResult(_MappingResult):
     sample_cost: float = float("nan")
     full_cost: float = float("nan")
     selection_objective: str = "full_valid_weighted_robust_cost"
+    # Retain the robust valid-pixel scale and realized optimizer bounds for
+    # reproducibility of automatic intensity scaling.
+    automatic_intensity_scale: float | None = None
+    bound_flag_intensity_scale: float | None = None
+    effective_bounds: dict[str, tuple[float, float]] = field(default_factory=dict)
 
     @property
     def values(self) -> Any:
@@ -513,7 +518,14 @@ def _fixed_names(parameters: Any, explicit: Any = None) -> set[str]:
     return fixed
 
 
-def _bounds_for(name: str, value: float, parameters: Any, explicit: Any = None) -> tuple[float, float]:
+def _bounds_for(
+    name: str,
+    value: float,
+    parameters: Any,
+    explicit: Any = None,
+    *,
+    intensity_scale: float | None = None,
+) -> tuple[float, float]:
     eps = np.finfo(float).eps
     if name in {"a", "b", "radial_sigma", "radial_gamma", "angular_width", "background_width"}:
         default = (eps, max(abs(value) * 10.0, 10.0 * eps))
@@ -527,7 +539,11 @@ def _bounds_for(name: str, value: float, parameters: Any, explicit: Any = None) 
         "amplitude_plus", "amplitude_minus", "background", "background_slope",
         "background_curvature", "background_amplitude",
     }:
-        default = (0.0, max(abs(value) * 20.0 + 1.0, 1.0))
+        upper = max(abs(value) * 20.0 + 1.0, 1.0)
+        if name in {"background_slope", "background_curvature", "background_amplitude"}:
+            if intensity_scale is not None and np.isfinite(intensity_scale):
+                upper = max(upper, abs(float(intensity_scale)) * 20.0 + 1.0)
+        default = (0.0, upper)
     else:
         default = (-np.inf, np.inf)
 
@@ -709,7 +725,10 @@ def _robust_cost(residual: np.ndarray, loss: str, f_scale: float) -> float:
     if kind == "linear":
         rho = z
     elif kind == "soft_l1":
-        rho = 2.0 * (np.sqrt(1.0 + z) - 1.0)
+        root = np.sqrt(1.0 + z)
+        # Rationalize near zero: sqrt(1 + z) - 1 otherwise rounds small,
+        # distinguishable weighted residuals to a zero objective.
+        rho = np.where(z <= 1.0, 2.0 * np.minimum(z, 1.0) / (root + 1.0), 2.0 * (root - 1.0))
     elif kind == "huber":
         rho = np.where(z <= 1.0, z, 2.0 * np.sqrt(z) - 1.0)
     elif kind == "cauchy":
@@ -780,7 +799,7 @@ def _estimate_intensity_scale(
     initial: Any,
     observed: np.ndarray,
     fixed_names: set[str],
-) -> tuple[Any, bool]:
+) -> tuple[Any, bool, float]:
     """Estimate only the linear intensity scale of an initial model.
 
     Geometry remains untouched.  The estimate is deliberately robust to a
@@ -792,10 +811,11 @@ def _estimate_intensity_scale(
     finite = np.asarray(observed, dtype=float)
     finite = finite[np.isfinite(finite)]
     if not finite.size:
-        return initial, False
+        return initial, False, float(np.finfo(float).eps)
     baseline = max(0.0, float(np.percentile(finite, 20.0)))
     upper = float(np.percentile(finite, 99.5))
     signal = max(upper - baseline, float(np.nanstd(finite)), np.finfo(float).eps)
+    intensity_scale = max(abs(upper), signal, np.finfo(float).eps)
     updates: dict[str, float] = {}
     for name in ("amplitude_plus", "amplitude_minus"):
         if name not in fixed_names:
@@ -803,7 +823,7 @@ def _estimate_intensity_scale(
     if "background" not in fixed_names:
         updates["background"] = baseline
     if not updates:
-        return initial, False
+        return initial, False, intensity_scale
     if isinstance(initial, ParameterSet):
         scaled = initial.copy()
         allowed = {
@@ -813,10 +833,10 @@ def _estimate_intensity_scale(
         }
         if allowed:
             scaled.update_values(allowed)
-        return scaled, bool(allowed)
+        return scaled, bool(allowed), intensity_scale
     values = parameter_values(initial)
     values.update(updates)
-    return values, True
+    return values, True, intensity_scale
 
 
 def fit_intensity_model(
@@ -890,12 +910,17 @@ def fit_intensity_model(
         raise ValueError("q window and mask leave no finite pixels for fitting")
     fixed_names = _fixed_names(initial, fixed)
     scale_estimated = False
+    intensity_scale: float | None = None
     if auto_scale_initial:
-        initial, scale_estimated = _estimate_intensity_scale(
+        initial, scale_estimated, intensity_scale = _estimate_intensity_scale(
             initial,
             values_obs[all_indices],
             fixed_names,
         )
+    # Bound proximity follows resolvable contrast, not the absolute intensity
+    # pedestal used to initialize amplitudes and their automatic bounds.
+    contrast_limits = np.percentile(values_obs[all_indices], [0.5, 99.5])
+    bound_flag_intensity_scale = float(contrast_limits[1] - contrast_limits[0])
     values = parameter_values(initial)
     names = _parameter_key_order(values, fixed_names)
     obs_scale = max(float(np.nanstd(values_obs[all_indices])), np.finfo(float).eps)
@@ -933,12 +958,20 @@ def fit_intensity_model(
             reference_axis_deg=float(reference_axis_deg),
             sample_cost=no_free_cost,
             full_cost=no_free_cost,
+            automatic_intensity_scale=intensity_scale,
+            bound_flag_intensity_scale=bound_flag_intensity_scale,
         )
 
     lower = []
     upper = []
     for name in names:
-        lo, hi = _bounds_for(name, float(values[name]), initial, bounds)
+        lo, hi = _bounds_for(
+            name,
+            float(values[name]),
+            initial,
+            bounds,
+            intensity_scale=intensity_scale,
+        )
         if not np.isfinite(lo):
             lo = -1e12
         if not np.isfinite(hi):
@@ -950,6 +983,29 @@ def fit_intensity_model(
     lower_arr, upper_arr = np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
     current = np.asarray([float(values[name]) for name in names], dtype=float)
     current = np.clip(current, lower_arr + 1e-12, upper_arr - 1e-12)
+    if intensity_scale is not None:
+        zero_background_indices = [
+            index
+            for index, name in enumerate(names)
+            if name in {"background_slope", "background_curvature", "background_amplitude"}
+            and float(values[name]) <= lower_arr[index] + np.finfo(float).eps
+        ]
+        if zero_background_indices:
+            # Starting every zero-valued component at the lower bound makes
+            # bounded least-squares steps vanish for some data scales.  Seed
+            # free components at an equal share of the robust valid-pixel
+            # scale; the existing and explicit bounds still control the fit.
+            start_value = float(intensity_scale) / len(zero_background_indices)
+            background_start_estimated = False
+            for index in zero_background_indices:
+                estimated_start = np.clip(
+                    start_value,
+                    lower_arr[index] + 1e-12,
+                    upper_arr[index] - 1e-12,
+                )
+                background_start_estimated |= abs(estimated_start - current[index]) > np.finfo(float).eps
+                current[index] = estimated_start
+            scale_estimated |= background_start_estimated
     history: list[dict[str, Any]] = []
     candidate_solutions: list[dict[str, Any]] = []
     best_result = None
@@ -1068,6 +1124,11 @@ def fit_intensity_model(
     )
     residual = prediction - values_obs
     full_residual = residual[all_indices]
+    # A constant but mismatched frame still has a finite residual scale. This
+    # catches optimizer round-off at zero without adding an intensity-unit floor.
+    bound_flag_intensity_scale = max(
+        bound_flag_intensity_scale, float(np.percentile(np.abs(full_residual), 99.5))
+    )
     full_weighted = scaled_residual(full_residual, all_indices)
     sampled_residual = residual[best_indices]
     sampled_weighted = scaled_residual(sampled_residual, best_indices)
@@ -1093,12 +1154,72 @@ def fit_intensity_model(
                 covariance = None
     bound_flags = {name: False for name in values}
     tolerance = 1e-7
-    for name, value, lo, hi in zip(names, current, lower_arr, upper_arr):
-        scale_value = max(1.0, abs(float(value)))
-        bound_flags[name] = bool(
-            (np.isfinite(lo) and abs(float(value) - float(lo)) <= tolerance * scale_value)
-            or (np.isfinite(hi) and abs(float(value) - float(hi)) <= tolerance * scale_value)
+    intensity_parameter_names = {
+        "amplitude_plus", "amplitude_minus", "background", "background_slope",
+        "background_curvature", "background_amplitude",
+    }
+    solver_active = np.asarray(getattr(best_result, "active_mask", np.zeros(len(names))), dtype=int)
+
+    def compatible_intensity_bound(index: int, endpoint: float) -> bool:
+        """Check a candidate bound using the same full weighted objective.
+
+        SciPy's active mask can include small interior coefficients. Conversely,
+        an exact zero solution may remain slightly positive in a bounded solver.
+        Projection distinguishes these cases without a unit-dependent cutoff.
+        """
+        raise_if_cancelled(cancel_event, "intensity:bound-diagnostics")
+        projected = current.copy()
+        projected[index] = endpoint
+        candidate = _candidate_parameter_values(initial, values, names, projected)
+        bound_prediction = double_ellipse_intensity(
+            qx[all_indices], qy[all_indices], candidate, reference_axis_deg=reference_axis_deg
         )
+        bound_cost = _robust_cost(
+            scaled_residual(bound_prediction - values_obs[all_indices], all_indices), robust_loss, f_scale
+        )
+        roundoff = 64.0 * np.finfo(float).eps * max(abs(cost), abs(bound_cost))
+        return bool(np.isfinite(bound_cost) and bound_cost <= cost + roundoff)
+
+    for index, (name, value, lo, hi) in enumerate(zip(names, current, lower_arr, upper_arr)):
+        value = float(value)
+        # A data pedestal must not make the tolerance wider than the allowed
+        # coefficient interval. Keep the data scale for tiny-unit/zero-bound
+        # round-off, but cap it by that interval; do not add a unit-sized floor.
+        interval_scale = float(hi - lo)
+        near_lower = False
+        if np.isfinite(lo):
+            lower_scale = max(
+                abs(value),
+                abs(float(lo)),
+                abs(float(bound_flag_intensity_scale))
+                if name in intensity_parameter_names
+                else 0.0,
+            )
+            if np.isfinite(interval_scale):
+                lower_scale = min(lower_scale, interval_scale)
+            lower_roundoff = 4.0 * np.spacing(max(abs(value), abs(float(lo))))
+            near_lower = abs(value - float(lo)) <= max(tolerance * lower_scale, lower_roundoff)
+        near_upper = False
+        if np.isfinite(hi):
+            upper_scale = max(
+                abs(value),
+                abs(float(hi)),
+                abs(float(bound_flag_intensity_scale))
+                if name in intensity_parameter_names
+                else 0.0,
+            )
+            if np.isfinite(interval_scale):
+                upper_scale = min(upper_scale, interval_scale)
+            upper_roundoff = 4.0 * np.spacing(max(abs(value), abs(float(hi))))
+            near_upper = abs(value - float(hi)) <= max(tolerance * upper_scale, upper_roundoff)
+        if name in intensity_parameter_names:
+            active = int(solver_active[index]) if solver_active.shape == (len(names),) else 0
+            bound_flags[name] = bool(
+                ((near_lower or active < 0) and compatible_intensity_bound(index, float(lo)))
+                or ((near_upper or active > 0) and compatible_intensity_bound(index, float(hi)))
+            )
+        else:
+            bound_flags[name] = bool(near_lower or near_upper)
     candidate_success = [bool(record["success"]) for record in candidate_solutions]
     candidate_failure_flags: tuple[str, ...] = ()
     if multistart > 1 and any(not success for success in candidate_success):
@@ -1151,6 +1272,12 @@ def fit_intensity_model(
         sample_cost=float(sample_cost),
         full_cost=float(full_cost),
         selection_objective="full_valid_weighted_robust_cost",
+        automatic_intensity_scale=intensity_scale,
+        bound_flag_intensity_scale=bound_flag_intensity_scale,
+        effective_bounds={
+            name: (float(lo), float(hi))
+            for name, lo, hi in zip(names, lower_arr, upper_arr)
+        },
     )
 
 

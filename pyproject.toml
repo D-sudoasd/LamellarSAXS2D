@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "butterfly-saxs"
 version = "0.4.0"
-description = "Quantitative refinement and in-situ analysis of anisotropic lamellar 2D SAXS patterns"
+description = "Identify and parameterize butterfly-pattern 2D SAXS: first-order ring L, constrained double ellipses, and in-situ batch review"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
 license = "MIT"

@@ -850,6 +850,29 @@ def _lobe_measurement_rows(item: FrameFitResult, index: int) -> list[dict[str, A
                 "flags": _json_text(_value(peak, "flags", default=())),
             }
         )
+    butterfly = _value(item.result, "butterfly", default=None)
+    if not isinstance(butterfly, Mapping):
+        butterfly = _value(_value(item.result, "observables", default={}), "butterfly", default={})
+    landmarks = butterfly.get("peak_landmarks", {}) if isinstance(butterfly, Mapping) else {}
+    if isinstance(landmarks, Mapping):
+        raw = landmarks.get("raw_global_max")
+        entries = [("raw_pixel_maximum", raw)] if isinstance(raw, Mapping) else []
+        entries += [("supported_lobe_pixel", point) for point in landmarks.get("peaks", []) if isinstance(point, Mapping)]
+        for peak_index, (kind, point) in enumerate(entries):
+            rows.append({
+                **base, "measurement_kind": kind, "lobe_index": peak_index,
+                # A pixel maximum is not automatically a radial reflection.
+                "q_star": None, "q": point.get("q"), "q_unit": landmarks.get("q_unit"),
+                "qx": point.get("qx"), "qy": point.get("qy"),
+                "angle_deg": point.get("chi_deg"), "angle_unit": "deg",
+                "pixel_x": point.get("pixel_x"), "pixel_y": point.get("pixel_y"),
+                "point_id": _value(point, "peak_id", "point_id", "id", default="G"),
+                "intensity": point.get("raw_intensity"), "smoothed_intensity": point.get("smoothed_intensity"),
+                "valid": True, "accepted": None if kind == "raw_pixel_maximum" else True,
+                "method": landmarks.get("method_version"),
+                "reason": "literal maximum in supplied valid domain" if kind == "raw_pixel_maximum" else "supported lobe maximum",
+                "flags": _json_text(point.get("flags", [])), "landmark_json": _json_text(point),
+            })
     return rows
 
 
@@ -1100,6 +1123,7 @@ class StreamingBatchExporter:
         "angle_rad", "angle_deg", "angle_unit", "q_star", "q_unit", "intensity", "baseline", "snr", "fwhm", "fwhm_deg", "radial_fwhm",
         "azimuthal_fwhm", "area", "coverage", "n_pixels", "valid", "accepted",
         "method", "reason", "refinement", "flags",
+        "point_id", "q", "qx", "qy", "pixel_x", "pixel_y", "smoothed_intensity", "landmark_json",
     ]
 
     def __init__(
@@ -1251,6 +1275,7 @@ class StreamingBatchExporter:
                 "lobe_angular": _json_safe(_lobe_angular(item.result)),
                 "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
                 "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
+                "peak_landmarks": _json_safe(_value(_value(item.result, "butterfly", default={}), "peak_landmarks", default={})),
             }
         )
         arrays: dict[str, Any] = {}
@@ -1724,6 +1749,7 @@ def export_batch(
             "lobe_angular": _json_safe(_lobe_angular(item.result)),
             "lobe_radial_profiles": _json_safe(_lobe_radial_profiles(item.result)),
             "lobe_radial_peaks": _json_safe(_lobe_radial_peaks(item.result)),
+            "peak_landmarks": _json_safe(_value(_value(item.result, "butterfly", default={}), "peak_landmarks", default={})),
         })
     ellipse_fit.write_text(
         json.dumps({"frames": ellipse_rows}, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
