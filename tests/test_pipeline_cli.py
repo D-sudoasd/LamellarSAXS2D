@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -50,6 +51,57 @@ def test_cli_json_stdout_is_safe_for_windows_gbk(monkeypatch: pytest.MonkeyPatch
         "q_unit": "Å^-1",
         "message": "拟合完成",
     }
+
+
+def test_cli_inspect_nonfinite_pixels_are_json_safe(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Overflow/NaN detector pixels must not crash ``bsaxs inspect`` JSON."""
+
+    image = np.ones((8, 8), dtype=float)
+    image[0, 0] = np.inf
+    image[0, 1] = -np.inf
+    image[0, 2] = np.nan
+    source = tmp_path / "nonfinite.npy"
+    np.save(source, image)
+
+    report = inspect_frame(source)
+    assert report["intensity_min"] == pytest.approx(1.0)
+    assert report["intensity_max"] == pytest.approx(1.0)
+    assert report["finite_fraction"] == pytest.approx(61.0 / 64.0)
+    assert all(math.isfinite(value) for value in report["q_range"])
+    json.dumps(report, allow_nan=False)
+
+    yy, xx = np.indices(image.shape, dtype=float)
+    qx = xx - 3.5
+    qy = yy - 3.5
+    qx[1, 1] = np.inf
+    qy[1, 2] = -np.inf
+    qmap_report = inspect_frame(image, qmap={"qx": qx, "qy": qy, "q_unit": "pixel-q"})
+    json.dumps(qmap_report, allow_nan=False)
+    assert all(value is None or math.isfinite(value) for value in qmap_report["qx_range"])
+    assert all(value is None or math.isfinite(value) for value in qmap_report["qy_range"])
+    assert qmap_report["qx_range"][0] == pytest.approx(-3.5)
+    assert qmap_report["qx_range"][1] == pytest.approx(3.5)
+
+    assert main(["inspect", str(source)]) == 0
+    cli_report = json.loads(capsys.readouterr().out)
+    assert cli_report["intensity_min"] == pytest.approx(1.0)
+    assert cli_report["intensity_max"] == pytest.approx(1.0)
+    json.dumps(cli_report, allow_nan=False)
+
+
+def test_cli_inspect_utf8_bom_csv(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    source = tmp_path / "excel_utf8.csv"
+    rows = "\n".join(
+        ",".join(str(float(row * 4 + col + 1)) for col in range(4)) for row in range(4)
+    )
+    source.write_bytes(("\ufeff" + rows + "\n").encode("utf-8"))
+    assert main(["inspect", str(source)]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["shape"] == [4, 4]
+    assert report["intensity_min"] == pytest.approx(1.0)
+    assert report["intensity_max"] == pytest.approx(16.0)
 
 
 def test_cli_synthetic_writes_array(tmp_path: Path) -> None:
@@ -619,6 +671,25 @@ def test_cli_batch_manifest_selects_distinct_npz_frames(
     assert [item["frame"] for item in metadata] == [0, 1]
     assert [item["dataset"] for item in metadata] == ["series", "series"]
     assert metadata[0]["frame"] != metadata[1]["frame"]
+
+
+def test_cli_batch_manifest_only_and_utf8_bom_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "frame.npy"
+    np.save(source, synthetic_butterfly((32, 32), seed=41))
+    manifest = tmp_path / "frames.json"
+    payload = json.dumps(
+        [{"path": source.name, "frame_id": "f0"}],
+        ensure_ascii=False,
+    )
+    manifest.write_bytes(("\ufeff" + payload).encode("utf-8"))
+    output = tmp_path / "manifest-only"
+
+    assert main(["batch", "--manifest", str(manifest), "--output", str(output), "--force"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["n_frames"] == 1
+    assert report["n_success"] == 1
 
 
 def test_cli_batch_exports_partial_results_but_returns_nonzero_on_failed_frame(

@@ -173,6 +173,22 @@ def _jsonable(value: Any, *, array_summary: bool = True) -> Any:
     return str(value)
 
 
+def _finite_bounds(array: Any) -> list[float | None]:
+    """Return [min, max] over finite values, or [None, None] if none exist.
+
+    ``NaN``/``±Inf`` detector pixels and q-map holes must not leak into CLI
+    JSON (``allow_nan=False``) or be reported as the intensity/q range.
+    """
+
+    values = np.asarray(array)
+    if values.size == 0:
+        return [None, None]
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return [None, None]
+    return [float(np.min(finite)), float(np.max(finite))]
+
+
 def _module_candidates(names: Sequence[str]) -> Iterable[Any]:
     for name in names:
         try:
@@ -1931,6 +1947,7 @@ def inspect_frame(
         include_config_mask=False,
     )
     finite = np.isfinite(image)
+    intensity_bounds = _finite_bounds(image)
     requested_fit_ellipse = bool(_config_value(config, "fit_ellipse", fit_ellipse))
     measured = measure_observables(
         image,
@@ -1945,11 +1962,11 @@ def inspect_frame(
         "shape": list(image.shape),
         "dtype": str(image.dtype),
         "finite_fraction": float(np.mean(finite)),
-        "intensity_min": float(np.nanmin(image)) if np.any(finite) else None,
-        "intensity_max": float(np.nanmax(image)) if np.any(finite) else None,
-        "q_range": [float(np.nanmin(q)), float(np.nanmax(q))],
-        "qx_range": [float(np.nanmin(qx)), float(np.nanmax(qx))],
-        "qy_range": [float(np.nanmin(qy)), float(np.nanmax(qy))],
+        "intensity_min": intensity_bounds[0],
+        "intensity_max": intensity_bounds[1],
+        "q_range": _finite_bounds(q),
+        "qx_range": _finite_bounds(qx),
+        "qy_range": _finite_bounds(qy),
         "q_unit": _qmap_unit(qmap_obj, config),
         # ``inspect`` is a CLI-facing report, so collapse profile arrays to
         # strict JSON summaries at this boundary rather than leaking NumPy

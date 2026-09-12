@@ -12,7 +12,12 @@ from butterfly_saxs.intensity import (
     fit_intensity_model,
 )
 from butterfly_saxs.models import ImageFrame, QMap
-from butterfly_saxs.observables import RadialProfile, _radial_peak, measure_radial_ridges
+from butterfly_saxs.observables import (
+    RadialProfile,
+    _radial_peak,
+    measure_radial_profile,
+    measure_radial_ridges,
+)
 from butterfly_saxs.p4_quality import evaluate_p4_ellipse_quality
 
 
@@ -23,6 +28,24 @@ def _ring_fixture() -> tuple[ImageFrame, QMap]:
     image = 0.1 + 5.0 * np.exp(-0.5 * ((q - 0.58) / 0.018) ** 2)
     image += np.random.default_rng(4).normal(0.0, 0.02, image.shape)
     return ImageFrame(image), QMap(qx, qy, q_unit="nm^-1")
+
+
+def test_radial_profile_keeps_pixels_on_closed_q_max_edge() -> None:
+    q = np.array([[0.0, 0.5, 1.0]], dtype=float)
+    image = np.array([[1.0, 2.0, 7.0]], dtype=float)
+    qx = q
+    qy = np.zeros_like(q)
+    profile = measure_radial_profile(
+        ImageFrame(image),
+        QMap(qx, qy, q_unit="nm^-1"),
+        0.0,
+        q_window=(0.0, 1.0),
+        n_bins=8,
+        sector_width=np.pi,
+    )
+    assert int(profile.counts[-1]) >= 1
+    assert profile.intensity[-1] == pytest.approx(7.0)
+    assert profile.coverage[-1] == pytest.approx(1.0)
 
 
 def test_radial_continuity_honors_configured_snr_threshold() -> None:

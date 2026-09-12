@@ -559,17 +559,19 @@ def _handle_batch(args: argparse.Namespace) -> int:
 
     config = _config(args.config)
     config = _with_analysis(config, _analysis_overrides(args))
+    analysis = config.analysis if config is not None else {}
+    manifest = args.manifest or analysis.get("manifest")
     inputs = list(args.inputs)
     if not inputs and config:
         inputs = list(config.input_paths)
-    if not inputs:
-        raise PipelineError("batch 没有输入；请提供路径或 TOML 的 inputs.files")
+    if not inputs and not manifest:
+        raise PipelineError("batch 没有输入；请提供路径、--manifest 或 TOML 的 inputs.files")
     # ``argparse`` receives quoted PowerShell globs literally.  Expand them
     # before handing a list to run_batch (its single-string form already has
     # this convenience, but a CLI naturally supplies a list).
     expanded_inputs: list[str] = []
     for value in inputs:
-        text = os.fspath(value)
+        text = os.path.expanduser(os.fspath(value))
         if any(char in text for char in "*?[]"):
             expanded_inputs.extend(
                 os.fspath(item) for item in filter_supported_image_paths(glob.glob(text))
@@ -582,11 +584,9 @@ def _handle_batch(args: argparse.Namespace) -> int:
         else:
             expanded_inputs.append(text)
     inputs = expanded_inputs
-    if not inputs:
+    if not inputs and not manifest:
         raise PipelineError("batch 输入通配符没有匹配任何文件")
-    analysis = config.analysis if config is not None else {}
     mode = args.mode or str(analysis.get("batch_mode", analysis.get("mode", "independent")))
-    manifest = args.manifest or analysis.get("manifest")
     checkpoint = args.checkpoint or analysis.get("checkpoint")
     resume = bool(args.resume or analysis.get("resume", False))
     series = args.series if args.series is not None else analysis.get("series")
@@ -599,10 +599,10 @@ def _handle_batch(args: argparse.Namespace) -> int:
         or args.frame_range is not None
     )
     if explicit_sequence:
-        start = args.start
-        stop = args.stop
-        stride = args.stride if args.stride is not None else 1
-        frame_range = args.frame_range
+        start = args.start if args.start is not None else analysis.get("start")
+        stop = args.stop if args.stop is not None else analysis.get("stop")
+        stride = args.stride if args.stride is not None else analysis.get("stride", 1)
+        frame_range = args.frame_range if args.frame_range is not None else analysis.get("frame_range")
     else:
         start = analysis.get("start")
         stop = analysis.get("stop")

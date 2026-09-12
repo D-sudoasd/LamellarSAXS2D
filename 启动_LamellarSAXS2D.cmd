@@ -3,6 +3,7 @@ setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul 2>&1
 
 set "PROJECT_DIR=%~dp0"
+cd /d "%PROJECT_DIR%"
 set "PYTHON="
 set "PYTHON_ARGS="
 set "CHECK_ONLY=0"

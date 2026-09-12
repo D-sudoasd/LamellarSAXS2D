@@ -232,7 +232,11 @@ def load_image(
         if dataset is not None:
             raise DatasetSelectionError("dataset is not applicable to CSV/TXT")
         try:
-            array = np.loadtxt(source, delimiter="," if suffix == ".csv" else None)
+            array = np.loadtxt(
+                source,
+                delimiter="," if suffix == ".csv" else None,
+                encoding="utf-8-sig",
+            )
         except (OSError, ValueError) as exc:
             raise DataIOError(f"could not read tabular image {source}: {exc}") from exc
         metadata = {"format": "csv" if suffix == ".csv" else "txt"}
@@ -387,6 +391,22 @@ def _validate_frame_argument(frame: int | None) -> None:
         raise FrameSelectionError("frame must be a non-negative integer")
 
 
+def _as_detector_plane(array: np.ndarray, *, source: Path, source_kind: str) -> np.ndarray:
+    """Reject colour/channel-last volumes; squeeze a trailing singleton."""
+
+    if array.ndim != 3:
+        return array
+    height, width, channels = (int(array.shape[0]), int(array.shape[1]), int(array.shape[2]))
+    if channels not in {1, 3, 4} or height < 4 or width < 4 or channels >= min(height, width):
+        return array
+    if channels == 1:
+        return np.squeeze(array, axis=-1)
+    raise DataShapeError(
+        f"{source_kind} source {source} looks like a colour/channel-last array "
+        f"{tuple(int(v) for v in array.shape)}; convert it to a 2-D intensity image"
+    )
+
+
 def _select_frame(
     array: Any,
     *,
@@ -394,7 +414,7 @@ def _select_frame(
     source: Path,
     source_kind: str,
 ) -> tuple[np.ndarray, int | None]:
-    ary = np.asarray(array)
+    ary = _as_detector_plane(np.asarray(array), source=source, source_kind=source_kind)
     if ary.ndim < 2:
         raise DataShapeError(
             f"selected object from {source} must be 2-D, got {ary.shape!r}"
@@ -510,9 +530,21 @@ def _read_tiff(
     return selected, metadata, selected_frame
 
 
+def _close_fabio(handle: Any) -> None:
+    closer = getattr(handle, "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception:
+        return
+
+
 def _read_fabio(
     source: Path, *, frame: int | None
 ) -> tuple[np.ndarray, dict[str, Any], int | None]:
+    first = None
+    image = None
     try:
         import fabio
 
@@ -534,7 +566,7 @@ def _read_fabio(
                 )
             image = fabio.open(str(source), frame=int(frame))
             selected_frame = int(frame)
-        data = np.asarray(image.data)
+        data = np.array(image.data, copy=True)
         header = dict(getattr(image, "header", {}) or {})
         metadata = {
             "format": source.suffix.lower().lstrip("."),
@@ -549,6 +581,10 @@ def _read_fabio(
         raise DataIOError("CBF/EDF support requires fabio") from exc
     except (OSError, ValueError, RuntimeError, TypeError) as exc:
         raise DataIOError(f"could not read FabIO source {source}: {exc}") from exc
+    finally:
+        if image is not None and image is not first:
+            _close_fabio(image)
+        _close_fabio(first)
 
 
 def _read_hdf5(

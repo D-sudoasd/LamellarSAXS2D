@@ -66,12 +66,29 @@ def _version_text(
         return f"installed (version lookup failed: {type(exc).__name__})"
 
 
+def _is_this_project(root: Path) -> bool:
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    try:
+        with pyproject.open("rb") as handle:
+            parsed = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    project = parsed.get("project", {}) if isinstance(parsed, dict) else {}
+    return isinstance(project, dict) and project.get("name") == "butterfly-saxs"
+
+
 def _project_root(cwd: Path) -> Path:
     candidate = cwd.expanduser().resolve(strict=False)
     if candidate.is_file():
         candidate = candidate.parent
     for root in (candidate, *candidate.parents):
-        if (root / "pyproject.toml").is_file():
+        if _is_this_project(root):
+            return root
+    module_file = Path(__file__).resolve()
+    for root in (module_file.parent, *module_file.parents):
+        if _is_this_project(root):
             return root
     return candidate
 
@@ -290,7 +307,7 @@ def collect_diagnostics(
                 specifier=(
                     declared.get(distribution.casefold().replace("_", "-"), "")
                     if declarations_complete
-                    else "<project dependency declaration unavailable>"
+                    else ""
                 ),
                 cwd=root,
             )
@@ -308,7 +325,7 @@ def collect_diagnostics(
                 specifier=(
                     declared.get(distribution.casefold().replace("_", "-"), "")
                     if declarations_complete and ui_declared <= set(declared)
-                    else "<project dependency declaration unavailable>"
+                    else ""
                 ),
                 cwd=root,
             )

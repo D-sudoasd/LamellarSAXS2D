@@ -12,6 +12,17 @@ from butterfly_saxs.io import (
 )
 
 
+def test_csv_utf8_bom_loads_as_numeric_image(tmp_path):
+    source = tmp_path / "frame.csv"
+    source.write_bytes(b"\xef\xbb\xbf0.25,2.5\n100.0,-3.0\n")
+
+    loaded = load_image(source)
+
+    np.testing.assert_allclose(loaded.data, [[0.25, 2.5], [100.0, -3.0]])
+    assert loaded.data.ndim == 2
+    assert loaded.preserves_absolute_intensity
+
+
 def test_npy_preserves_float_dtype_and_values(tmp_path):
     source = tmp_path / "frame.npy"
     values = np.array([[0.25, 2.5], [100.0, -3.0]], dtype=np.float32)
@@ -105,6 +116,40 @@ def test_unicode_paths_work_for_cbf_and_poni(tmp_path):
     np.testing.assert_array_equal(loaded.data, values)
     assert maps.shape == values.shape
     assert maps.metadata["q_unit"] == "nm^-1"
+
+
+def test_channel_last_rgb_is_rejected_instead_of_slicing_a_row(tmp_path):
+    tifffile = pytest.importorskip("tifffile")
+    source = tmp_path / "rgb.tif"
+    tifffile.imwrite(source, np.arange(5 * 7 * 3, dtype=np.uint8).reshape(5, 7, 3))
+
+    with pytest.raises(DataShapeError, match="channel-last|colour"):
+        load_image(source, frame=0)
+
+
+def test_trailing_singleton_channel_is_squeezed(tmp_path):
+    source = tmp_path / "plane.npy"
+    values = np.arange(72, dtype=np.float32).reshape(8, 9, 1)
+    np.save(source, values)
+
+    loaded = load_image(source)
+
+    assert loaded.data.shape == (8, 9)
+    np.testing.assert_array_equal(loaded.data, values[:, :, 0])
+
+
+def test_fabio_edf_releases_the_file_handle(tmp_path):
+    pytest.importorskip("fabio")
+    from fabio.edfimage import EdfImage
+
+    source = tmp_path / "frame.edf"
+    values = np.array([[1.5, 2.5], [3.5, 4.5]], dtype=np.float32)
+    EdfImage(data=values, header={"Exposure_time": "0.5"}).write(str(source))
+
+    loaded = load_image(source)
+    np.testing.assert_array_equal(loaded.data, values)
+    source.unlink()
+    assert not source.exists()
 
 
 def test_multiframe_npy_requires_explicit_frame(tmp_path):

@@ -1157,12 +1157,14 @@ def measure_radial_profile(
     q_min, q_max = _q_limits(q, q_window, q_range)
     candidate = np.isfinite(values) & np.isfinite(q) & (q >= q_min) & (q <= q_max) & (_wrap_distance(phi, angle) <= float(sector_width) / 2.0)
     selected = candidate & valid
-    edges = np.linspace(q_min, q_max, int(n_bins) + 1)
+    n = int(n_bins)
+    edges = np.linspace(q_min, q_max, n + 1)
     centres = 0.5 * (edges[:-1] + edges[1:])
-    all_idx = np.digitize(q[candidate], edges, right=False) - 1
-    valid_idx = np.digitize(q[selected], edges, right=False) - 1
-    candidate_counts = np.bincount(np.clip(all_idx, 0, int(n_bins) - 1), minlength=int(n_bins)).astype(int)
-    profile, counts = _bin_mean(values[selected], valid_idx, int(n_bins), statistic)
+    # Closed window [q_min, q_max]: digitize would place q == q_max in bin n.
+    all_idx = np.clip(np.digitize(q[candidate], edges, right=False) - 1, 0, n - 1)
+    valid_idx = np.clip(np.digitize(q[selected], edges, right=False) - 1, 0, n - 1)
+    candidate_counts = np.bincount(all_idx, minlength=n).astype(int)
+    profile, counts = _bin_mean(values[selected], valid_idx, n, statistic)
     coverage = np.divide(counts, candidate_counts, out=np.zeros_like(profile), where=candidate_counts > 0)
     return RadialProfile(
         angle=float(angle),

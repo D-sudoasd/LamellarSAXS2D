@@ -59,6 +59,48 @@ def test_doctor_rejects_python_outside_supported_range(version) -> None:
     assert "Python" in report["required_failures"]
 
 
+def test_doctor_accepts_pyside6_6_11() -> None:
+    def versions(distribution: str) -> str:
+        if distribution == "PySide6":
+            return "6.11.0"
+        return _version(distribution)
+
+    report = doctor.collect_diagnostics(
+        require_ui=True,
+        importer=lambda _module: object(),
+        version_getter=versions,
+        version_info=(3, 13, 0),
+    )
+    assert report["ready"] is True
+    assert "PySide6" not in report["required_failures"]
+
+
+def test_doctor_stays_ready_from_a_foreign_working_directory(tmp_path) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "unrelated"\ndependencies = []\n',
+        encoding="utf-8",
+    )
+    foreign = doctor.collect_diagnostics(
+        cwd=tmp_path,
+        require_ui=False,
+        importer=lambda _module: object(),
+        version_getter=_version,
+        version_info=(3, 12, 0),
+    )
+    empty = doctor.collect_diagnostics(
+        cwd=tmp_path / "missing",
+        require_ui=False,
+        importer=lambda _module: object(),
+        version_getter=_version,
+        version_info=(3, 12, 0),
+    )
+
+    assert foreign["ready"] is True
+    assert empty["ready"] is True
+    assert "NumPy" not in foreign["required_failures"]
+    assert "NumPy" not in empty["required_failures"]
+
+
 def test_doctor_json_is_strict_and_exit_code_tracks_readiness(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],

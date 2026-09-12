@@ -528,7 +528,7 @@ class FrameRef:
             frame = numeric_frame
             if frame < 0:
                 raise ValueError("frame selector must be a non-negative integer")
-        object.__setattr__(self, "path", Path(path))
+        object.__setattr__(self, "path", Path(path).expanduser())
         object.__setattr__(self, "time", time)
         object.__setattr__(
             self,
@@ -542,7 +542,7 @@ class FrameRef:
         object.__setattr__(self, "frame", frame)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "path", Path(self.path))
+        object.__setattr__(self, "path", Path(self.path).expanduser())
         if self.frame_id is None:
             object.__setattr__(self, "frame_id", self.path.stem)
         object.__setattr__(self, "metadata", dict(self.metadata or {}))
@@ -631,7 +631,7 @@ def _manifest_rows(manifest: Any) -> list[Any]:
             with path.open("r", encoding="utf-8-sig", newline="") as handle:
                 loaded_manifest: Any = list(csv.DictReader(handle))
         else:
-            with path.open("r", encoding="utf-8") as handle:
+            with path.open("r", encoding="utf-8-sig") as handle:
                 loaded_manifest = json.load(handle)
         rows = _manifest_rows(loaded_manifest)
         resolved_rows: list[Any] = []

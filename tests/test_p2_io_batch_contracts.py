@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from butterfly_saxs.batch import FrameRef, build_frame_refs
+from butterfly_saxs.batch import FrameRef, build_frame_refs, input_fingerprint
 from butterfly_saxs.io import FrameSelectionError, load_image
 from butterfly_saxs.pipeline import inspect_frame
 
@@ -118,6 +118,23 @@ def test_manifest_order_is_numeric_for_integers_leading_zeros_and_decimals(
     assert [ref.path for ref in refs] == [paths[0], paths[3], paths[1], paths[2]]
     assert [ref.order for ref in refs] == [1, 1.5, 2, 10]
     assert all(isinstance(ref.order, (int, float)) for ref in refs)
+
+
+def test_home_relative_frame_path_is_hashed_after_expanduser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    source = home / "frame.npy"
+    np.save(source, np.ones((8, 8), dtype=float))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HOME", str(home))
+
+    ref = FrameRef("~/frame.npy")
+
+    assert ref.path.exists()
+    assert ref.path.resolve() == source.resolve()
+    assert input_fingerprint([ref]) == input_fingerprint([FrameRef(source)])
 
 
 @pytest.mark.parametrize("order", ["not-a-number", "NaN", "Inf", np.nan, np.inf])

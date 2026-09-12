@@ -37,7 +37,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-ui = ["PySide6>=6.8,<6.11", "pyqtgraph>=0.13.7"]
+ui = ["PySide6>=6.8,<6.12", "pyqtgraph>=0.13.7"]
 hdf5 = ["h5py>=3.10"]
 dev = [
   "pytest>=8",
@@ -46,7 +46,7 @@ dev = [
   "build>=1.4,<2",
 ]
 all = [
-  "PySide6>=6.8,<6.11",
+  "PySide6>=6.8,<6.12",
   "pyqtgraph>=0.13.7",
   "h5py>=3.10",
   "pytest>=8",
