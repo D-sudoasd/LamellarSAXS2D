@@ -59,16 +59,17 @@ bsaxs-doctor --require-ui --json
 
 ## 4. 界面中的推荐顺序
 
-右侧 `工作流状态 / Workflow status` 会根据当前状态提示下一步。建议顺序为：
+右侧 `工作流状态 / Workflow status` 会根据当前状态提示下一步。蝴蝶分析页的建议顺序为：
 
 1. **打开图像**：确认帧和 HDF5/NPZ dataset 选择正确。
 2. **加载 PONI**：只有物理 `q` 坐标建立后，间距和 reciprocal-space 尺度才可解释。`pixel-q` 仅用于算法检查或合成数据。
 3. **设置 mask、ROI 和 q 范围**：先排除 beam stop、坏点、探测器缝隙和无效边界，再确定分析区间。
-4. **运行 Preview**：检查模型位置、双椭圆和剖面是否与观测花样基本一致。
-5. **运行 Optimize**：仅在初值和分析域合理后进行；Optimize 不是科学有效性的自动判定。
-6. **检查四视图**：同时检查 `Observed`、`Model`、`Residual` 和 `Overlay`，并查看 ridge、coverage、flags 与参数是否触边。
-7. **人工接受或拒绝**：具名 `Accept/Reject` 仅记录当前会话审核，不等于 P3/P4 科学证据门通过。
-8. **导出证据或进入批处理**：跨帧比较必须保持 PONI、mask、q 范围、权重和配置一致。
+4. **识别弧（Identify）**：在蝴蝶页提取观测弧、分支/象限标签和 ridge 点；这是几何测量，不是 full2d 强度拟合。
+5. **评估（Evaluate）**：在已识别弧上拟合镜像约束双椭圆，并查看占用边、flags 与质量诊断。贴在 `flat_ellipse` 边界上的解按仅环处理。
+6. **检查叠加与峰位**：核对实测图、观测轨迹、几何候选和（若已运行）full2d 椭圆；峰位表区分原始最亮点与受支持峰。
+7. **可选 Preview / Optimize**：高级强度页的 Preview/Optimize 只服务经验 `full2d` 模型，不能代替 Identify → Evaluate，也不能当作科学验收。
+8. **人工接受或拒绝**：具名 `Accept/Reject` 仅记录当前会话审核，不等于 P3/P4 科学证据门通过。
+9. **导出图包或进入批处理**：跨帧比较必须保持 PONI、mask、q 范围、权重和配置一致。
 
 右侧控制栏已改为可滚动布局；在 980×680 或笔记本屏幕上，底部 ROI、人工审核和快照控件仍可访问。
 

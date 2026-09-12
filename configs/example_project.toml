@@ -17,7 +17,7 @@ directory = "results"
 # 没有专用 qmap 模块时，q_scale 用作像素到 q 的示例比例。
 q_scale = 1.0
 q_window = [0.0, 90.0]
-ridge_method = "radial_peak" # radial_peak, azimuthal_peak, or surface_curvature
+ridge_method = "butterfly_curvature" # butterfly_curvature, radial_peak, azimuthal_peak, or surface_curvature
 # For butterfly wings, azimuthal_peak measures angular maxima in q annuli;
 # it is intentionally a different observable from radial_peak.
 # ridge_method = "azimuthal_peak"

@@ -98,7 +98,7 @@ bsaxs preflight data/package --manifest manifest.csv \
   --poni geometry.poni --mask mask.npy -o results/preflight
 ```
 
-`bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs gui` remains an alias of `bsaxs-gui`.
+`bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_LamellarSAXS2D.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
 
 ## Names
 
@@ -115,6 +115,7 @@ bsaxs preflight data/package --manifest manifest.csv \
 | First launch and recommended UI order | [docs/first_run_zh.md](docs/first_run_zh.md) |
 | CLI, TOML, batch, masks, exports | [docs/user_guide_zh.md](docs/user_guide_zh.md) |
 | Butterfly arcs and publication rules | [docs/butterfly_arcs_zh.md](docs/butterfly_arcs_zh.md) |
+| Measurement / peak figures | [docs/butterfly_figures_zh.md](docs/butterfly_figures_zh.md) |
 | Symbols, units, and interpretation limits | [docs/scientific_basis_zh.md](docs/scientific_basis_zh.md) |
 | Architecture | [docs/architecture_zh.md](docs/architecture_zh.md) |
 | Lamellar studio / publication artboards | [docs/lamellar_workbench_zh.md](docs/lamellar_workbench_zh.md), [docs/publication_figures_zh.md](docs/publication_figures_zh.md) |

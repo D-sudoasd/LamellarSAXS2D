@@ -78,6 +78,7 @@ jobs:
           bsaxs benchmark --help
           bsaxs annotation-pack --help
           bsaxs p3-status --help
+          bsaxs p4-evaluate --help
           bsaxs synthetic --shape 16x16
           bsaxs-doctor --json --require-ui
 

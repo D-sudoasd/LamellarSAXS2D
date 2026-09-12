@@ -74,7 +74,7 @@ PONI 是物理 q 坐标的校准输入，CBF、EDF、TIF/TIFF 的最小示例：
 | `.npy` | 数组必须能选出严格二维图像；多帧数组显式给 `--frame`。 |
 | `.npz` | 使用 `--dataset KEY` 选择键；文件含多个候选二维数组时必须明确选择。含 `data` 及 `qx/qy/q` 的 fixture 也可由 pipeline 读取其 qmap。 |
 | `.h5`, `.hdf5`, `.hdf` | 通过 h5py 读取；多个数据集或路径不明确时显式给 `--dataset`。 |
-| `.csv`, `.txt` | 读取二维数值表；不适合作为带实验元数据的通用容器。 |
+| `.csv`, `.txt` | 读取二维数值表（UTF-8，含 BOM）；不适合作为带实验元数据的通用容器。 |
 
 所有选中的图像必须严格二维且与 qmap/mask 形状一致。读取阶段不做隐式归一化；若需暗场、曝光或监视器校正，应在项目外明确完成并记录。
 
@@ -107,7 +107,7 @@ directory = "results"
 
 [analysis]
 q_window = [0.02, 0.20]
-ridge_method = "surface_curvature"
+ridge_method = "butterfly_curvature"
 ridge_snr_threshold = 2.0
 ridge_min_peak_fraction = 0.0
 ridge_min_coverage = 0.0
