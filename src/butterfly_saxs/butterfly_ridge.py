@@ -15,8 +15,6 @@ eigenvalue as a proxy for curvature.
 
 from __future__ import annotations
 
-import time as _time
-
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -29,10 +27,14 @@ from typing import Any
 import numpy as np
 
 try:  # scipy is a declared project dependency.
-    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import gaussian_filter, gaussian_filter1d
+    from scipy.signal import find_peaks, peak_widths
     from scipy.spatial import cKDTree
 except Exception:  # pragma: no cover - source inspection in partial installs
     gaussian_filter = None
+    gaussian_filter1d = None
+    find_peaks = None
+    peak_widths = None
     cKDTree = None
 
 from .ridge_inputs import (
@@ -45,7 +47,20 @@ from .ridge_inputs import (
 )
 
 
-METHOD_VERSION = "butterfly-observed-ridges-v1.0"
+METHOD_VERSION = "butterfly-observed-ridges-v1.3"
+FIRST_ORDER_PEAK_MIN_BIN_COUNT = 8
+FIRST_ORDER_PEAK_MIN_TOTAL_SUPPORTED_BINS = 8
+FIRST_ORDER_PEAK_MIN_CONTIGUOUS_RUN_BINS = 8
+FIRST_ORDER_PEAK_MIN_EFFECTIVE_SAMPLES = 2.0
+FIRST_ORDER_PEAK_NOISE_SIGMA_BINS = 0.8
+FIRST_ORDER_PEAK_PROMINENCE_NOISE_MULTIPLE = 3.0
+FIRST_ORDER_PEAK_AMBIGUITY_NOISE_MULTIPLE = 1.0
+FIRST_ORDER_PEAK_AMBIGUITY_MIN_WIDTH_BINS = 2.0
+FIRST_ORDER_PEAK_FAMILY_SPAN = 1.45
+RADIAL_HINT_CACHE_MAX_BYTES = 64 * 1024 * 1024
+CANDIDATE_NOISE_METHOD = "mask_normalized_raw_minus_smoothed_mad"
+CANDIDATE_NOISE_MIN_SAFE_SAMPLES = 32
+CANDIDATE_NOISE_EDGE_TRUNCATE = 4.0
 
 
 def _check_cancelled(cancel_event: Any, stage: str) -> None:
@@ -252,7 +267,8 @@ def _apply_edits(
         actions = edits
     if isinstance(actions, Mapping) or isinstance(actions, (str, bytes)):
         actions = [actions]
-    edited = np.asarray(valid, dtype=bool).copy()
+    base_valid = np.asarray(valid, dtype=bool)
+    edited = base_valid.copy()
     applied: list[dict[str, Any]] = []
     seed_actions: list[dict[str, Any]] = []
     for action in list(actions or []):
@@ -268,9 +284,10 @@ def _apply_edits(
         if kind == "exclude_polygon":
             edited[polygon] = False
         else:
-            # Include edits override the editable exclusion state while still
-            # respecting non-finite image/q coordinates at the caller.
-            edited[polygon] = True
+            # Restore pre-edit validity only. Include can undo earlier polygon
+            # edits, but cannot override input masks (including ROI masks),
+            # finite-value checks, or the q-window.
+            edited[polygon] = base_valid[polygon]
         applied.append({"type": kind, "n_pixels": int(np.count_nonzero(polygon))})
     return edited, applied, seed_actions
 
@@ -308,6 +325,11 @@ class _CurvatureField:
     noise: float
     q_step: float
     height_scale: float
+    structural_spread: float
+    noise_support_count: int
+    noise_support_fraction: float
+    noise_status: str
+    noise_edge_guard_pixels: int
     coordinate_derivatives: Mapping[str, np.ndarray] | None = None
 
 
@@ -315,6 +337,51 @@ def _coordinate_derivatives(qx: np.ndarray, qy: np.ndarray) -> tuple[dict[str, n
     """Return detector-to-q derivatives, local inverse Jacobian, q step."""
 
     return _shared_coordinate_derivatives(qx, qy)
+
+
+def _masked_highpass_noise(
+    image: np.ndarray,
+    smooth: np.ndarray,
+    support: np.ndarray,
+    valid: np.ndarray,
+    *,
+    sigma: float,
+    support_min: float,
+) -> tuple[float, str, int, float, int]:
+    """Estimate detector noise from valid raw-minus-smooth samples only."""
+
+    safe = (
+        np.asarray(valid, dtype=bool)
+        & np.isfinite(image)
+        & np.isfinite(smooth)
+        & (support >= float(support_min))
+    )
+    edge_guard = int(np.ceil(CANDIDATE_NOISE_EDGE_TRUNCATE * float(sigma)))
+    if edge_guard:
+        rows, cols = safe.shape
+        if rows <= 2 * edge_guard or cols <= 2 * edge_guard:
+            safe[:] = False
+        else:
+            safe[:edge_guard, :] = False
+            safe[-edge_guard:, :] = False
+            safe[:, :edge_guard] = False
+            safe[:, -edge_guard:] = False
+    sample_count = int(np.count_nonzero(safe))
+    valid_count = int(np.count_nonzero(valid))
+    support_fraction = float(sample_count / max(1, valid_count))
+    if sample_count < CANDIDATE_NOISE_MIN_SAFE_SAMPLES:
+        return float("inf"), "insufficient_safe_support", sample_count, support_fraction, edge_guard
+    residual = np.asarray(image[safe], dtype=float) - np.asarray(smooth[safe], dtype=float)
+    centre = float(np.median(residual))
+    noise = float(1.4826 * np.median(np.abs(residual - centre)))
+    scale = max(
+        1.0,
+        float(np.max(np.abs(image[safe]))),
+        float(np.max(np.abs(smooth[safe]))),
+    )
+    if not np.isfinite(noise) or noise <= np.finfo(float).eps * scale:
+        return float("inf"), "degenerate_highpass_mad", sample_count, support_fraction, edge_guard
+    return noise, "ok", sample_count, support_fraction, edge_guard
 
 
 def _scaled_surface_field(
@@ -339,10 +406,18 @@ def _scaled_surface_field(
     finite_values = surface[valid & np.isfinite(surface)]
     baseline = float(np.nanpercentile(finite_values, 10.0)) if finite_values.size else 0.0
     height_scale = float(np.nanpercentile(finite_values, 90.0) - np.nanpercentile(finite_values, 10.0)) if finite_values.size else 1.0
-    noise = _robust_noise(finite_values - baseline)
-    if not np.isfinite(noise) or noise <= np.finfo(float).eps:
-        noise = max(float(np.nanstd(finite_values)), np.finfo(float).eps) if finite_values.size else 1.0
-    height_scale = max(height_scale, 3.0 * noise, np.finfo(float).eps)
+    structural_spread = _robust_noise(finite_values - baseline)
+    if not np.isfinite(structural_spread) or structural_spread <= np.finfo(float).eps:
+        structural_spread = max(float(np.nanstd(finite_values)), np.finfo(float).eps) if finite_values.size else 1.0
+    height_scale = max(height_scale, 3.0 * structural_spread, np.finfo(float).eps)
+    noise, noise_status, noise_support_count, noise_support_fraction, noise_edge_guard = _masked_highpass_noise(
+        image,
+        smooth,
+        support,
+        valid,
+        sigma=float(sigma),
+        support_min=float(options["support_min"]),
+    )
     z = (surface - baseline) / height_scale
     if coordinate_derivatives is None:
         derivatives, _inverse, q_step = _coordinate_derivatives(qx, qy)
@@ -492,6 +567,11 @@ def _scaled_surface_field(
         noise=noise,
         q_step=q_step,
         height_scale=height_scale,
+        structural_spread=float(structural_spread),
+        noise_support_count=noise_support_count,
+        noise_support_fraction=noise_support_fraction,
+        noise_status=noise_status,
+        noise_edge_guard_pixels=noise_edge_guard,
         coordinate_derivatives=derivatives,
     )
 
@@ -934,6 +1014,130 @@ def _demote_unresolved_identity_point(point: dict[str, Any], reason: str, *flags
         point["reason"] = reason
 
 
+def _contiguous_profile_runs(usable: np.ndarray) -> list[tuple[int, int]]:
+    transitions = np.diff(np.concatenate(([False], usable, [False])).astype(np.int8))
+    starts = np.flatnonzero(transitions == 1)
+    stops = np.flatnonzero(transitions == -1)
+    return [
+        (int(start), int(stop))
+        for start, stop in zip(starts, stops)
+        if int(stop - start) >= FIRST_ORDER_PEAK_MIN_CONTIGUOUS_RUN_BINS
+    ]
+
+
+def _radial_profile_noise_mad(
+    profile: np.ndarray,
+    supported_runs: Sequence[tuple[int, int]],
+) -> float | None:
+    if gaussian_filter1d is None:
+        return None
+    residuals = [
+        profile[start:stop]
+        - gaussian_filter1d(profile[start:stop], sigma=FIRST_ORDER_PEAK_NOISE_SIGMA_BINS)
+        for start, stop in supported_runs
+    ]
+    if not residuals:
+        return None
+    high_pass = np.concatenate(residuals)
+    high_pass = high_pass[np.isfinite(high_pass)]
+    if high_pass.size == 0:
+        return None
+    centre = float(np.median(high_pass))
+    return float(1.4826 * np.median(np.abs(high_pass - centre)))
+
+
+def _effective_radial_bin_samples(
+    bin_indices: np.ndarray,
+    weights: np.ndarray,
+    n_bins: int,
+) -> np.ndarray:
+    """Return scale-stable Kish effective sample counts for radial bins."""
+
+    maximum = np.zeros(int(n_bins), dtype=float)
+    np.maximum.at(maximum, bin_indices, weights)
+    scales = maximum[bin_indices]
+    scaled = np.divide(
+        weights,
+        scales,
+        out=np.zeros_like(weights, dtype=float),
+        where=scales > 0.0,
+    )
+    total = np.bincount(bin_indices, weights=scaled, minlength=int(n_bins))
+    squared_total = np.bincount(bin_indices, weights=scaled * scaled, minlength=int(n_bins))
+    return np.divide(
+        total * total,
+        squared_total,
+        out=np.zeros(int(n_bins), dtype=float),
+        where=squared_total > 0.0,
+    )
+
+
+class _RadialHintGeometryCache:
+    """One-analysis cache for radial bins, with exact geometry/support checks."""
+
+    def __init__(self, max_bytes: int = RADIAL_HINT_CACHE_MAX_BYTES) -> None:
+        self.max_bytes = int(max_bytes)
+        self._radii: np.ndarray | None = None
+        self._selected: np.ndarray | None = None
+        self._edges: np.ndarray | None = None
+        self._bin_indices: np.ndarray | None = None
+        self._counts: np.ndarray | None = None
+
+    def _clear(self) -> None:
+        self._radii = None
+        self._selected = None
+        self._edges = None
+        self._bin_indices = None
+        self._counts = None
+
+    def get(
+        self,
+        radii: np.ndarray,
+        selected: np.ndarray,
+        edges: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return bin labels/counts, reusing them only for identical inputs."""
+
+        if (
+            self._radii is not None
+            and self._selected is not None
+            and self._edges is not None
+            and self._bin_indices is not None
+            and self._counts is not None
+            and np.array_equal(edges, self._edges)
+            and np.array_equal(selected, self._selected)
+            and np.array_equal(radii, self._radii)
+        ):
+            return self._bin_indices, self._counts
+
+        n_bins = int(edges.size - 1)
+        bin_indices = np.searchsorted(edges, radii, side="right") - 1
+        np.clip(bin_indices, 0, n_bins - 1, out=bin_indices)
+        counts = np.bincount(bin_indices, minlength=n_bins)
+
+        if n_bins <= np.iinfo(np.uint8).max + 1:
+            compact_indices = bin_indices.astype(np.uint8)
+        elif n_bins <= np.iinfo(np.uint16).max + 1:
+            compact_indices = bin_indices.astype(np.uint16)
+        else:
+            compact_indices = bin_indices
+        cache_bytes = int(
+            radii.nbytes + selected.nbytes + edges.nbytes
+            + compact_indices.nbytes + counts.nbytes
+        )
+        if cache_bytes <= self.max_bytes:
+            self._radii = np.asarray(radii, dtype=float).copy()
+            self._selected = np.asarray(selected, dtype=bool).copy()
+            self._edges = np.asarray(edges, dtype=float).copy()
+            self._bin_indices = compact_indices
+            self._counts = counts
+            for cached in (self._radii, self._selected, self._edges, self._bin_indices, self._counts):
+                cached.flags.writeable = False
+        else:
+            self._clear()
+        return bin_indices, counts
+
+
 def _first_order_q_hint(
     q: np.ndarray,
     intensity: np.ndarray,
@@ -942,14 +1146,13 @@ def _first_order_q_hint(
     q_max: float,
     *,
     n_bins: int = 96,
+    geometry_cache: _RadialHintGeometryCache | None = None,
 ) -> dict[str, Any]:
-    """Locate the lowest-q significant ring inside the user window.
+    """Select a supported radial peak only when prominence clears profile noise.
 
-    A wide experimental window often contains the first-order butterfly and a
-    growing harmonic.  The Wang/Grubb ellipse is the innermost ring, so the
-    hint is the lowest-q local maximum that is still a substantial fraction
-    of the global I(q) peak.  The caller may tighten an analysis band without
-    rewriting the user's configured q_window.
+    A lower-q family that is visibly present but below the significance limit
+    makes the first order ambiguous; it must not cause a brighter harmonic to
+    be promoted. Noise-sized one-bin shoulders are ignored.
     """
 
     summary: dict[str, Any] = {
@@ -957,6 +1160,26 @@ def _first_order_q_hint(
         "band": None,
         "n_bins": int(n_bins),
         "reason": None,
+        "selection_status": "not_selected",
+        "selection_method": "lowest_significant_supported_radial_peak_family",
+        "profile_noise_estimator": "1.4826*MAD(profile - gaussian_filter1d(profile, sigma=0.8 bins))",
+        "profile_noise_sigma_bins": FIRST_ORDER_PEAK_NOISE_SIGMA_BINS,
+        "minimum_bin_count": FIRST_ORDER_PEAK_MIN_BIN_COUNT,
+        "minimum_total_supported_bins": FIRST_ORDER_PEAK_MIN_TOTAL_SUPPORTED_BINS,
+        "minimum_contiguous_run_bins": FIRST_ORDER_PEAK_MIN_CONTIGUOUS_RUN_BINS,
+        "minimum_effective_samples_per_peak_bin": FIRST_ORDER_PEAK_MIN_EFFECTIVE_SAMPLES,
+        "significance_prominence_noise_multiple": FIRST_ORDER_PEAK_PROMINENCE_NOISE_MULTIPLE,
+        "ambiguity_prominence_noise_multiple": FIRST_ORDER_PEAK_AMBIGUITY_NOISE_MULTIPLE,
+        "ambiguity_min_width_bins": FIRST_ORDER_PEAK_AMBIGUITY_MIN_WIDTH_BINS,
+        "peak_family_span": FIRST_ORDER_PEAK_FAMILY_SPAN,
+        "n_supported_bins": 0,
+        "n_supported_runs": 0,
+        "profile_noise_mad": None,
+        "effective_noise_floor": None,
+        "significance_prominence_threshold": None,
+        "ambiguity_prominence_floor": None,
+        "candidate_peaks": [],
+        "n_significant_peaks": 0,
     }
     selected = (
         np.asarray(valid, dtype=bool)
@@ -967,12 +1190,19 @@ def _first_order_q_hint(
     )
     if int(np.count_nonzero(selected)) < 200:
         summary["reason"] = "insufficient_pixels"
+        summary["selection_status"] = "no_hint"
         return summary
     radii = np.asarray(q[selected], dtype=float)
     weights = np.clip(np.asarray(intensity[selected], dtype=float), 0.0, None)
     edges = np.linspace(float(q_min), float(q_max), int(n_bins) + 1)
-    summed, _ = np.histogram(radii, bins=edges, weights=weights)
-    counts, _ = np.histogram(radii, bins=edges)
+    if geometry_cache is None:
+        bin_indices = np.searchsorted(edges, radii, side="right") - 1
+        np.clip(bin_indices, 0, int(n_bins) - 1, out=bin_indices)
+        counts = np.bincount(bin_indices, minlength=int(n_bins))
+    else:
+        bin_indices, counts = geometry_cache.get(radii, selected, edges)
+    summed = np.bincount(bin_indices, weights=weights, minlength=int(n_bins))
+    effective_samples = _effective_radial_bin_samples(bin_indices, weights, int(n_bins))
     profile = np.divide(
         summed,
         counts,
@@ -980,30 +1210,135 @@ def _first_order_q_hint(
         where=counts > 0,
     )
     centres = 0.5 * (edges[:-1] + edges[1:])
-    usable = np.isfinite(profile) & (counts >= 8)
-    if int(np.count_nonzero(usable)) < 8:
+    usable = np.isfinite(profile) & (counts >= FIRST_ORDER_PEAK_MIN_BIN_COUNT)
+    summary["n_supported_bins"] = int(np.count_nonzero(usable))
+    if summary["n_supported_bins"] < FIRST_ORDER_PEAK_MIN_TOTAL_SUPPORTED_BINS:
         summary["reason"] = "sparse_radial_profile"
+        summary["selection_status"] = "no_hint"
         return summary
-    intensity_q = np.where(usable, profile, 0.0)
-    peak = float(np.max(intensity_q))
-    if not np.isfinite(peak) or peak <= 0.0:
+    supported_runs = _contiguous_profile_runs(usable)
+    summary["n_supported_runs"] = len(supported_runs)
+    if not supported_runs:
+        summary["reason"] = "insufficient_contiguous_support"
+        summary["selection_status"] = "no_hint"
+        return summary
+    if find_peaks is None or peak_widths is None:
+        summary["reason"] = "peak_detection_unavailable"
+        summary["selection_status"] = "no_hint"
+        return summary
+    noise_mad = _radial_profile_noise_mad(profile, supported_runs)
+    if noise_mad is None:
+        summary["reason"] = "noise_estimator_unavailable"
+        summary["selection_status"] = "no_hint"
+        return summary
+    peak_height = float(np.max(profile[usable]))
+    if not np.isfinite(peak_height) or peak_height <= 0.0:
         summary["reason"] = "empty_radial_profile"
+        summary["selection_status"] = "no_hint"
         return summary
-    interior = (
-        (intensity_q[1:-1] >= intensity_q[:-2])
-        & (intensity_q[1:-1] >= intensity_q[2:])
-        & (intensity_q[1:-1] >= 0.25 * peak)
+    noise_floor = max(noise_mad, np.finfo(float).eps * max(1.0, abs(peak_height)))
+    significance_threshold = FIRST_ORDER_PEAK_PROMINENCE_NOISE_MULTIPLE * noise_floor
+    ambiguity_floor = FIRST_ORDER_PEAK_AMBIGUITY_NOISE_MULTIPLE * noise_floor
+    summary.update(
+        {
+            "profile_noise_mad": float(noise_mad),
+            "effective_noise_floor": float(noise_floor),
+            "significance_prominence_threshold": float(significance_threshold),
+            "ambiguity_prominence_floor": float(ambiguity_floor),
+        }
     )
-    peak_indices = np.where(interior)[0] + 1
-    if peak_indices.size == 0:
-        peak_indices = np.asarray([int(np.argmax(intensity_q))], dtype=int)
-    # Adjacent bins of one Bragg ring can each look like a local max.
-    # Harmonics sit at ≳2× q*, so keep the strongest member of the lowest-q
-    # family instead of the first noisy shoulder.
+
+    candidate_peaks: list[dict[str, Any]] = []
+    for start, stop in supported_runs:
+        segment = profile[start:stop]
+        local_peaks, properties = find_peaks(segment, prominence=(None, None))
+        widths = peak_widths(segment, local_peaks, rel_height=0.5)[0]
+        for local_peak, prominence, width in zip(
+            local_peaks, properties["prominences"], widths
+        ):
+            index = int(start + local_peak)
+            height = float(profile[index])
+            prominence = float(prominence)
+            width = float(width)
+            candidate_peaks.append(
+                {
+                    "index": index,
+                    "q_bin": float(centres[index]),
+                    "height": height,
+                    "prominence": prominence,
+                    "prominence_noise_ratio": float(prominence / noise_floor),
+                    "width_bins": width,
+                    "effective_samples": float(effective_samples[index]),
+                    "support_status": (
+                        "eligible"
+                        if effective_samples[index] >= FIRST_ORDER_PEAK_MIN_EFFECTIVE_SAMPLES
+                        else "outlier_dominated"
+                    ),
+                }
+            )
+    summary["candidate_peaks"] = [
+        {key: value for key, value in candidate.items() if key != "index"}
+        for candidate in candidate_peaks
+    ]
+    if not candidate_peaks:
+        summary["reason"] = "no_supported_local_peak"
+        summary["selection_status"] = "no_hint"
+        return summary
+    eligible_peaks = [
+        peak for peak in candidate_peaks if peak["support_status"] == "eligible"
+    ]
+    summary["n_outlier_dominated_peaks"] = int(len(candidate_peaks) - len(eligible_peaks))
+    if not eligible_peaks:
+        summary["reason"] = "outlier_dominated_peak_only"
+        summary["selection_status"] = "no_hint"
+        return summary
+
+    significant_peak_count = sum(
+        peak["prominence"] >= significance_threshold for peak in eligible_peaks
+    )
+    summary["n_significant_peaks"] = int(significant_peak_count)
+    families: list[list[dict[str, Any]]] = []
+    for candidate in eligible_peaks:
+        if (
+            not families
+            or candidate["q_bin"]
+            > FIRST_ORDER_PEAK_FAMILY_SPAN * families[-1][0]["q_bin"]
+        ):
+            families.append([candidate])
+        else:
+            families[-1].append(candidate)
+
+    selected_family: list[dict[str, Any]] | None = None
+    for family in families:
+        significant = [
+            peak for peak in family if peak["prominence"] >= significance_threshold
+        ]
+        if significant:
+            selected_family = significant
+            break
+        ambiguous = [
+            peak
+            for peak in family
+            if peak["prominence"] >= ambiguity_floor
+            and peak["width_bins"] >= FIRST_ORDER_PEAK_AMBIGUITY_MIN_WIDTH_BINS
+        ]
+        if ambiguous:
+            summary["reason"] = "ambiguous_lower_q_peak_family"
+            summary["selection_status"] = "ambiguous"
+            summary["ambiguous_peaks"] = [
+                {key: value for key, value in peak.items() if key != "index"}
+                for peak in ambiguous
+            ]
+            return summary
+    if selected_family is None:
+        summary["reason"] = "no_significant_supported_peak"
+        summary["selection_status"] = "no_hint"
+        return summary
+
+    selected_indices = np.asarray([peak["index"] for peak in selected_family], dtype=int)
     peak_index = _select_first_order_peak_index(
-        centres[peak_indices],
-        intensity_q[peak_indices],
-        peak_indices,
+        centres[selected_indices], profile[selected_indices], selected_indices,
+        family_span=FIRST_ORDER_PEAK_FAMILY_SPAN,
     )
     q_bin = float(centres[peak_index])
     q_star = _refine_radial_peak_q(
@@ -1011,20 +1346,36 @@ def _first_order_q_hint(
     )
     if not np.isfinite(q_star) or q_star <= 0.0:
         summary["reason"] = "invalid_peak"
+        summary["selection_status"] = "no_hint"
         return summary
     low = max(float(q_min), 0.62 * q_star)
     high = min(float(q_max), 1.45 * q_star)
     if high <= low:
-        summary["q_star"] = q_star
-        summary["q_star_bin"] = q_bin
-        summary["reason"] = "degenerate_band"
+        summary.update(
+            {
+                "q_star": float(q_star),
+                "q_star_bin": q_bin,
+                "reason": "degenerate_band",
+                "selection_status": "selected",
+            }
+        )
         return summary
     summary.update(
         {
-            "q_star": q_star,
+            "q_star": float(q_star),
             "q_star_bin": q_bin,
             "band": [low, high],
             "reason": "ok",
+            "selection_status": "selected",
+            "selected_peak": next(
+                {
+                    key: value
+                    for key, value in peak.items()
+                    if key != "index"
+                }
+                for peak in selected_family
+                if peak["index"] == peak_index
+            ),
         }
     )
     return summary
@@ -2362,6 +2713,7 @@ def trace_butterfly_ridges(
     options: Any = None,
     edits: Any = None,
     cancel_event: Any = None,
+    radial_hint_cache: _RadialHintGeometryCache | None = None,
 ) -> dict[str, Any]:
     """Trace observed butterfly ridges and return points, arcs and profiles.
 
@@ -2400,7 +2752,9 @@ def trace_butterfly_ridges(
         valid &= ~explicit_mask
     valid, applied_edits, seed_actions = _apply_edits(valid, qx, qy, edits)
     finite_domain = np.isfinite(qx) & np.isfinite(qy) & np.isfinite(q) & (q >= q_min) & (q <= q_max)
-    first_order = _first_order_q_hint(q, image_array, valid, q_min, q_max)
+    first_order = _first_order_q_hint(
+        q, image_array, valid, q_min, q_max, geometry_cache=radial_hint_cache
+    )
     first_order["applied"] = False
     if not np.any(finite_domain):
         return {
@@ -2420,6 +2774,7 @@ def trace_butterfly_ridges(
     _check_cancelled(cancel_event, "ridge-trace:crop")
     signature = _point_signature(image_array, opts, (q_min, q_max))
     raw_candidates: list[dict[str, Any]] = []
+    noise_estimates_by_scale: list[dict[str, Any]] = []
     coordinate_cache = _coordinate_derivatives(crop_qx, crop_qy)
     for scale in opts["smoothing_scales"]:
         _check_cancelled(cancel_event, f"ridge-trace:curvature:{scale:g}")
@@ -2431,6 +2786,26 @@ def trace_butterfly_ridges(
             sigma=float(scale),
             options=opts,
             coordinate_derivatives=coordinate_cache,
+        )
+        noise_estimates_by_scale.append(
+            {
+                "smoothing_scale": float(scale),
+                "method": CANDIDATE_NOISE_METHOD,
+                "status": field.noise_status,
+                "noise_sigma": float(field.noise) if np.isfinite(field.noise) else None,
+                "candidate_snr_min": float(opts["candidate_snr_min"]),
+                "noise_threshold_delta": (
+                    float(opts["candidate_snr_min"] * field.noise)
+                    if np.isfinite(field.noise)
+                    else None
+                ),
+                "noise_sample_count": int(field.noise_support_count),
+                "noise_support_fraction": float(field.noise_support_fraction),
+                "minimum_support_fraction": float(opts["support_min"]),
+                "edge_guard_pixels": int(field.noise_edge_guard_pixels),
+                "structural_spread_for_height_scale": float(field.structural_spread),
+                "height_scale": float(field.height_scale),
+            }
         )
         raw_candidates.extend(
             _raw_candidates(
@@ -2630,6 +3005,14 @@ def trace_butterfly_ridges(
         "n_arcs": int(len(arcs)),
         "n_valid_arcs": int(sum(bool(arc["valid"]) for arc in arcs)),
         "scale_stability": {"mean": float(np.nanmean([point["scale_stability"] for point in public_points])) if public_points else float("nan"), "min": float(np.nanmin([point["scale_stability"] for point in public_points])) if public_points else float("nan")},
+        "candidate_noise": {
+            "method": CANDIDATE_NOISE_METHOD,
+            "threshold_basis": "mask-normalized raw-minus-smoothed high-pass MAD",
+            "minimum_safe_samples": CANDIDATE_NOISE_MIN_SAFE_SAMPLES,
+            "support_min": float(opts["support_min"]),
+            "crop_edge_guard_truncate_sigma": CANDIDATE_NOISE_EDGE_TRUNCATE,
+            "estimates_by_scale": noise_estimates_by_scale,
+        },
         "mask_fraction_in_q_window": float(1.0 - np.count_nonzero(crop_valid) / max(1, np.count_nonzero(finite_domain[row0:row1, col0:col1]))),
         "edits": applied_edits,
         "seed_matches": seed_records,

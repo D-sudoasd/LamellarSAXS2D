@@ -844,9 +844,10 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
 
 
 def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
-                      parameters=None, reference_axis_deg=0., multistart=7, cancel_event=None):
+                      parameters=None, reference_axis_deg=0., multistart=7, cancel_event=None,
+                      _radial_hint_cache=None):
     """Return serializable observed arcs, candidate geometry and evidence."""
-    from .butterfly_ridge import trace_butterfly_ridges
+    from .butterfly_ridge import _RadialHintGeometryCache, trace_butterfly_ridges
     from .analysis_config import DEFAULT_ANALYSIS_SETTINGS
 
     settings = normalize_butterfly_settings(options)
@@ -860,10 +861,18 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
         if isinstance(parameters, Mapping) and pname in parameters:
             spec = parameters[pname]
             settings.setdefault(qname, float(_read(spec, "value", spec)))
+    radial_hint_cache = _radial_hint_cache
+    if (
+        radial_hint_cache is None
+        and settings["stage"] == "evaluate"
+        and settings["resamples"] > 0
+    ):
+        radial_hint_cache = _RadialHintGeometryCache()
     raise_if_cancelled(cancel_event, "butterfly:trace")
     trace = trace_butterfly_ridges(image, qmap, q_window, mask=mask,
                                   reference_axis_deg=reference_axis_deg, options=settings,
-                                  edits=settings["edits"], cancel_event=cancel_event)
+                                  edits=settings["edits"], cancel_event=cancel_event,
+                                  radial_hint_cache=radial_hint_cache)
     candidate = _empty_candidate(q_unit, reference_axis_deg, diagnostics=trace)
     uncertainty = {"intervals": {}, "coverage_calibrated": False, "status": "not_run"}
     sensitivity = {"completed": False, "records": [], "held_out_arcs": []}
@@ -878,10 +887,18 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
                 overrides = dict(overrides)
                 perturbed_qmap = overrides.pop("qmap", qmap)
                 perturbed_mask = overrides.pop("mask", mask)
+                replicate_radial_cache = radial_hint_cache
+                qmap_perturbation = overrides.get("qmap_perturbation")
+                if isinstance(qmap_perturbation, Mapping):
+                    center_delta = qmap_perturbation.get("center_delta_px", (0.0, 0.0))
+                    qcal_scale = float(qmap_perturbation.get("qcal_scale", 1.0))
+                    if any(float(value) != 0.0 for value in center_delta) or qcal_scale != 1.0:
+                        replicate_radial_cache = None
                 replicate = analyze_butterfly(perturbed, perturbed_qmap, q_window, mask=perturbed_mask,
                     options={**settings, **overrides, "resamples": 0, "sensitivity": False},
                     parameters=parameters, reference_axis_deg=reference_axis_deg,
-                    multistart=1, cancel_event=cancel_event)
+                    multistart=1, cancel_event=cancel_event,
+                    _radial_hint_cache=replicate_radial_cache)
                 groups = {(p.get("branch_id"), p.get("side")) for p in replicate.get("points", [])
                           if p.get("accepted") and p.get("side") in ("upper", "lower")
                           and p.get("branch_id") in (0, 1)}
@@ -935,6 +952,31 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
     result = analyze_butterfly(frame, qmap, q_window, mask=mask, options=settings,
                               parameters=ellipse_parameters, reference_axis_deg=draw_axis_deg - 90.,
                               multistart=multistart, cancel_event=cancel_event)
+    # Landmarks are independent display/measurement diagnostics. Calculate
+    # them once at this public adapter, never in each uncertainty refit.
+    from .peak_landmarks import compute_peak_landmarks
+    from .ridge_inputs import canonical_inputs
+    from .butterfly_ridge import _parse_q_window, _apply_edits
+
+    peak_image, peak_qx, peak_qy, peak_q, peak_invalid = canonical_inputs(frame, qmap, mask=mask)
+    peak_window = _parse_q_window(q_window, peak_q)
+    peak_valid = (~peak_invalid & np.isfinite(peak_image) & np.isfinite(peak_qx)
+                  & np.isfinite(peak_qy) & np.isfinite(peak_q)
+                  & (peak_q >= peak_window[0]) & (peak_q <= peak_window[1]))
+    peak_valid, peak_edits, _ = _apply_edits(peak_valid, peak_qx, peak_qy, result.get("edits", []))
+    peak_hint = result.get("diagnostics", {}).get("first_order_q_hint", {})
+    signal_window = peak_hint.get("band") if peak_hint.get("selection_status") == "selected" else None
+    peak_options = dict(settings.get("peak_landmark_options") or {})
+    if signal_window is not None:
+        peak_options["signal_q_window_origin"] = (
+            f"first_order_q_hint:{peak_hint.get('q_star')}; method={peak_hint.get('selection_method')}"
+        )
+    result["peak_landmarks"] = compute_peak_landmarks(
+        peak_image, peak_qx, peak_qy, valid_mask=peak_valid, q_window=peak_window,
+        signal_q_window=signal_window, q_unit=_qmap_unit(qmap),
+        options=peak_options, cancel_event=cancel_event,
+    )
+    result["peak_landmarks"]["domain"]["applied_polygon_edits"] = peak_edits
     unit = str(_read(qmap, "q_unit", "unknown"))
     if settings.get("companion_observables", True):
         raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")

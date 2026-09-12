@@ -25,6 +25,7 @@ from .pipeline import (
 from .project import ProjectConfig, ProjectConfigError, load_project
 from .settings import deep_merge_mapping
 from .path_utils import filter_supported_image_paths
+from .analysis_config import normalize_ridge_method
 
 
 _DEFAULT_LEGACY_PROJECT_RUNNER = run_project
@@ -285,6 +286,13 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_parser.add_argument("-o", "--output", help="JSON/NPZ 文件或输出目录")
     analyze_parser.add_argument("--full2d", action="store_true", help="调用可选的 full2d 精修模块")
     analyze_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    analyze_parser.add_argument(
+        "--figure-output", help="另存基于测量数组的科研图包到新目录（SVG/PDF/TIFF/PNG 与源数据）"
+    )
+    analyze_parser.add_argument("--figure-width", type=float, choices=(89.0, 183.0), default=183.0,
+                                help="科研图画板宽度，单位 mm（默认双栏 183）")
+    analyze_parser.add_argument("--figure-dpi", type=int, choices=(300, 600, 1200), default=600,
+                                help="科研图中栅格内容的分辨率（默认 600 dpi）")
     _add_refinement_options(analyze_parser)
 
     batch_parser = sub.add_parser("batch", help="批量分析原位序列")
@@ -457,7 +465,23 @@ def _handle_inspect(args: argparse.Namespace) -> int:
 
 def _handle_analyze(args: argparse.Namespace) -> int:
     config = _config(args.config)
-    config = _with_analysis(config, _analysis_overrides(args))
+    overrides = _analysis_overrides(args)
+    figure_output = getattr(args, "figure_output", None)
+    if figure_output:
+        figure_target = Path(figure_output).expanduser().resolve()
+        if figure_target.exists():
+            raise FileExistsError(f"科研图目录已存在，未覆盖：{figure_output}")
+        if args.output:
+            analysis_target = Path(args.output).expanduser().resolve()
+            if analysis_target == figure_target or figure_target in analysis_target.parents:
+                raise PipelineError("分析输出会占用科研图目录；请为 --output 和 --figure-output 选择独立目录")
+            if analysis_target.suffix.lower() in {".json", ".npz", ".csv"} and analysis_target in figure_target.parents:
+                raise PipelineError("科研图目录不能放在分析输出文件内部；请选择独立目录")
+        selected_method = overrides.get("ridge_method", (config.analysis if config else {}).get("ridge_method"))
+        if selected_method is not None and normalize_ridge_method(selected_method) != "butterfly_curvature":
+            raise PipelineError("科研图导出需要 --ridge-method butterfly_curvature")
+        overrides["ridge_method"] = "butterfly_curvature"
+    config = _with_analysis(config, overrides)
     source = _pick_input(args, config)
     result = analyze_frame(
         source,
@@ -470,9 +494,58 @@ def _handle_analyze(args: argparse.Namespace) -> int:
         mask_frame=args.mask_frame,
         mask_dataset=args.mask_dataset,
         valid_mask=args.valid_mask,
-        output=args.output,
+        output=None if figure_output else args.output,
         force=args.force,
     )
+    if figure_output:
+        from .butterfly_figure import export_butterfly_figure
+        from .pipeline import _coerce_qmap, _result_output_paths
+
+        if not isinstance(result.butterfly, Mapping):
+            raise PipelineError("当前分析没有可导出的蝴蝶观测结果")
+        if args.output:
+            analysis_paths = [path.expanduser().resolve() for path in _result_output_paths(result, args.output)]
+            if any(path == figure_target or figure_target in path.parents or path in figure_target.parents
+                   for path in analysis_paths):
+                raise PipelineError("分析文件与科研图目录冲突；请选择独立目录")
+            existing = [path for path in analysis_paths if path.exists()]
+            if any(path.is_dir() for path in existing):
+                raise PipelineError("分析输出文件的位置已有目录；科研图未写入，请选择独立目录")
+            if any(parent.exists() and not parent.is_dir() for path in analysis_paths for parent in path.parents):
+                raise PipelineError("分析输出的父目录位置已有文件；科研图未写入，请选择独立目录")
+            if existing and not args.force:
+                raise FileExistsError(f"分析输出已存在，科研图未写入：{existing[0]}")
+        coordinates = _coerce_qmap(result.qmap, result.image.shape)
+        pixel_fit = result.full2d if isinstance(result.full2d, Mapping) else {}
+        pixel_model = pixel_fit.get("model_image", pixel_fit.get("model"))
+        comparison_inputs = {} if pixel_model is None else {"model": pixel_model}
+        written = export_butterfly_figure(
+            figure_output, observed=result.image,
+            qx=coordinates["qx"], qy=coordinates["qy"],
+            valid_mask=result.valid_mask, result=result.butterfly,
+            q_unit=coordinates.get("q_unit", "unknown"),
+            context={
+                "metadata": result.metadata, "analysis": result.analysis,
+                "valid_mask_role": "analysis fit domain, including detector/external mask, q-window, ROI and weight validity",
+                "analysis_domain": None if result.analysis_domain is None else result.analysis_domain.to_summary(),
+                "pixel_model_source": "full2d fit output" if pixel_model is not None else None,
+                "pixel_model_status": pixel_fit.get("status"),
+                "pixel_model_parameters": pixel_fit.get("parameters"),
+                "pixel_model_reference_axis_deg": pixel_fit.get("reference_axis_deg"),
+                "pixel_model_bound_flags": pixel_fit.get("bound_flags"),
+                "pixel_model_condition_number": pixel_fit.get("condition_number"),
+                "pixel_model_rmse": pixel_fit.get("rmse"),
+                "pixel_model_effective_bounds": pixel_fit.get("effective_bounds"),
+            },
+            width_mm=args.figure_width, dpi=args.figure_dpi,
+            **comparison_inputs,
+        )
+        result.output_paths.extend(str(path) for path in written.values())
+        if args.output:
+            from .pipeline import export_result
+
+            analysis_paths = export_result(result, args.output, force=args.force)
+            result.output_paths.extend(str(path) for path in analysis_paths)
     report = result.to_mapping()
     _print_json(report)
     from .batch import _quality_failure_reason

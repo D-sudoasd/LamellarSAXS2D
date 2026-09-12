@@ -1630,6 +1630,10 @@ class ButterflyAnalysisService:
                     "weighted_rmse": _as_public_scalar(_read(fit, ("weighted_rmse",), None)),
                     "condition_number": _as_public_scalar(_read(fit, ("condition_number",), None)),
                     "bound_flags": _json_safe(_read(fit, ("bound_flags",), {})),
+                    "effective_bounds": _json_safe(_read(fit, ("effective_bounds",), {})),
+                    "bound_flag_intensity_scale": _as_public_scalar(
+                        _read(fit, ("bound_flag_intensity_scale",), None)
+                    ),
                     "stderr": _json_safe(_read(fit, ("stderr",), {})),
                     **audit,
                 }

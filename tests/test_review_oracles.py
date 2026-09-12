@@ -82,11 +82,15 @@ def _pipeline_config() -> dict:
 
 def test_well_resolved_known_truth_reaches_pipeline_with_geometry_and_support() -> None:
     case = generate_arc_case("ellipse_ratio_400", seed=20260906, shape=(96, 96))
+    config = _pipeline_config()
+    # This oracle has b/a=0.4, outside the explicit flat prior's 0.35 cap.
+    # Test localization accuracy with a compatible prior; retain the 5% limit.
+    config["analysis"]["ellipse_preset"] = "standard"
     result = analyze_frame(
         case["image"],
         qmap=case["qmap"],
         mask=case["mask"],
-        config=_pipeline_config(),
+        config=config,
         full2d=False,
     )
 

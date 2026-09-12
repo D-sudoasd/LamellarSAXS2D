@@ -27,6 +27,14 @@ except Exception:  # pragma: no cover - numpy is a core dependency normally
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 
 
+def _axis_tick_text(value: float, lower: float, upper: float) -> str:
+    """Hide floating-point zero residue without hiding small physical scales."""
+    scale = max(abs(lower), abs(upper), abs(upper - lower))
+    if abs(value) <= scale * 1e-12:
+        value = 0.0
+    return f"{value:.3g}"
+
+
 def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
     if isinstance(source, Mapping):
         for name in names:
@@ -190,6 +198,7 @@ if QT_AVAILABLE:
         """
 
         pointSelected = QtCore.Signal(object)
+        landmarkSelected = QtCore.Signal(object)
         editRequested = QtCore.Signal(object)
         roiPreviewChanged = QtCore.Signal(object)
         interactionChanged = QtCore.Signal(str)
@@ -210,6 +219,14 @@ if QT_AVAILABLE:
             self._qy: Any = None
             self._valid_mask: Any = None
             self._butterfly: dict[str, Any] = {}
+            self._peak_landmarks: dict[str, Any] = {}
+            self._fit_layers: dict[str, Any] = {}
+            # Keep the legacy canvas behavior for direct users. The workbench
+            # chooses an explicit source layer through its selector.
+            self._overlay_mode = "legacy"
+            self._show_global_raw_max = True
+            self._show_supported_peaks = True
+            self._selected_landmark_id: str | None = None
             self._edits: list[dict[str, Any]] = []
             self._display_scale = "linear"
             self._display_percentile = 99.5
@@ -257,8 +274,16 @@ if QT_AVAILABLE:
             return self._selected_point_id
 
         @property
+        def selected_landmark_id(self) -> str | None:
+            return self._selected_landmark_id
+
+        @property
         def q_bounds(self) -> tuple[float, float, float, float] | None:
             return self._q_bounds
+
+        @property
+        def base_q_bounds(self) -> tuple[float, float, float, float] | None:
+            return self._base_q_bounds
 
         @property
         def q_window(self) -> tuple[float, float] | None:
@@ -354,6 +379,8 @@ if QT_AVAILABLE:
             )
             self._draft_points.clear()
             self._selected_point_id = None
+            self.set_peak_landmarks(None)
+            self.set_fit_layers(None)
             self._mesh_revision += 1
             self._mesh_cache_key = None
             self.update()
@@ -467,6 +494,119 @@ if QT_AVAILABLE:
 
         set_overlay = set_butterfly
 
+        @property
+        def peak_landmarks(self) -> dict[str, Any]:
+            return dict(self._peak_landmarks)
+
+        @property
+        def fit_layers(self) -> dict[str, Any]:
+            return dict(self._fit_layers)
+
+        def set_peak_landmarks(self, payload: Any = None) -> None:
+            """Set the independent raw-maximum / supported-peak display layer."""
+
+            self._peak_landmarks = dict(payload) if isinstance(payload, Mapping) else {}
+            self._selected_landmark_id = None
+            self.update()
+
+        def set_fit_layers(self, payload: Any = None) -> None:
+            """Set separately sourced geometry and full2d diagnostic curves."""
+
+            self._fit_layers = dict(payload) if isinstance(payload, Mapping) else {}
+            self.update()
+
+        def set_overlay_mode(self, mode: str) -> None:
+            allowed = {
+                "measured_only",
+                "observed_ridges",
+                "geometry_candidate",
+                "full2d_model",
+                "compare",
+                "legacy",
+            }
+            value = str(mode or "measured_only").strip().lower()
+            self._overlay_mode = value if value in allowed else "measured_only"
+            self.update()
+
+        @property
+        def overlay_mode(self) -> str:
+            return self._overlay_mode
+
+        def set_landmark_visibility(
+            self,
+            *,
+            global_raw_max: bool | None = None,
+            supported_peaks: bool | None = None,
+        ) -> None:
+            if global_raw_max is not None:
+                self._show_global_raw_max = bool(global_raw_max)
+            if supported_peaks is not None:
+                self._show_supported_peaks = bool(supported_peaks)
+            self.update()
+
+        def set_selected_landmark(self, landmark_id: Any) -> None:
+            self._selected_landmark_id = (
+                None if landmark_id in (None, "") else str(landmark_id)
+            )
+            self.update()
+
+        def _landmark_items(self) -> list[tuple[str, str, Mapping[str, Any]]]:
+            items: list[tuple[str, str, Mapping[str, Any]]] = []
+            raw_max = self._peak_landmarks.get("raw_global_max")
+            if self._show_global_raw_max and isinstance(raw_max, Mapping):
+                items.append(("G", "raw_global_max", raw_max))
+            peaks = self._peak_landmarks.get("peaks", ())
+            if self._show_supported_peaks and isinstance(peaks, Sequence) and not isinstance(
+                peaks, (str, bytes)
+            ):
+                for index, peak in enumerate(peaks):
+                    if not isinstance(peak, Mapping):
+                        continue
+                    peak_id = str(_read(peak, ("peak_id",), f"P{index + 1}") or "")
+                    if peak_id:
+                        items.append((peak_id, "supported_peak", peak))
+            return [item for item in items if _point_q(item[2]) is not None]
+
+        @staticmethod
+        def _screen_distance(position: Any, target: Any) -> float:
+            return math.hypot(
+                float(position.x()) - float(target.x()),
+                float(position.y()) - float(target.y()),
+            )
+
+        def _nearest_landmark_hit(self, position: Any) -> tuple[Mapping[str, Any] | None, float]:
+            best: Mapping[str, Any] | None = None
+            best_distance = float("inf")
+            for _, _, record in self._landmark_items():
+                q = _point_q(record)
+                screen = self._q_to_screen(*q) if q is not None else None
+                if screen is None:
+                    continue
+                distance = self._screen_distance(position, screen)
+                if distance < best_distance:
+                    best_distance, best = distance, record
+            return best, best_distance
+
+        def _nearest_visible_point_hit(self, position: Any) -> tuple[Mapping[str, Any] | None, float]:
+            if self._overlay_mode not in {"legacy", "observed_ridges"}:
+                return None, float("inf")
+            points = self._butterfly.get("points", ())
+            if isinstance(points, Mapping):
+                points = (points,)
+            best: Mapping[str, Any] | None = None
+            best_distance = float("inf")
+            for point in points if isinstance(points, Sequence) else ():
+                if not isinstance(point, Mapping) or not self._point_visible(point):
+                    continue
+                q = _point_q(point)
+                screen = self._q_to_screen(*q) if q is not None else None
+                if screen is None:
+                    continue
+                distance = self._screen_distance(position, screen)
+                if distance < best_distance:
+                    best_distance, best = distance, point
+            return best, best_distance
+
         def set_edits(self, edits: Sequence[Any] | None) -> None:
             """Render the persisted include/exclude polygons on the q image."""
 
@@ -528,9 +668,8 @@ if QT_AVAILABLE:
             x0, x1, y0, y1 = bounds
             span_x = max(1e-12, x1 - x0)
             span_y = max(1e-12, y1 - y0)
-            margin = 28.0
             available = (self.rect().adjusted(42, 12, -12, -34) if self._compact_mode
-                         else self.rect().adjusted(margin, margin, -margin, -margin))
+                         else self.rect().adjusted(70, 28, -28, -48))
             if available.width() <= 1 or available.height() <= 1:
                 self._plot_rect = QtCore.QRectF()
                 return
@@ -628,10 +767,34 @@ if QT_AVAILABLE:
                 return
             mode = self._interaction_mode
             if mode == "select_point":
-                point = self._nearest_point(q)
-                if point is not None:
+                landmark, landmark_distance = self._nearest_landmark_hit(event.position())
+                point, point_distance = self._nearest_visible_point_hit(event.position())
+                hit_radius = 12.0
+                if (
+                    landmark is not None
+                    and landmark_distance <= hit_radius
+                    and landmark_distance < point_distance
+                ):
+                    self._selected_landmark_id = str(
+                        _read(landmark, ("peak_id",), "G") or "G"
+                    )
+                    if landmark is self._peak_landmarks.get("raw_global_max"):
+                        self._selected_landmark_id = "G"
+                    self.landmarkSelected.emit(dict(landmark))
+                    self.update()
+                    return
+                if point is not None and point_distance <= hit_radius:
                     self._selected_point_id = str(_read(point, ("point_id",), "") or "") or None
                     self.pointSelected.emit(dict(point))
+                    self.update()
+                    return
+                if landmark is not None and landmark_distance <= hit_radius:
+                    self._selected_landmark_id = str(
+                        _read(landmark, ("peak_id",), "G") or "G"
+                    )
+                    if landmark is self._peak_landmarks.get("raw_global_max"):
+                        self._selected_landmark_id = "G"
+                    self.landmarkSelected.emit(dict(landmark))
                     self.update()
                 return
             if mode == "seed":
@@ -993,7 +1156,8 @@ if QT_AVAILABLE:
             painter.save()
             if not self._plot_rect.isNull():
                 painter.setClipRect(self._plot_rect, QtCore.Qt.ClipOperation.IntersectClip)
-            points = self._butterfly.get("points", [])
+            draw_ridges = self._overlay_mode in {"legacy", "observed_ridges"}
+            points = self._butterfly.get("points", []) if draw_ridges else []
             if isinstance(points, Mapping):
                 points = [points]
             for point in points if isinstance(points, Sequence) else ():
@@ -1039,7 +1203,7 @@ if QT_AVAILABLE:
                     painter.setPen(QtGui.QPen(QtGui.QColor(255, 245, 120, 255), 2.0))
                     painter.drawEllipse(screen, 8.0, 8.0)
 
-            arcs = self._butterfly.get("arcs", [])
+            arcs = self._butterfly.get("arcs", []) if draw_ridges else []
             if isinstance(arcs, Mapping):
                 arcs = list(arcs.values())
             for arc in arcs if isinstance(arcs, Sequence) else ():
@@ -1109,7 +1273,10 @@ if QT_AVAILABLE:
                 painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
                 self._draw_polyline_segments(painter, screen_points)
 
-            fit = self._butterfly.get("candidate_fit", {})
+            # Direct QSpaceView users retain the historical ellipse overlay.
+            # The workbench uses fit_geometry_layers and enables one labelled
+            # source at a time through the explicit overlay selector.
+            fit = self._butterfly.get("candidate_fit", {}) if self._overlay_mode == "legacy" else {}
             if not isinstance(fit, Mapping):
                 fit = {}
             ring_overlay = overlay_uses_first_order_ring(self._butterfly)
@@ -1210,6 +1377,99 @@ if QT_AVAILABLE:
 
             painter.restore()
 
+        def _draw_fit_layers(self, painter: Any) -> None:
+            mode_sources = {
+                "geometry_candidate": ("geometry",),
+                "full2d_model": ("intensity_model",),
+                "compare": ("geometry", "intensity_model"),
+            }
+            sources = mode_sources.get(self._overlay_mode, ())
+            if not sources:
+                return
+            painter.save()
+            if not self._plot_rect.isNull():
+                painter.setClipRect(self._plot_rect, QtCore.Qt.ClipOperation.IntersectClip)
+            source_styles = {
+                "geometry": (QtGui.QColor(235, 100, 177, 235), QtCore.Qt.PenStyle.DashLine),
+                "intensity_model": (QtGui.QColor(92, 205, 245, 245), QtCore.Qt.PenStyle.SolidLine),
+            }
+            for source in sources:
+                layer = self._fit_layers.get(source)
+                if not isinstance(layer, Mapping):
+                    continue
+                curves = layer.get("curves", ())
+                if isinstance(curves, Mapping):
+                    curves = list(curves.values())
+                if not isinstance(curves, Sequence) or isinstance(curves, (str, bytes)):
+                    continue
+                color, pen_style = source_styles[source]
+                for curve in curves:
+                    if not isinstance(curve, Mapping):
+                        continue
+                    branch = _read(curve, ("branch_id", "branch", "component"), None)
+                    if branch is not None:
+                        try:
+                            if not any(
+                                self._visible_branches.get((int(branch), side), True)
+                                for side in ("upper", "lower")
+                            ):
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                    raw_points = curve.get("points", ())
+                    screen_points = []
+                    try:
+                        iterator = iter(raw_points)
+                    except TypeError:
+                        continue
+                    for item in iterator:
+                        pair = _point_q(item)
+                        screen_points.append(self._q_to_screen(*pair) if pair is not None else None)
+                    painter.setPen(QtGui.QPen(color, 1.8, pen_style))
+                    painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                    self._draw_polyline_segments(painter, screen_points)
+            painter.restore()
+
+        def _draw_landmarks(self, painter: Any) -> None:
+            if not self._landmark_items():
+                return
+            painter.save()
+            if not self._plot_rect.isNull():
+                painter.setClipRect(self._plot_rect, QtCore.Qt.ClipOperation.IntersectClip)
+            for landmark_id, kind, record in self._landmark_items():
+                pair = _point_q(record)
+                if pair is None:
+                    continue
+                screen = self._q_to_screen(*pair)
+                if screen is None:
+                    continue
+                selected = landmark_id == self._selected_landmark_id
+                if kind == "raw_global_max":
+                    color = QtGui.QColor(255, 205, 72, 255)
+                    diamond = QtGui.QPolygonF(
+                        [
+                            QtCore.QPointF(screen.x(), screen.y() - 6.0),
+                            QtCore.QPointF(screen.x() + 6.0, screen.y()),
+                            QtCore.QPointF(screen.x(), screen.y() + 6.0),
+                            QtCore.QPointF(screen.x() - 6.0, screen.y()),
+                        ]
+                    )
+                    painter.setPen(QtGui.QPen(color, 1.5))
+                    painter.setBrush(QtGui.QBrush(QtGui.QColor(255, 205, 72, 80)))
+                    painter.drawPolygon(diamond)
+                else:
+                    color = QtGui.QColor(112, 235, 189, 255)
+                    painter.setPen(QtGui.QPen(color, 1.5))
+                    painter.setBrush(QtGui.QBrush(QtGui.QColor(18, 38, 37, 220)))
+                    painter.drawEllipse(screen, 5.0, 5.0)
+                if selected:
+                    painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+                    painter.setPen(QtGui.QPen(QtGui.QColor(255, 246, 120, 255), 2.0))
+                    painter.drawEllipse(screen, 9.0, 9.0)
+                painter.setPen(QtGui.QPen(color, 1.0))
+                painter.drawText(QtCore.QPointF(screen.x() + 7.0, screen.y() - 6.0), landmark_id)
+            painter.restore()
+
         def _draw_edits(self, painter: Any) -> None:
             for edit in self._edits:
                 kind = str(edit.get("type", ""))
@@ -1276,6 +1536,8 @@ if QT_AVAILABLE:
             painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
             painter.drawRect(self._plot_rect)
             self._draw_butterfly(painter)
+            self._draw_fit_layers(painter)
+            self._draw_landmarks(painter)
             self._draw_edits(painter)
             self._draw_draft(painter)
             if self._compact_mode:
@@ -1310,15 +1572,21 @@ if QT_AVAILABLE:
                 y_point = self._q_to_screen(x0, qy_tick)
                 if x_point is not None:
                     painter.drawLine(x_point.x(), self._plot_rect.bottom(), x_point.x(), self._plot_rect.bottom() + 4)
-                    painter.drawText(x_point.x() - 20, self._plot_rect.bottom() + 16, f"{qx_tick:.3g}")
+                    painter.drawText(x_point.x() - 20, self._plot_rect.bottom() + 16,
+                                     _axis_tick_text(qx_tick, x0, x1))
                 if y_point is not None:
                     painter.drawLine(self._plot_rect.left() - 4, y_point.y(), self._plot_rect.left(), y_point.y())
-                    painter.drawText(2, y_point.y() + 4, f"{qy_tick:.3g}")
+                    painter.drawText(
+                        QtCore.QRectF(24, y_point.y() - 9, self._plot_rect.left() - 31, 18),
+                        QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                        _axis_tick_text(qy_tick, y0, y1),
+                    )
             qx_label = f"qx ({self._q_unit})"
             qy_label = f"qy ({self._q_unit})"
             painter.drawText(
-                int(self._plot_rect.center().x() - 32),
-                int(self._plot_rect.bottom() + 31),
+                QtCore.QRectF(self._plot_rect.left(), self._plot_rect.bottom() + 22,
+                              self._plot_rect.width(), 22),
+                QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignVCenter,
                 qx_label,
             )
             painter.save()
@@ -1336,7 +1604,12 @@ if QT_AVAILABLE:
                 "polygon_include": "包含多边形",
             }.get(self._interaction_mode, self._interaction_mode)
             if self._language.lower().startswith("en"):
-                mode_text = self._interaction_mode
+                mode_text = {
+                    "select_point": "Select point", "seed": "Seed point",
+                    "exclude_point": "Exclude point", "rectangle_exclude": "Exclude rectangle",
+                    "rectangle_include": "Include rectangle", "polygon_exclude": "Exclude polygon",
+                    "polygon_include": "Include polygon",
+                }.get(self._interaction_mode, self._interaction_mode)
             painter.drawText(self.width() - 180, 18, f"mode: {mode_text}")
             if self._hover_q is not None:
                 hover_text = (

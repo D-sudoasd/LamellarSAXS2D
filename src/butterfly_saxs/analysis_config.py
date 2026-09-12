@@ -370,6 +370,20 @@ def ellipse_parameter_specs(
     }
 
 
+def normalize_ridge_method(value: Any) -> str:
+    """Canonical method names shared by analysis and entrypoint preflight."""
+    method = str(value).strip().lower().replace("-", "_")
+    if method == "curvature":
+        method = "surface_curvature"
+    if method in {"azimuthal", "azimuthal_max", "angular_peak", "azimuth_peak"}:
+        method = "azimuthal_peak"
+    if method not in {"radial_peak", "surface_curvature", "azimuthal_peak", "butterfly_curvature"}:
+        raise ValueError(
+            "ridge_method must be 'radial_peak', 'azimuthal_peak', 'surface_curvature', or 'butterfly_curvature'"
+        )
+    return method
+
+
 def validate_analysis_settings(
     settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -414,15 +428,7 @@ def validate_analysis_settings(
         raise ValueError("draw_axis_deg must be finite")
     merged["draw_axis_deg"] = draw_axis
 
-    method = str(merged.get("ridge_method", "radial_peak")).strip().lower().replace("-", "_")
-    if method == "curvature":
-        method = "surface_curvature"
-    if method in {"azimuthal", "azimuthal_max", "angular_peak", "azimuth_peak"}:
-        method = "azimuthal_peak"
-    if method not in {"radial_peak", "surface_curvature", "azimuthal_peak", "butterfly_curvature"}:
-        raise ValueError(
-            "ridge_method must be 'radial_peak', 'azimuthal_peak', 'surface_curvature', or 'butterfly_curvature'"
-        )
+    method = normalize_ridge_method(merged.get("ridge_method", "radial_peak"))
     merged["ridge_method"] = method
     raw_input = settings if isinstance(settings, Mapping) else {}
     raw_ellipse = raw_input.get("ellipse") if isinstance(raw_input.get("ellipse"), Mapping) else {}

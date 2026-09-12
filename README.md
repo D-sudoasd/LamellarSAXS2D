@@ -4,84 +4,64 @@
 ![Python](https://img.shields.io/badge/Python-3.11--3.13-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Quantitative refinement and in-situ analysis of anisotropic lamellar 2D SAXS patterns.**
+**Identify and parameterize butterfly-pattern 2D SAXS, then review an in-situ series without treating a solver bound as a measured structure.**
 
-LamellarSAXS2D reads calibrated two-dimensional SAXS detector data, measures anisotropic butterfly/eyebrow features across several scales, fits mirror-constrained double ellipses, and tracks fitted parameters through an in-situ sequence. It preserves the input intensity scale and uses a supplied PONI file to construct physical `q`, `chi`, `qx`, and `qy` coordinates through pyFAI.
+LamellarSAXS2D reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), builds physical `q`, `chi`, `qx`, and `qy` from a PONI file through pyFAI, traces observed butterfly arcs, and reports what the image actually supports:
 
-![LamellarSAXS2D refinement workbench using synthetic data](docs/assets/refinement-ui.png)
+| A typical frame reports | Only when an interior ellipse is supported |
+| --- | --- |
+| First-order `q*` and **L ring** = `2π/q*` | Apparent `a`, `b/a`, `θ` |
+| Occupied sides, quality, and flags | Unpublished **Ln / Lz / L major** candidates |
+| `ring` when the fit sits on a bound or the major axis runs away | Never a silent overwrite of user bounds or of ring L into the Ln column |
 
-The screenshot uses synthetic data and demonstrates the observed, model, residual, and reciprocal-space overlay views.
+`success=True` is not scientific acceptance. Pixel-q never invents a physical period. Opposite quadrants are never fabricated.
 
-## Features
+[中文说明](#中文说明) · [Install](#install) · [Quick start](#quick-start) · [Docs](#documentation) · [Scientific scope](#scientific-scope)
 
-- Parameter-driven real-space lamellar studio: linked SAXS, shared 2D/3D slab geometry, fixed-layout sequence playback, explicit candidate/assumption provenance, and SVG/PDF/PNG/GIF exports. See the [lamellar studio guide](docs/lamellar_workbench_zh.md). This feature produces schematics, not a unique structural inversion.
-- Publication artboards (0.4): planar micro-bevel geometry, opaque matte Qt Quick 3D, balanced orthographic framing, 89/183 mm layouts, editable SVG/TrueType PDF annotations and genuine 600 dpi PNG/TIFF renders. See the [publication guide](docs/publication_figures_zh.md).
+![Synthetic butterfly pattern with an origin-centred double-ellipse overlay](docs/assets/refinement-ui.png)
 
-- Observed butterfly arc workflow (`butterfly_curvature`) with separately identified ellipse sides, restricted arc projection and parameter-level evidence. See the [butterfly arc guide](docs/butterfly_arcs_zh.md). Older projects retain their saved ridge method.
+Synthetic demonstration (pixel-q): the Wang/Grubb double ellipse drawn on a generated butterfly. Real experimental frames more often support a first-order **ring** until an interior ellipse is actually identified.
 
-- CBF, EDF, TIF/TIFF, NPY, NPZ, HDF5, CSV, and TXT input, including explicit frame/dataset selection.
-- PONI-calibrated reciprocal-space maps and explicit masks or exclusion regions.
-- Read-only package preflight for manifests, geometry, masks, units, correction state, uncertainty state, and SHA-256 evidence.
-- P3 same-model/independent-FFT benchmark generators, an eight-frame blind-annotation pack, and a read-only Go/No-Go evidence gate.
-- Radial and azimuthal profiles, lobe measurements, directly observed azimuthal-peak or radial ridge extraction, and q-space symmetric double-ellipse fitting.
-- Explicit `flat_ellipse` and `very_flat_ellipse` measurement presets (editable `b/a` bounds; the latter defaults to `0.005–0.35`), deterministic multistart and separate geometry-only remeasurement/refinement.
-- Quadrant pairing is defined in the fitted `(q-center)`/reference-axis frame: QI+QIII form one mirrored pair and QII+QIV the other. The fitter never fabricates a missing counterpart; unsupported opposite quadrants remain flagged.
-- Optional full-pixel empirical 2D refinement with bounds, fixed parameters, expression constraints, weights, and residual diagnostics.
-- Qt workbench with live preview, background optimization, parameter tables, overlays, batch controls, evolution plots, a scroll-safe control dock, and a state-aware next-step guide.
-- Independent or quality-gated warm-start processing, selector-aware checkpoints, cooperative cancellation/progress, optional streaming exports, failed-frame isolation, and auditable CSV/JSON/NPZ exports.
-- First-run environment diagnostics and a crash-visible GUI launcher that records otherwise silent `pythonw` start-up failures.
+## What it does
 
-## Install from source
+- **Butterfly arcs** (`ridge_method=butterfly_curvature`): curvature ridges, branch/side labels (QI+QIII vs QII+QIV), first-order family vs harmonics, sparse-ring fill. See the [butterfly arc guide](docs/butterfly_arcs_zh.md).
+- **Honest ellipse publication**: `flat_ellipse` (editable `b/a` bounds, default `0.005–0.35`) and `very_flat_ellipse`. A cap, floor, or major axis longer than the observed first-order ridge is **ring-only** — `a`, tilt, and ellipticity stay unpublished.
+- **Batch review**: independent frames, cancel/progress, checkpoints, streaming CSV/JSON/NPZ. The table shows `WARN · ring` / `WARN · ellipse`, L ring, and candidate-period tooltips. Warm-start stays quality-gated.
+- **Workbench**: Identify arcs → Evaluate; bilingual UI; first-order ring overlay instead of a capped tilted ellipse; lamellar studio and 0.4 publication artboards are schematics, not a unique inversion ([studio](docs/lamellar_workbench_zh.md), [figures](docs/publication_figures_zh.md)).
+- **Optional `full2d`**: empirical whole-pixel intensity refinement. It is a different model from the butterfly geometry measurement.
+- **Measurement and fit figures**: export fixed-size SVG/PDF and high-resolution TIFF/PNG with source arrays, curve/profile CSVs, and checksums. Inspect measured data, candidate ellipses, overlays, and actual `full2d` predictions without promoting a candidate to a scientifically accepted result. See the [figure export guide](docs/butterfly_figures_zh.md).
+- **Peak diagnostics**: locate the raw brightest pixel separately from supported lobe peaks; inspect measured/model peak positions, local zooms, angular/radial profiles, and clean overlays from each fit source. Peak coordinates and support flags also travel through batch exports.
+- **Preflight and P3/P4 gates**: read-only package checks and evidence reports. They do not freeze science or replace named human review.
 
-Supported Python versions are 3.11–3.13. Python 3.14 and newer are outside this support contract. A project-local environment keeps the desktop launcher and terminal commands on the same interpreter:
+## Install
 
-```bash
+Python **3.11–3.13** (3.14+ is outside the support contract). Core analysis does not need Qt; the workbench does.
+
+```powershell
 git clone https://github.com/D-sudoasd/LamellarSAXS2D.git
 cd LamellarSAXS2D
 python -m venv .venv-project
-```
-
-Activate the environment, or call its Python directly. On Windows:
-
-```powershell
 .\.venv-project\Scripts\python.exe -m pip install --upgrade pip
 .\.venv-project\Scripts\python.exe -m pip install `
   -c constraints\validation-py311-313.txt -e ".[all]"
 .\.venv-project\Scripts\bsaxs-doctor.exe --require-ui
 ```
 
-On Linux/macOS:
+Linux / macOS:
 
 ```bash
+python -m venv .venv-project
 .venv-project/bin/python -m pip install --upgrade pip
 .venv-project/bin/python -m pip install \
   -c constraints/validation-py311-313.txt -e ".[all]"
 .venv-project/bin/bsaxs-doctor --require-ui
 ```
 
-Core analysis does not require Qt. For core-only use, install with `python -m pip install -e .` and run `bsaxs-doctor` without `--require-ui`.
+Core-only: `python -m pip install -e .` then `bsaxs-doctor` without `--require-ui`.
 
-### Windows desktop launch
-
-The launcher searches `.venv-project`, `.venv`, and `venv` first, then asks
-the Windows Python launcher for Python 3.13, 3.12 or 3.11 and prepends this
-checkout's `src` directory to `PYTHONPATH`. It does not use the Microsoft
-Store `python.exe` alias or install global packages. `--check` requires the
-optional UI dependencies; install the project extras in a project environment
-when the diagnostic reports a missing `pyqtgraph`/Qt package.
-
-After the environment check passes, double-click `启动_LamellarSAXS2D.cmd`, or run:
-
-```powershell
-.\启动_LamellarSAXS2D.cmd data\frame_0001.cbf `
-  --poni geometry\detector.poni
-```
-
-The launcher searches `.venv-project`, `.venv`, and `venv` before using `PATH`. Use `.\启动_LamellarSAXS2D.cmd --check` to validate the complete desktop-launch chain without opening the GUI. A start-up exception is written to the per-user `LamellarSAXS2D/launcher.log` and its location is shown instead of failing silently. See the [first-run guide](docs/first_run_zh.md).
+On Windows, after the doctor is green, double-click `启动_LamellarSAXS2D.cmd` or run `.\启动_LamellarSAXS2D.cmd --check`. The launcher uses `.venv-project` / `.venv` / `venv` first and writes start-up failures to a per-user `LamellarSAXS2D/launcher.log`. Details: [first-run guide](docs/first_run_zh.md).
 
 ## Quick start
-
-Create a deterministic synthetic pattern and open it in the workbench:
 
 ```bash
 bsaxs-doctor --require-ui
@@ -90,101 +70,81 @@ bsaxs inspect synthetic.npz
 bsaxs-gui synthetic.npz
 ```
 
-`bsaxs gui synthetic.npz` remains supported; `bsaxs-gui` uses the crash-visible desktop entry point.
-
-Analyze one calibrated detector frame:
+Calibrated detector frame — geometry / butterfly measurement (not `--full2d`):
 
 ```bash
-bsaxs inspect data/frame_0001.cbf --poni geometry/detector.poni
-bsaxs analyze data/frame_0001.cbf --poni geometry/detector.poni --full2d -o results/frame_0001
+bsaxs inspect data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy
+bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
+  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --butterfly-stage evaluate --butterfly-resamples 0 \
+  -o results/frame_0001
 ```
 
-Track a sequence with quality-gated warm starts:
+Folder of frames:
 
 ```bash
-bsaxs batch "data/frame_*.cbf" --poni geometry/detector.poni \
-  -o results/batch --mode warm_start --checkpoint results/checkpoint.json
+bsaxs batch "data/frame_*.edf" --poni geometry/detector.poni --mask masks/detector.npy \
+  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --butterfly-stage evaluate --mode independent \
+  -o results/batch --checkpoint results/checkpoint.json
 ```
 
-Validate a real-data package before any fit starts:
+Read-only package check before fitting real data:
 
 ```bash
 bsaxs preflight data/package --manifest manifest.csv \
-  --poni geometry.poni --mask mask.npy \
-  -o results/validation/preflight
+  --poni geometry.poni --mask mask.npy -o results/preflight
 ```
 
-Generate P3 benchmark evidence without fitting real data:
+`bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs gui` remains an alias of `bsaxs-gui`.
 
-```bash
-bsaxs benchmark --suite t1 --seed 20260828 -o results/validation/t1
-bsaxs benchmark --suite t2 --shape 256x256 --seed 20260828 -o results/validation/t2
-```
+## Names
 
-Create an R0 blind-annotation pack and inspect the P3 evidence gate (both are read-only with respect to source data):
+| Shown to people | Stable machine name |
+| --- | --- |
+| LamellarSAXS2D | PyPI / wheel: `butterfly-saxs` |
+| | Import: `butterfly_saxs` |
+| | CLI: `bsaxs`, `bsaxs-doctor`, `bsaxs-gui` |
 
-```bash
-bsaxs annotation-pack <R0-package> --rt-manifest <RT-manifest> \
-  --hold-manifest <hold-manifest> -o results/validation/annotations/r0_pilot
-bsaxs p3-status --t1-manifest <T1-truth_manifest.json> \
-  --t2-manifest <T2-truth_manifest.json> \
-  --annotation-status <annotation_status.json> \
-  --thresholds <acceptance_thresholds.json> \
-  -o results/validation/p3_gate/p3_gate_report.json
-```
+## Documentation
 
-`annotation-pack` prepares eight fixed blind frames with pre-filled identity columns (`blind_id`, coordinate system, and PNG hash); the actual annotation fields remain to be completed. `p3-status` reports `go`/`no_go` from the supplied evidence. A final thresholds file requires each `evidence_sources` record to bind reproducible per-frame human errors, hashed instrument-calibration evidence, or eight consensus-linked pilot results. The gate does not run fitting, freeze thresholds, or forcibly prevent a later-stage command. See the [first-run guide](docs/first_run_zh.md), [user guide](docs/user_guide_zh.md), [P3 benchmark protocol](docs/validation/benchmark_protocol.md), [scientific definitions and limits](docs/scientific_basis_zh.md), and [architecture](docs/architecture_zh.md) for complete contracts.
-
-## Compatibility names
-
-`LamellarSAXS2D` is the application display name. Existing programmatic interfaces remain stable:
-
-- Python distribution: `butterfly-saxs`
-- Import package: `butterfly_saxs`
-- Main command-line program: `bsaxs`
-- Environment diagnostic: `bsaxs-doctor`
-- Crash-visible graphical entry point: `bsaxs-gui`
-- Existing machine-readable provenance identifiers and project/output contracts
+| Topic | Page |
+| --- | --- |
+| First launch and recommended UI order | [docs/first_run_zh.md](docs/first_run_zh.md) |
+| CLI, TOML, batch, masks, exports | [docs/user_guide_zh.md](docs/user_guide_zh.md) |
+| Butterfly arcs and publication rules | [docs/butterfly_arcs_zh.md](docs/butterfly_arcs_zh.md) |
+| Symbols, units, and interpretation limits | [docs/scientific_basis_zh.md](docs/scientific_basis_zh.md) |
+| Architecture | [docs/architecture_zh.md](docs/architecture_zh.md) |
+| Lamellar studio / publication artboards | [docs/lamellar_workbench_zh.md](docs/lamellar_workbench_zh.md), [docs/publication_figures_zh.md](docs/publication_figures_zh.md) |
+| P3 / P4 evidence | [docs/validation/benchmark_protocol.md](docs/validation/benchmark_protocol.md) |
 
 ## Scientific scope
 
-The symmetric ellipses and optional `full2d` model are empirical reciprocal-space measurement/refinement models. A successful fit does **not** uniquely recover a three-dimensional lamellar structure or establish a deformation mechanism from one 2D pattern. Structural interpretation requires explicit geometric assumptions and independent experimental evidence.
+The double ellipse is an **empirical reciprocal-space measurement**, following the Wang/Grubb picture of a butterfly as a pair of origin-centred ellipses. One 2D pattern does not uniquely recover a 3D lamellar stack or a deformation mechanism.
 
-The implementation is informed by the ellipse and lamellar-pattern analysis discussed by [Wang, Murthy & Grubb (2007), *“Butterfly” small-angle X-ray scattering patterns in semicrystalline polymers are double-elliptical*](https://doi.org/10.1016/j.polymer.2007.04.026), [Grubb, Murthy & Francescangeli (2016)](https://doi.org/10.1002/polb.23930), and [Grubb et al. (2021)](https://doi.org/10.1016/j.polymer.2021.123566). The papers themselves are not redistributed in this repository.
+- [Wang, Murthy & Grubb (2007)](https://doi.org/10.1016/j.polymer.2007.04.026)
+- [Grubb, Murthy & Francescangeli (2016)](https://doi.org/10.1002/polb.23930)
+- [Grubb et al. (2021)](https://doi.org/10.1016/j.polymer.2021.123566)
+
+The papers are not redistributed here.
 
 ---
 
 ## 中文说明
 
-LamellarSAXS2D 面向取向层片体系的各向异性二维 SAXS 花样，提供从像素、剖面、峰脊线到镜像双椭圆和整幅经验强度模型的定量测量，并可跟踪原位序列中的参数演化。软件保留输入强度的数值尺度；当提供 PONI 文件时，通过 pyFAI 生成物理 `q/chi/qx/qy` 坐标。
+LamellarSAXS2D 面向取向层片的各向异性二维 SAXS 蝴蝶纹：用 PONI（pyFAI）得到物理 `q/chi/qx/qy`，识别观测弧，并只发表图像真正支持的量。
 
-### 主要能力
+多数实验帧给出的是**一阶环周期**（`q*` 与 **环 L**）。只有内凹椭圆真正成立时，才显示表观 `a`、`b/a`、`θ`，以及未发表的 **Ln / Lz / 长轴 L** 候选。贴在 `flat_ellipse` 上下界、或长轴超出一阶脊线范围的解，按 **仅环** 处理，不会把求解器的倾角或环 L 写进 Ln 列。`success=True` 不是科学验收；像素 q 不能冒充物理周期；缺失象限不会被镜像补齐。
 
-- “实空间片层”页自动接入径向峰与已有拟合结果，联动二维投影、原生三维薄板及实验序列；支持单/多堆栈、候选值预览、撤销/重做和可追溯出图。详见[片层工作台指南](docs/lamellar_workbench_zh.md)。厚度、横向尺寸及出平面排列均保留为示意假设。
-- 0.4 新增[发表画板](docs/publication_figures_zh.md)：平直微倒角片层、哑光材质、均衡光照、结构主图与 SAXS 组合版式，以及保留矢量文字的 600 dpi 高清输出。
+### 安装与启动
 
-- 读取 CBF、EDF、TIF/TIFF、NPY、NPZ、HDF5、CSV/TXT，并显式选择帧或数据集。
-- 使用 PONI、外部 mask 和排除 ROI 管理真实探测器几何与有效像素。
-- 在拟合前只读检查数据包、manifest、PONI、mask、单位、校正/不确定度状态和输入哈希。
-- 生成 P3 同模型/独立 FFT 基准、8 帧盲标包，并提供缺证据即 No-Go 的只读证据门；是否进入下一阶段由团队依据报告决定。
-- 提取径向/方位剖面、lobe、ridge，并在 q 空间拟合共享中心和半轴的镜像双椭圆。
-- `flat_ellipse` 与 `very_flat_ellipse` 是可编辑的观测几何先验；`very_flat_ellipse` 默认 `b/a=0.005–0.35`，不会覆盖项目中已明确给出的边界。
-- 象限配对在 `(q-center)`/reference-axis 坐标中执行：QI+QIII 为一对，QII+QIV 为另一对。软件只使用实际观测到的 ridge 点，不用镜像点补齐缺失象限；缺失对侧、短弧和外推都会保留在 flags/quality/coverage 诊断中。
-- `azimuthal_peak` 表示 q annulus 内的观测方位最大值；`radial_peak`/lobe radial profile 才给出沿方位的径向 `q_star`。`full2d` 是另一个使用全有效像素的经验强度模型，三者不互相冒充。
-- 可选像素级 `full2d` 经验精修，支持参数边界、固定、表达式绑定、权重和残差诊断。
-- Qt 界面提供 Observed、Model、Residual、Overlay 四视图和可编辑参数表；人工修改参数后，Preview 会同步更新经验模型及 Overlay 中的模型双椭圆，Optimize 只作为当前单帧的可选辅助。
-- 右侧控制栏采用可滚动布局，并在顶部显示输入、q 标定、mask/ROI、结果状态及“建议下一步”；在笔记本或 980×680 窗口下，底部审核与快照控件仍可访问。
-- 顶栏 `语言 / Language` 菜单可在中文和 English 间即时切换；首次启动默认中文，选择保存在应用级 `QSettings` 中，不写入科研项目 JSON，也不改变参数、单位、flags 或审核状态码。
-- UI 可保存带备注的参数快照、恢复 Optimize 前状态，并由具名审核者显式 Accept/Reject 当前 Preview 或 Optimize；该人工会话状态不等于科学 PASS。`Export evidence…` 默认不覆盖，固定导出四张诊断图、参数 CSV、会话 JSON 和 provenance JSON。
-- 支持独立拟合或质量门控的 warm start、checkpoint 恢复、失败帧隔离及 CSV/JSON/NPZ 可审计导出。
-- `bsaxs-doctor` 在打开 GUI 前检查 Python 和核心/UI 依赖；Windows 启动器会记录 `pythonw` 阶段的 traceback，避免双击后无反馈。
-
-### 安装与使用
+支持 Python 3.11–3.13。Windows：
 
 ```powershell
 git clone https://github.com/D-sudoasd/LamellarSAXS2D.git
 cd LamellarSAXS2D
 py -3.13 -m venv .venv-project
+.\.venv-project\Scripts\python.exe -m pip install --upgrade pip
 .\.venv-project\Scripts\python.exe -m pip install `
   -c constraints\validation-py311-313.txt -e ".[all]"
 .\.venv-project\Scripts\bsaxs-doctor.exe --require-ui
@@ -192,24 +152,28 @@ py -3.13 -m venv .venv-project
 .\启动_LamellarSAXS2D.cmd
 ```
 
-终端分析命令保持不变：
+蝴蝶页建议顺序：**识别弧 → 评估**。详见[首次启动](docs/first_run_zh.md)。
+
+评估后可在「叠加图层」分别检查实测谱、观测轨迹、几何候选和全像素模型椭圆；峰位表区分原始最亮点 G 与受支持峰 P，选中行即可定位。导出同时包含干净叠加图、峰位图、局部放大、剖面及 CSV/NPZ 源数据。匹配差或参数不稳定时会保留明确提示，不能仅凭曲线看起来像蝴蝶判定拟合正确。详见[测量图与峰位导出](docs/butterfly_figures_zh.md)。
+
+### 常用命令
 
 ```bash
-bsaxs inspect data/frame_0001.cbf --poni geometry/detector.poni
-bsaxs analyze data/frame_0001.cbf --poni geometry/detector.poni --full2d -o results/frame_0001
-bsaxs-gui data/frame_0001.cbf --poni geometry/detector.poni
-bsaxs preflight data/package --manifest manifest.csv -o results/validation/preflight
+bsaxs inspect data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy
+bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
+  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --butterfly-stage evaluate --butterfly-resamples 0 -o results/frame_0001
+bsaxs batch "data/frame_*.edf" --poni geometry/detector.poni --mask masks/detector.npy \
+  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --butterfly-stage evaluate --mode independent -o results/batch
+bsaxs-gui data/frame_0001.edf --poni geometry/detector.poni
 ```
 
-支持的 Python 版本为 3.11–3.13；3.14 及更高版本不在本项目支持契约内。`annotation-pack` 用于从 R0 清单生成 8 帧只读盲标包，`p3-status` 用于汇总 T1/T2/人工证据并报告 `go`/`no_go`，`p4-evaluate` 用于运行 ridge/lobe/双椭圆工程验证；这些工程报告不替代人工拟合接受或科学证据门。首次启动与标准界面流程见[首次启动指南](docs/first_run_zh.md)，其余详见 [P3 基准协议](docs/validation/benchmark_protocol.md) 和[操作与输入输出指南](docs/user_guide_zh.md)。
+`--full2d` 才是可选的整幅经验强度精修，与蝴蝶几何测量不是同一条路径。批处理表用「警告 · 仅环 / 椭圆」区分发表状态；环 L 与 Ln 候选分列。
 
-批处理、mask、项目配置、字段和失败恢复见[操作与输入输出指南](docs/user_guide_zh.md)；模型参数、单位和可解释性边界见[科学量与解释边界](docs/scientific_basis_zh.md)。
+公开展示名是 `LamellarSAXS2D`；安装包仍为 `butterfly-saxs`，导入仍为 `butterfly_saxs`，主命令仍为 `bsaxs`。
 
-### 科学边界与兼容性
-
-椭圆拟合和 `full2d` 成功，只说明当前经验模型能够描述所选有效像素，不等于完成唯一的三维结构反演或机制判定。跨帧比较应保持 q 标定、mask、权重和配置一致，并结合独立实验解释。
-
-公开展示名为 `LamellarSAXS2D`；为保持现有用户脚本和结果兼容，安装包仍为 `butterfly-saxs`，Python 包仍为 `butterfly_saxs`，主命令仍为 `bsaxs`。
+科学量、单位与不可扩大解释的边界见[科学量与解释边界](docs/scientific_basis_zh.md)；操作与导出见[用户指南](docs/user_guide_zh.md)。
 
 ## License
 
