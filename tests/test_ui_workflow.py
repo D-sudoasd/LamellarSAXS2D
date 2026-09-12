@@ -733,7 +733,9 @@ def test_optimize_pre_snapshot_is_detached_and_stale_result_cannot_change_candid
         def optimize(self, *, parameters, payload):
             del parameters
             self.started.set()
-            self.release.wait(2.0)
+            # Remain active until the test releases this worker; a wall-clock
+            # deadline could finish before cancellation on a busy CI runner.
+            self.release.wait()
             cancel_event = payload.get("cancel_event") if isinstance(payload, dict) else None
             self.saw_cancel = bool(cancel_event is not None and cancel_event.is_set())
             return {"parameters": {"theta_deg": {"value": 5.0, "unit": "degree"}}}
@@ -743,25 +745,29 @@ def test_optimize_pre_snapshot_is_detached_and_stale_result_cannot_change_candid
     qtbot.addWidget(window)
     observed = np.arange(12, dtype=float).reshape(3, 4)
     window.set_observed_data(observed)
-    window.request_optimize()
-    qtbot.waitUntil(engine.started.is_set, timeout=2_000)
-    before = window._fit_session["optimize_before"]
+    try:
+        window.request_optimize()
+        qtbot.waitUntil(engine.started.is_set, timeout=10_000)
+        before = window._fit_session["optimize_before"]
 
-    assert before["parameters"]["theta_deg"]["value"] == pytest.approx(10.0)
-    # The GUI snapshot retains selectors/configuration only; detector-sized
-    # arrays remain owned by the loaded frame/service and are never copied on
-    # the event thread.
-    assert "data" not in before["input"]
-    observed[0, 0] = 999.0
-    assert before["input"].get("path") is None or before["input"].get("path") == window._source_path
+        assert before["parameters"]["theta_deg"]["value"] == pytest.approx(10.0)
+        # The snapshot retains selectors/configuration, not detector arrays.
+        assert "data" not in before["input"]
+        observed[0, 0] = 999.0
+        assert before["input"].get("path") is None or before["input"].get("path") == window._source_path
 
-    window.cancel_jobs()
-    engine.release.set()
-    qtbot.waitUntil(lambda: not window._workers, timeout=2_000)
-    assert engine.saw_cancel is True
-    assert window.parameters["theta_deg"] == pytest.approx(10.0)
-    assert window._fit_session["optimize_after"] is None
-    window.close()
+        window.cancel_jobs()
+        engine.release.set()
+        qtbot.waitUntil(lambda: not window._workers, timeout=10_000)
+        assert engine.saw_cancel is True
+        assert window.parameters["theta_deg"] == pytest.approx(10.0)
+        assert window._fit_session["optimize_after"] is None
+    finally:
+        # Assertion failures must not leave a blocked QThreadPool worker.
+        window.cancel_jobs()
+        engine.release.set()
+        qtbot.waitUntil(lambda: not window._workers, timeout=10_000)
+        window.close()
 
 
 def test_optimize_review_requires_explicit_reviewer_and_edit_invalidates_status(qtbot) -> None:
