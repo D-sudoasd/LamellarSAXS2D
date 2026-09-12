@@ -32,6 +32,7 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
       MPLBACKEND: Agg
+      MPLCONFIGDIR: ${{ runner.temp }}/matplotlib
       PYTHONUTF8: "1"
       PYTHONIOENCODING: utf-8
       OMP_NUM_THREADS: "1"
@@ -46,11 +47,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install Linux Qt runtime
+      - name: Install Linux Qt runtime and CJK fonts
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y libegl1
+          sudo apt-get install --no-install-recommends -y libegl1 fonts-noto-cjk
 
       - name: Install dependencies
         run: |

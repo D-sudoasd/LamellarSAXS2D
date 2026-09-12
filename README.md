@@ -59,6 +59,8 @@ python -m venv .venv-project
 
 Core-only: `python -m pip install -e .` then `bsaxs-doctor` without `--require-ui`.
 
+For Chinese figure text on Debian/Ubuntu, install a CJK font: `sudo apt-get install fonts-noto-cjk`. The renderer selects an installed CJK font; CI installs Noto CJK so missing-glyph checks run on Linux as well as Windows.
+
 On Windows, after the doctor is green, double-click `启动_LamellarSAXS2D.cmd` or run `.\启动_LamellarSAXS2D.cmd --check`. The launcher uses `.venv-project` / `.venv` / `venv` first and writes start-up failures to a per-user `LamellarSAXS2D/launcher.log`. Details: [first-run guide](docs/first_run_zh.md).
 
 ## Quick start

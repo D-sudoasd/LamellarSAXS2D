@@ -10,16 +10,16 @@ renderer never regenerates a second approximation from centre/size values.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 import numpy as np
-from matplotlib import font_manager
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.font_manager import FontProperties
 from matplotlib.patches import Polygon
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+from .font_support import font_properties
 
 
 _OFFWHITE = "#faf8f4"
@@ -122,26 +122,7 @@ def _font() -> FontProperties:
     and applications that own their own style sheet.
     """
 
-    candidates = (
-        Path(r"C:\Windows\Fonts\msyh.ttc"),
-        Path(r"C:\Windows\Fonts\simhei.ttf"),
-        Path(r"C:\Windows\Fonts\simsun.ttc"),
-        Path(r"C:\Windows\Fonts\NotoSansCJK-Regular.ttc"),
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            try:
-                return FontProperties(fname=str(candidate))
-            except (OSError, ValueError):
-                continue
-    try:
-        path = font_manager.findfont(
-            FontProperties(family=["Noto Sans CJK SC", "Microsoft YaHei", "DejaVu Sans"]),
-            fallback_to_default=True,
-        )
-        return FontProperties(fname=path)
-    except (OSError, ValueError):  # pragma: no cover - defensive matplotlib path
-        return FontProperties(family="DejaVu Sans")
+    return font_properties(size=None, language="zh")
 
 
 def _title_suffix(scene: Any, language: str) -> str:

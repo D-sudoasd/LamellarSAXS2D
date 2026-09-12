@@ -7,13 +7,13 @@ import numpy as np
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.colors import LogNorm, Normalize
 from matplotlib.figure import Figure
-from matplotlib.font_manager import FontProperties
 from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon, Rectangle
 from matplotlib.text import Annotation
 from matplotlib.ticker import MaxNLocator
 from scipy.spatial import ConvexHull
 
+from .font_support import font_properties
 from .publication_geometry import camera_basis, project_points
 from .publication_models import PublicationFigureSpec, PublicationRenderResult, PublicationStyle
 
@@ -26,8 +26,7 @@ def _get(value, name, default=None):
 
 
 def _font(size=6.5, *, weight="normal", language="en"):
-    families = ["Microsoft YaHei", "DejaVu Sans"] if language.startswith("zh") else ["Arial", "DejaVu Sans"]
-    return FontProperties(family=families, size=size, weight=weight)
+    return font_properties(size=size, weight=weight, language=language)
 
 
 def _scene_status(scene):
