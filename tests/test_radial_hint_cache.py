@@ -122,6 +122,23 @@ def test_cache_does_not_retain_geometry_over_its_memory_budget() -> None:
 
     assert cache._bin_indices is None
     assert cache._radii is None
+    assert not any(isinstance(value, np.ndarray) for value in vars(cache).values())
+
+
+def test_cache_budget_boundary_accounts_for_all_retained_arrays() -> None:
+    _qx, _qy, q, intensity = _case()
+    valid = np.ones(q.shape, dtype=bool)
+    cache = _RadialHintGeometryCache()
+    _first_order_q_hint(q, intensity, valid, .05, .50, geometry_cache=cache)
+    retained = [value for value in vars(cache).values() if isinstance(value, np.ndarray)]
+    assert retained and all(not value.flags.writeable for value in retained)
+    required = sum(value.nbytes for value in retained)
+    exact = _RadialHintGeometryCache(max_bytes=required)
+    too_small = _RadialHintGeometryCache(max_bytes=required - 1)
+    _first_order_q_hint(q, intensity, valid, .05, .50, geometry_cache=exact)
+    _first_order_q_hint(q, intensity, valid, .05, .50, geometry_cache=too_small)
+    assert sum(value.nbytes for value in vars(exact).values() if isinstance(value, np.ndarray)) == required
+    assert not any(isinstance(value, np.ndarray) for value in vars(too_small).values())
 
 
 @pytest.mark.parametrize(

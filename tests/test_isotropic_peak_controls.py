@@ -256,14 +256,18 @@ def test_start_stop_window_aliases_match_canonical_q_window_pairs() -> None:
 def test_nonfinite_q_and_observation_samples_are_excluded_from_reference() -> None:
     qx, qy = _q_map(161)
     observed = _ring(qx, qy)
-    qx[0, 0] = np.nan
-    qy[1, 1] = np.inf
-    observed[2, 2] = np.nan
+    baseline = _analyze(observed, qx, qy)
+    for row in (80, 81, 82):
+        assert .15 < np.hypot(qx[row, 120], qy[row, 120]) < .29
+    qx[80, 120] = np.nan
+    qy[81, 120] = np.inf
+    observed[82, 120] = np.nan
 
     result = _analyze(observed, qx, qy)
 
     assert result["peak_count"] == 0
-    assert result["domain"]["raw_search_pixel_count"] < qx.size
+    assert result["domain"]["raw_search_pixel_count"] == baseline["domain"]["raw_search_pixel_count"] - 3
+    assert result["domain"]["signal_pixel_count"] == baseline["domain"]["signal_pixel_count"] - 3
 
 
 def test_signal_window_excludes_ring_from_lobes_but_keeps_raw_maximum() -> None:
