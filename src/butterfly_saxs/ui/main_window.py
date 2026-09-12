@@ -98,9 +98,9 @@ def _default_parameter_rows() -> list[ParameterRow]:
     """Return UI-only defaults when no engine parameter set is supplied."""
 
     return [
-        ParameterRow("q_center", 0.10, 0.0, None, True, "", "nm⁻¹"),
-        ParameterRow("q_major", 0.16, 0.0, None, True, "", "nm⁻¹"),
-        ParameterRow("q_minor", 0.08, 0.0, None, True, "", "nm⁻¹"),
+        ParameterRow("q_center", 0.10, 0.0, None, True, "", "pixel-q"),
+        ParameterRow("q_major", 0.16, 0.0, None, True, "", "pixel-q"),
+        ParameterRow("q_minor", 0.08, 0.0, None, True, "", "pixel-q"),
         # UI always exposes the angle in degrees.  Engines that use radians
         # can convert it in their adapter while retaining a stable, explicit
         # ``theta_deg`` name for project files and batch exports.
@@ -108,7 +108,7 @@ def _default_parameter_rows() -> list[ParameterRow]:
         ParameterRow("ellipticity", 2.0, 1.0, None, True, "", ""),
         ParameterRow("intensity", 1.0, 0.0, None, True, "", "a.u."),
         ParameterRow("background", 0.0, 0.0, None, True, "", "a.u."),
-        ParameterRow("ridge_width", 0.01, 0.0, None, True, "", "nm⁻¹"),
+        ParameterRow("ridge_width", 0.01, 0.0, None, True, "", "pixel-q"),
     ]
 
 
@@ -961,7 +961,12 @@ if QT_AVAILABLE:
             self.parameter_model.parameterChanged.connect(self._on_parameter_changed)
 
             self.setMinimumSize(980, 680)
-            self.resize(1440, 900)
+            screen = QtGui.QGuiApplication.primaryScreen()
+            available = screen.availableGeometry() if screen is not None else QtCore.QRect(0, 0, 1440, 900)
+            self.resize(
+                min(1440, max(self.minimumWidth(), available.width() - 48)),
+                min(900, max(self.minimumHeight(), available.height() - 72)),
+            )
             self._project_controller = ProjectDocumentController(
                 snapshot=self._snapshot_project_document,
                 restore=self._restore_project_document,
@@ -3758,6 +3763,8 @@ if QT_AVAILABLE:
             """Make every older worker result stale before changing input state."""
 
             self._generation.next()
+            for cancel_event in tuple(self._cancel_events.values()):
+                cancel_event.set()
             self._pending_input_records.clear()
             self._debounce_timer.stop()
             self._set_busy(False)
@@ -3779,6 +3786,12 @@ if QT_AVAILABLE:
                 self._last_result_input_records = None
                 self._last_error = None
                 self.last_metrics = {}
+                self._metric_display = {"rmse": "—", "ndata": "—", "coverage": "—"}
+                self._displayed_flags_text = "—"
+                if hasattr(self, "rmse_label"):
+                    self._render_metric_labels()
+                if hasattr(self, "ridge_table"):
+                    self._update_measurements({})
 
         def _clear_incompatible_external_mask(self, data: Any) -> bool:
             """Drop a file/combined mask when the incoming image shape changes."""
@@ -3853,9 +3866,25 @@ if QT_AVAILABLE:
             """Apply the active physical q unit to q-valued table rows."""
 
             unit = self._active_q_unit({"q_unit": q_unit}) if q_unit is not None else self._active_q_unit()
-            if not unit or unit.lower() in {"unknown", "pixel", "pixels", "pixel-q", "pixel_q"}:
+            if not unit:
                 return
-            q_names = {"a", "b", "q_center", "q_major", "q_minor", "radial_sigma", "radial_gamma", "radial_fwhm", "background_width"}
+            lowered = unit.lower()
+            if lowered in {"unknown", "pixel", "pixels", "pixel-q", "pixel_q"}:
+                unit = "pixel-q"
+            q_names = {
+                "a",
+                "b",
+                "cx",
+                "cy",
+                "q_center",
+                "q_major",
+                "q_minor",
+                "radial_sigma",
+                "radial_gamma",
+                "radial_fwhm",
+                "background_width",
+                "ridge_width",
+            }
             for row_index, row in enumerate(self.parameter_model.rows):
                 if row.name not in q_names or row.unit == unit:
                     continue

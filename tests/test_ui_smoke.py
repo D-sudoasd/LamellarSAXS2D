@@ -72,6 +72,39 @@ def test_workbench_offscreen_smoke(qtbot, tmp_path):
     window.close()
 
 
+def test_uncalibrated_parameter_units_are_pixel_q_not_nm(qtbot):
+    window = MainWindow(engine=_Engine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((8, 8)))
+    units = {row.name: row.unit for row in window.parameter_model.rows}
+    assert units["q_center"] == "pixel-q"
+    assert units["q_major"] == "pixel-q"
+    assert "nm" not in str(units["q_center"]).lower()
+    assert "q-map unit" not in window.ellipse_ratio_min_spin.toolTip()
+    window.close()
+
+
+def test_loading_new_image_clears_stale_fit_metrics(qtbot):
+    engine = _Engine()
+    window = MainWindow(engine=engine, auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    window.set_observed_data(np.ones((12, 12)))
+    window.request_preview()
+    qtbot.waitUntil(lambda: window.rmse_label.text().startswith("RMSE: 0.1"), timeout=2_000)
+    assert window.ndata_label.text() == "ndata: 144"
+    assert window.flags_label.text() == "flags: ok"
+    assert window.ridge_table.rowCount() == 2
+
+    window.set_observed_data(np.zeros((8, 8)))
+
+    assert window.rmse_label.text() == "RMSE: —"
+    assert window.ndata_label.text() == "ndata: —"
+    assert window.flags_label.text() == "flags: —"
+    assert window.ridge_table.rowCount() == 0
+    assert window.lobe_table.rowCount() == 0
+    window.close()
+
+
 def test_parameter_change_is_debounced(qtbot):
     engine = _Engine()
     window = MainWindow(

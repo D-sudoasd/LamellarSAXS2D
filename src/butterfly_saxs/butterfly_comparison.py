@@ -545,11 +545,11 @@ def _comparison_figure(
     )
     FigureCanvasAgg(fig)
     if width_mm == 89.0:
-        map_a = fig.add_axes([0.13, 0.77, 0.74, 0.18])
-        curve_ax = fig.add_axes([0.13, 0.53, 0.74, 0.18])
-        map_c = fig.add_axes([0.13, 0.29, 0.74, 0.18])
-        residual_ax = fig.add_axes([0.13, 0.05, 0.74, 0.14])
-        colorbar_ax = fig.add_axes([0.90, 0.29, 0.025, 0.66])
+        map_a = fig.add_axes([0.13, 0.78, 0.74, 0.17])
+        curve_ax = fig.add_axes([0.13, 0.55, 0.74, 0.17])
+        map_c = fig.add_axes([0.13, 0.32, 0.74, 0.16])
+        residual_ax = fig.add_axes([0.13, 0.04, 0.74, 0.12])
+        colorbar_ax = fig.add_axes([0.90, 0.32, 0.025, 0.63])
     else:
         row_h, top_y, bottom_y = 0.34, 0.57, 0.10
         map_a = fig.add_axes([0.055, top_y, 0.39, row_h])
@@ -623,7 +623,7 @@ def _comparison_figure(
         legend_position = (
             {"loc": "lower center", "bbox_to_anchor": (0.5, 1.05)}
             if width_mm == 183.0
-            else {"loc": "upper center", "bbox_to_anchor": (0.5, -0.28)}
+            else {"loc": "upper center", "bbox_to_anchor": (0.5, -0.38)}
         )
         map_c.legend(
             handles=[handle for handle, _label in legend_entries],
