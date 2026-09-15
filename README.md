@@ -100,6 +100,8 @@ bsaxs preflight data/package --manifest manifest.csv \
 
 `bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_LamellarSAXS2D.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
 
+Agents (and any non-interactive operator) should start with `bsaxs describe` or a bare `bsaxs`. That prints a JSON catalog of commands, exit codes, and scientific invariants. Environment checks: `bsaxs doctor --json` (same as `bsaxs-doctor`). Failed commands emit a JSON error envelope on stdout and a human `错误：` line on stderr. See [AGENTS.md](AGENTS.md).
+
 ## Names
 
 | Shown to people | Stable machine name |
@@ -113,6 +115,7 @@ bsaxs preflight data/package --manifest manifest.csv \
 | Topic | Page |
 | --- | --- |
 | First launch and recommended UI order | [docs/first_run_zh.md](docs/first_run_zh.md) |
+| Agent / automation CLI contract | [AGENTS.md](AGENTS.md) |
 | CLI, TOML, batch, masks, exports | [docs/user_guide_zh.md](docs/user_guide_zh.md) |
 | Butterfly arcs and publication rules | [docs/butterfly_arcs_zh.md](docs/butterfly_arcs_zh.md) |
 | Measurement / peak figures | [docs/butterfly_figures_zh.md](docs/butterfly_figures_zh.md) |
@@ -162,6 +165,8 @@ py -3.13 -m venv .venv-project
 ### 常用命令
 
 ```bash
+bsaxs describe
+bsaxs doctor --json
 bsaxs inspect data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy
 bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
   --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \

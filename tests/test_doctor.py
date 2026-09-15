@@ -43,6 +43,7 @@ def test_doctor_requires_only_requested_ui_dependencies() -> None:
     )
 
     assert core_report["ready"] is True
+    assert core_report["version"]
     assert ui_report["ready"] is False
     assert ui_report["required_failures"] == ["PySide6"]
 

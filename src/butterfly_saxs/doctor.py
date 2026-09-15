@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
+from . import __version__
+
 SUPPORTED_MIN = (3, 11)
 SUPPORTED_MAX_EXCLUSIVE = (3, 14)
 
@@ -352,6 +354,7 @@ def collect_diagnostics(
         "require_ui": bool(require_ui),
         "application": "LamellarSAXS2D",
         "distribution": "butterfly-saxs",
+        "version": str(__version__),
         "python": {
             "version": platform.python_version(),
             "executable": sys.executable,

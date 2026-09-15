@@ -31,7 +31,7 @@ from butterfly_saxs.project import ProjectConfig, load_project, save_project
 def test_cli_help_has_public_vertical_slice() -> None:
     parser = build_parser()
     assert parser.description.startswith("LamellarSAXS2D")
-    assert {"inspect", "analyze", "batch", "synthetic", "gui"}.issubset(
+    assert {"inspect", "analyze", "batch", "synthetic", "gui", "describe", "doctor"}.issubset(
         parser._subparsers._group_actions[0].choices
     )
     with pytest.raises(SystemExit) as error:

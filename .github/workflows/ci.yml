@@ -74,6 +74,8 @@ jobs:
       - name: CLI and environment smoke
         run: |
           python -m butterfly_saxs --help
+          bsaxs describe
+          bsaxs doctor --json
           bsaxs preflight --help
           bsaxs benchmark --help
           bsaxs annotation-pack --help

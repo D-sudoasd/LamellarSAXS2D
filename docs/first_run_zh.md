@@ -32,7 +32,10 @@ bsaxs-doctor --require-ui
 
 ```powershell
 bsaxs-doctor --require-ui --json
+bsaxs doctor --json
 ```
+
+`bsaxs doctor` 与 `bsaxs-doctor` 相同；无 GUI 时不要加 `--require-ui`。无子命令的 `bsaxs` 会打印 JSON 命令清单（`bsaxs describe`）。
 
 ## 3. Windows 启动
 
