@@ -11,24 +11,41 @@ import os
 import sys
 from typing import Any, Sequence
 
-import numpy as np
-
-from .pipeline import (
-    PipelineError,
-    analyze_frame,
-    inspect_frame,
-    launch_gui,
-    run_project,
-    run_project_bounded,
-    synthetic_butterfly,
+from .cancellation import AnalysisCancelled
+from .cli_contract import (
+    agent_manifest,
+    annotate_report,
+    cli_error_payload,
+    usage_error_payload,
 )
+from .errors import PipelineError
+from .path_utils import filter_supported_image_paths
 from .project import ProjectConfig, ProjectConfigError, load_project
 from .settings import deep_merge_mapping
-from .path_utils import filter_supported_image_paths
-from .analysis_config import normalize_ridge_method
 
 
-_DEFAULT_LEGACY_PROJECT_RUNNER = run_project
+def _pipeline_symbol(name: str) -> Any:
+    """Return a pipeline object, honouring test monkeypatches on this module.
+
+    ``bsaxs describe`` / ``bsaxs doctor`` / ``--help`` must not import NumPy.
+    Handlers load ``pipeline`` on demand.  Tests patch ``cli.analyze_frame``
+    and ``cli.run_project``; those names win over the live pipeline symbols.
+    """
+
+    patched = globals().get(name)
+    if patched is not None:
+        return patched
+    from . import pipeline as pipeline_module
+
+    return getattr(pipeline_module, name)
+
+
+# Patch seams for tests.  ``None`` means "import from pipeline on demand".
+analyze_frame = None
+inspect_frame = None
+run_project = None
+synthetic_butterfly = None
+launch_gui = None
 
 
 def _shape(value: str) -> tuple[int, int]:
@@ -224,7 +241,24 @@ def _print_json(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False))
 
 
-def _write_synthetic(array: np.ndarray, qmap: dict[str, Any], output: str | os.PathLike[str], *, force: bool) -> Path:
+def _emit_error(
+    exc: BaseException,
+    *,
+    exit_code: int,
+    command: str | None = None,
+    code: str | None = None,
+) -> None:
+    """Human stderr line plus a strict JSON envelope on stdout for agents."""
+
+    print(f"错误：{exc}", file=sys.stderr)
+    _print_json(
+        cli_error_payload(exc, exit_code=exit_code, command=command, code=code)
+    )
+
+
+def _write_synthetic(array: Any, qmap: dict[str, Any], output: str | os.PathLike[str], *, force: bool) -> Path:
+    import numpy as np
+
     destination = Path(output)
     if destination.exists() and not force:
         raise FileExistsError(f"输出已存在，未覆盖：{destination}（需要 --force）")
@@ -254,9 +288,36 @@ def _write_synthetic(array: np.ndarray, qmap: dict[str, Any], output: str | os.P
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bsaxs",
-        description="LamellarSAXS2D：蝴蝶状二维 SAXS 花样的定量测量与椭圆精修",
+        description=(
+            "LamellarSAXS2D：蝴蝶状二维 SAXS 花样的定量测量与椭圆精修。"
+            "无子命令时打印 agent 清单（bsaxs describe）。"
+        ),
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command", required=False)
+
+    describe_parser = sub.add_parser("describe", help="打印机器可读的命令、退出码与科学边界清单")
+    describe_parser.add_argument(
+        "--text",
+        action="store_true",
+        help="同时在 stderr 打印简短人类可读摘要；stdout 仍是 JSON",
+    )
+
+    doctor_parser = sub.add_parser("doctor", help="检查 Python 与依赖（同 bsaxs-doctor）")
+    doctor_parser.add_argument(
+        "--require-ui",
+        action="store_true",
+        help="Treat PySide6 and pyqtgraph as required.",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a strict machine-readable JSON report.",
+    )
+    doctor_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Print nothing; communicate readiness through the exit code.",
+    )
 
     inspect_parser = sub.add_parser("inspect", help="检查图像、q 空间和基础观测量")
     inspect_parser.add_argument("input", nargs="?", help="CBF/EDF/TIF/NPY/NPZ/HDF5 图像")
@@ -442,7 +503,7 @@ def _pick_input(args: argparse.Namespace, config: ProjectConfig | None) -> Any:
 def _handle_inspect(args: argparse.Namespace) -> int:
     config = _config(args.config)
     source = _pick_input(args, config)
-    report = inspect_frame(
+    report = _pipeline_symbol("inspect_frame")(
         source,
         poni=args.poni or (config.poni_path if config else None),
         config=config,
@@ -453,6 +514,7 @@ def _handle_inspect(args: argparse.Namespace) -> int:
         mask_dataset=args.mask_dataset,
         valid_mask=args.valid_mask,
     )
+    report = annotate_report(report, command="inspect", exit_code=0)
     if args.output:
         destination = Path(args.output)
         if destination.exists() and not args.force:
@@ -478,12 +540,14 @@ def _handle_analyze(args: argparse.Namespace) -> int:
             if analysis_target.suffix.lower() in {".json", ".npz", ".csv"} and analysis_target in figure_target.parents:
                 raise PipelineError("科研图目录不能放在分析输出文件内部；请选择独立目录")
         selected_method = overrides.get("ridge_method", (config.analysis if config else {}).get("ridge_method"))
+        from .analysis_config import normalize_ridge_method
+
         if selected_method is not None and normalize_ridge_method(selected_method) != "butterfly_curvature":
             raise PipelineError("科研图导出需要 --ridge-method butterfly_curvature")
         overrides["ridge_method"] = "butterfly_curvature"
     config = _with_analysis(config, overrides)
     source = _pick_input(args, config)
-    result = analyze_frame(
+    result = _pipeline_symbol("analyze_frame")(
         source,
         poni=args.poni or (config.poni_path if config else None),
         config=config,
@@ -547,10 +611,18 @@ def _handle_analyze(args: argparse.Namespace) -> int:
             analysis_paths = export_result(result, args.output, force=args.force)
             result.output_paths.extend(str(path) for path in analysis_paths)
     report = result.to_mapping()
-    _print_json(report)
     from .batch import _quality_failure_reason
 
-    return 1 if _quality_failure_reason(report) is not None else 0
+    quality_reason = _quality_failure_reason(report)
+    exit_code = 1 if quality_reason is not None else 0
+    report = annotate_report(
+        report,
+        command="analyze",
+        exit_code=exit_code,
+        quality_gate_reason=quality_reason,
+    )
+    _print_json(report)
+    return exit_code
 
 
 def _handle_batch(args: argparse.Namespace) -> int:
@@ -727,7 +799,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
             selected_dataset = getattr(frame_ref, "dataset", None)
             if selected_dataset is None:
                 selected_dataset = getattr(frame_ref, "dataset_id", None) or None
-        return analyze_frame(
+        return _pipeline_symbol("analyze_frame")(
             source,
             poni=poni,
             config=config,
@@ -834,14 +906,18 @@ def _handle_batch(args: argparse.Namespace) -> int:
         "total_count": run.total_count,
         "outputs": {key: str(path) for key, path in exports.items()},
     }
+    exit_code = 1 if run.failures else 0
+    report = annotate_report(report, command="batch", exit_code=exit_code)
     _print_json(report)
     # Partial exports remain available for inspection, while automation gets
     # an honest non-zero status when any frame failed its load/fit quality gate.
-    return 1 if run.failures else 0
+    return exit_code
 
 
 def _handle_synthetic(args: argparse.Namespace) -> int:
-    array, qmap = synthetic_butterfly(
+    import numpy as np
+
+    array, qmap = _pipeline_symbol("synthetic_butterfly")(
         args.shape,
         q0=args.q0,
         width=args.width,
@@ -852,20 +928,25 @@ def _handle_synthetic(args: argparse.Namespace) -> int:
         return_qmap=True,
     )
     destination = _write_synthetic(array, qmap, args.output, force=args.force) if args.output else None
-    report = {
-        "shape": list(array.shape),
-        "dtype": str(array.dtype),
-        "output": os.fspath(destination) if destination else None,
-        "intensity_min": float(np.min(array)),
-        "intensity_max": float(np.max(array)),
-        "seed": args.seed,
-        "flags": {
-            "empirical_model_only": True,
-            "mechanism_under_determined": True,
-            "forward_simulation_only": True,
-            "nonunique_inverse_problem": True,
+    report = annotate_report(
+        {
+            "shape": list(array.shape),
+            "dtype": str(array.dtype),
+            "output": os.fspath(destination) if destination else None,
+            "intensity_min": float(np.min(array)),
+            "intensity_max": float(np.max(array)),
+            "seed": args.seed,
+            "flags": {
+                "empirical_model_only": True,
+                "mechanism_under_determined": True,
+                "forward_simulation_only": True,
+                "nonunique_inverse_problem": True,
+                "uncalibrated_pixel_q": True,
+            },
         },
-    }
+        command="synthetic",
+        exit_code=0,
+    )
     _print_json(report)
     return 0
 
@@ -873,7 +954,7 @@ def _handle_synthetic(args: argparse.Namespace) -> int:
 def _handle_gui(args: argparse.Namespace) -> int:
     config = _config(args.config)
     return int(
-        launch_gui(
+        _pipeline_symbol("launch_gui")(
             input_path=args.input,
             poni=args.poni or (config.poni_path if config else None),
             config=config,
@@ -1012,70 +1093,123 @@ def _handle_p4_evaluate(args: argparse.Namespace) -> int:
     return 0 if report["p4_go_no_go"] == "GO" else 1
 
 
+def _handle_describe(args: argparse.Namespace) -> int:
+    report = agent_manifest()
+    if getattr(args, "text", False):
+        tool = report["tool"]
+        print(
+            (
+                f"{tool['name']} {tool['version']} agent catalog\n"
+                "Run commands via `bsaxs <command>`. JSON stdout; exit 0/1/2.\n"
+                "success=True is not scientific acceptance. pixel-q is not a period."
+            ),
+            file=sys.stderr,
+        )
+    _print_json(report)
+    return 0
+
+
+def _handle_doctor(args: argparse.Namespace) -> int:
+    from .doctor import main as doctor_main
+
+    argv: list[str] = []
+    if args.require_ui:
+        argv.append("--require-ui")
+    if args.json:
+        argv.append("--json")
+    if args.quiet:
+        argv.append("--quiet")
+    return int(doctor_main(argv))
+
+
+def _handle_project(args: argparse.Namespace) -> int:
+    # Tests patch ``cli.run_project``.  Unpatched CLI uses the bounded runner.
+    project_runner = globals().get("run_project")
+    if project_runner is None:
+        project_runner = _pipeline_symbol("run_project_bounded")
+    run = project_runner(args.config, force=args.force)
+    compact_records = []
+    for item in run.frame_results:
+        record = item.to_record()
+        if hasattr(item.result, "to_mapping"):
+            record["result"] = item.result.to_mapping()
+        compact_records.append(record)
+    if args.legacy_json:
+        _print_json(compact_records)
+        return 1 if run.failures else 0
+    exit_code = 1 if run.failures else 0
+    report = annotate_report(
+        {
+            "schema_version": "lamellarsaxs2d.project_run.v2",
+            "mode": run.mode,
+            "input_hash": run.input_hash,
+            "config_hash": run.config_hash,
+            "frames": compact_records,
+            "n_frames": len(run.frame_results),
+            "n_success": len(run.successful),
+            "n_failed": len(run.failures),
+            "checkpoint": (
+                str(run.checkpoint) if run.checkpoint is not None else None
+            ),
+        },
+        command="project",
+        exit_code=exit_code,
+    )
+    _print_json(report)
+    return exit_code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
     try:
-        if args.command == "inspect":
-            return _handle_inspect(args)
-        if args.command == "analyze":
-            return _handle_analyze(args)
-        if args.command == "batch":
-            return _handle_batch(args)
-        if args.command == "synthetic":
-            return _handle_synthetic(args)
-        if args.command == "gui":
-            return _handle_gui(args)
-        if args.command == "project":
-            # The CLI uses the bounded runner explicitly.  Keep the legacy
-            # symbol as an injection seam for older callers/tests that patch
-            # ``cli.run_project``.
-            project_runner = (
-                run_project
-                if run_project is not _DEFAULT_LEGACY_PROJECT_RUNNER
-                else run_project_bounded
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        code = 0 if exc.code is None else int(exc.code)
+        if code == 0:
+            raise
+        _print_json(
+            usage_error_payload(
+                "invalid command or arguments; run `bsaxs describe` or `bsaxs --help`"
             )
-            run = project_runner(args.config, force=args.force)
-            compact_records = []
-            for item in run.frame_results:
-                record = item.to_record()
-                if hasattr(item.result, "to_mapping"):
-                    record["result"] = item.result.to_mapping()
-                compact_records.append(record)
-            if args.legacy_json:
-                _print_json(compact_records)
-            else:
-                _print_json(
-                    {
-                        "schema_version": "lamellarsaxs2d.project_run.v2",
-                        "mode": run.mode,
-                        "input_hash": run.input_hash,
-                        "config_hash": run.config_hash,
-                        "frames": compact_records,
-                        "n_frames": len(run.frame_results),
-                        "n_success": len(run.successful),
-                        "n_failed": len(run.failures),
-                        "checkpoint": (
-                            str(run.checkpoint) if run.checkpoint is not None else None
-                        ),
-                    }
-                )
-            return 1 if run.failures else 0
-        if args.command == "preflight":
+        )
+        return 2
+
+    command = args.command or "describe"
+    try:
+        if command == "describe":
+            return _handle_describe(args)
+        if command == "doctor":
+            return _handle_doctor(args)
+        if command == "inspect":
+            return _handle_inspect(args)
+        if command == "analyze":
+            return _handle_analyze(args)
+        if command == "batch":
+            return _handle_batch(args)
+        if command == "synthetic":
+            return _handle_synthetic(args)
+        if command == "gui":
+            return _handle_gui(args)
+        if command == "project":
+            return _handle_project(args)
+        if command == "preflight":
             return _handle_preflight(args)
-        if args.command == "benchmark":
+        if command == "benchmark":
             return _handle_benchmark(args)
-        if args.command == "annotation-pack":
+        if command == "annotation-pack":
             return _handle_annotation_pack(args)
-        if args.command == "p3-status":
+        if command == "p3-status":
             return _handle_p3_status(args)
-        if args.command == "p4-evaluate":
+        if command == "p4-evaluate":
             return _handle_p4_evaluate(args)
-        parser.error(f"未知命令：{args.command}")
+        parser.error(f"未知命令：{command}")
+    except AnalysisCancelled as exc:
+        _emit_error(exc, exit_code=1, command=command, code="cancelled")
+        return 1
     except (PipelineError, ProjectConfigError, FileExistsError, OSError, ValueError) as exc:
-        print(f"错误：{exc}", file=sys.stderr)
+        _emit_error(exc, exit_code=2, command=command)
         return 2
     return 2
 
 
-__all__ = ["build_parser", "main"]
+__all__ = ["build_parser", "main", "PipelineError"]

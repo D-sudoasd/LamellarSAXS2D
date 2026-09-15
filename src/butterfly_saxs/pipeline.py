@@ -36,10 +36,7 @@ from .cancellation import AnalysisCancelled, raise_if_cancelled
 from .path_utils import filter_supported_image_paths
 from .csv_utils import safe_csv_cell
 from .public_ellipse import canonical_ellipse_payload
-
-
-class PipelineError(RuntimeError):
-    """A user-facing, recoverable pipeline error."""
+from .errors import PipelineError
 
 
 def _config_value(config: Any, name: str, default: Any = None) -> Any:

@@ -13,6 +13,8 @@ python -m venv .venv-project
 
 安装后的 `bsaxs` 与 `python -m butterfly_saxs` 是同一 CLI。Windows 下建议直接使用 `.\.venv-project\Scripts\bsaxs.exe`；双击 `启动_LamellarSAXS2D.cmd` 也只使用这个已验证环境。旧 `.venv` 不会被删除或自动修复。
 
+无子命令时 `bsaxs` 打印 JSON 命令清单（与 `bsaxs describe` 相同）：命令、退出码 `0/1/2`、推荐工作流与不可违反的科学边界。`bsaxs doctor --json` 与 `bsaxs-doctor --json` 等价。失败时 stdout 仍是 JSON 错误信封（`lamellarsaxs2d.cli_error.v1`），stderr 保留人类可读的 `错误：` 行。Agent 操作说明见仓库根目录 [AGENTS.md](../AGENTS.md)。
+
 ### 常用单帧命令
 
 PONI 是物理 q 坐标的校准输入，CBF、EDF、TIF/TIFF 的最小示例：
