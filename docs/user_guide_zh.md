@@ -242,12 +242,31 @@ PowerShell 中若使用通配符，建议加引号让 CLI 自己展开；CLI 也
   --series hold_375C --range 60:120:2 --stream
 ```
 
+无人值守分析使用同一 `batch` 入口，加 `--unattended PACKAGE` 串联逐帧预检、逐环花瓣脊线识别、双椭圆候选评估、流式批次导出和检查点。`PACKAGE` 是原始数据包根目录，应包含所选图像、PONI 与 mask；输出必须在数据包外。首次运行指定新的输出目录，恢复时原命令加 `--resume`：
+
+```powershell
+.\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\package\images\*.edf" `
+  --unattended data\package --poni data\package\geometry\detector.poni `
+  --mask data\package\masks\detector.npy --manifest data\package\sequence.csv `
+  -o results\unattended_001 --mode independent
+
+# 中断或失败后：仅在输入、PONI、mask 与科学配置未改变时恢复；失败帧会重试。
+.\.venv-project\Scripts\python.exe -m butterfly_saxs batch "data\package\images\*.edf" `
+  --unattended data\package --poni data\package\geometry\detector.poni `
+  --mask data\package\masks\detector.npy --manifest data\package\sequence.csv `
+  -o results\unattended_001 --mode independent --resume
+```
+
+该模式缺省选择 `butterfly_curvature` 工作流、`annular_peak` 逐环提峰、`evaluate` 阶段与 0 次重采样；TOML 或显式 CLI 科学参数仍可覆盖具体追踪设置，但不能把无人值守工作流切换为非蝴蝶方法或仅 trace。`--full2d` 仍须显式指定，表示另做整幅像素强度拟合。可用 `-c project.toml` 固定 q 窗口等分析参数，`--preflight-context` 提供数据包背景。运行时预检只读取原始数据，将证据写入 `preflight/`；红灯阻止拟合并返回 2，黄灯继续保留批次证据但最终返回 1。`checkpoint.json`、CSV/JSONL、`results.npz` 与 `evolution.png` 写到输出目录；stdout 只列逐帧状态与证据路径，完整数值读导出文件。返回 0 只表示预检无警告且所有帧通过工程质量门，**不表示科学接受或发表许可**。
+
 `manifest` 可用 CSV/JSON 提供 `path`、`frame_id`、`time`、`order`、`dataset`、零基 `frame`（或 `frame_index`）等元数据。manifest 文件中的相对 `path` 按 manifest 所在目录解析。它可以让同一个 HDF5/NPZ/TIFF 容器中的不同 dataset/frame 成为独立批处理记录；这些选择器会传给实际读取器并进入 checkpoint 身份。没有 manifest 时使用自然文件名排序。`checkpoint` 记录输入内容 hash、配置 hash、模式和每帧控制状态；`--resume` 只有 hash/mode 相符时才恢复。
 配置 hash 还绑定 PONI、mask、valid-mask、sigma、weights 和 uncertainty 文件的当前 SHA-256 内容；文件被替换即使路径不变也会拒绝恢复。输入/校准/mask 源保持只读。
 
 `--series` 按 manifest 的 `series`/`series_id`/`group`/`sample` 或 FrameRef 的 `source` 精确筛选；`--start`、`--stop` 和 `--stride` 在筛选后的自然/manifest 顺序上工作，`stop` 包含在内。也可以用 `--range START:STOP[:STEP]` 一次声明范围，不能和三项分开参数混用。序列位置选择与容器内的 `--frame` 选择是两套独立语义。
 
 `--stream` 逐帧把 CSV、JSONL 和 NPZ 数组写入临时证据包，并释放已处理帧的 detector 数组；适合 1679×1475 或更大探测器的长序列。流式 checkpoint 仍只保存数组摘要。resume 会先验证上一轮 manifest、NPZ 元数据和声明的数组成员，再保留已恢复帧的原始数组，只替换实际重跑的帧；如果上一轮 bundle 没有可验证的 manifest/数组，会拒绝恢复。参数、ridge、lobe、椭圆和 flags 仍逐帧保留。取消请求会在当前帧结束后停止，并把 `cancelled`、`processed_count`、`elapsed_s` 与最后 checkpoint 写出。
+
+当椭圆的 `quantitative_parameters` 未给出全部可用的轴长与倾角时，批次参数表中由该椭圆推得的 `L_N`、`L_z` 和长轴周期的 `value` 留空；原始拟合数值仅写入带 `identifiability_status=undetermined` 的 `candidate_value`。径向反射环的独立周期字段不受这条椭圆门槛影响。
 
 恢复只接受 checkpoint 中 `status=ok` 且质量检查通过的帧；失败、质量 FAIL 或不完整帧会在恢复时重新读取和拟合，这是预期的 failed-frame retry 行为。若所有选中帧都能从已验证 checkpoint 恢复，stream exporter 会走 no-op fast path，保留原 NPZ 成员而不重新压缩；这只优化 I/O，不把质量 WARN/FAIL 改写成 PASS。
 

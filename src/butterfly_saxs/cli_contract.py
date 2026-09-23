@@ -195,6 +195,12 @@ def agent_guidance(
         failed = report.get("n_failed")
         if isinstance(failed, int) and failed > 0:
             next_steps.append("Inspect failed frames in stdout JSON and the output directory; remaining frames were isolated.")
+        if report.get("blocked_stage") == "preflight":
+            next_steps.append("Read preflight/preflight.json; fitting did not start.")
+        elif report.get("unattended"):
+            next_steps.append("Read preflight/preflight.json and frame_summary.csv; require complete NPZ metadata before using the batch evidence.")
+        if report.get("cancelled"):
+            next_steps.append("The batch was cancelled; resume only with the same inputs and scientific configuration.")
         next_steps.append("Keep PONI, mask, q-window, and config identical across the series.")
     elif command == "synthetic":
         next_steps.append("Synthetic arrays are empirical fixtures with pixel-q unless a PONI is supplied later.")
@@ -274,6 +280,7 @@ def agent_manifest() -> dict[str, Any]:
             "bsaxs analyze synthetic.npz --ridge-method butterfly_curvature "
             "--ellipse-preset flat_ellipse --butterfly-stage evaluate --butterfly-resamples 0",
             "bsaxs preflight PACKAGE --manifest MANIFEST --poni PONI --mask MASK -o results/preflight",
+            "bsaxs batch 'PACKAGE/images/*.edf' --unattended PACKAGE --manifest PACKAGE/manifest.csv --poni PACKAGE/geometry.poni --mask PACKAGE/mask.npy -o results/unattended_001",
         ],
         "commands": [
             {
@@ -305,7 +312,7 @@ def agent_manifest() -> dict[str, Any]:
             },
             {
                 "name": "batch",
-                "purpose": "Independent or quality-gated warm-start series with fail-closed overwrite.",
+                "purpose": "Independent or quality-gated warm-start series; --unattended adds preflight, streaming evidence and a checkpoint.",
                 "stdout": BATCH_RUN_SCHEMA,
                 "exit_codes": EXIT_CODES,
             },

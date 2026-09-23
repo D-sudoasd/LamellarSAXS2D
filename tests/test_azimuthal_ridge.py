@@ -4,6 +4,7 @@ import numpy as np
 
 from butterfly_saxs.models import ImageFrame, QMap
 from butterfly_saxs.observables import (
+    _azimuthal_peak_ridges,
     fit_symmetric_double_ellipse,
     measure_observables,
     measure_radial_ridges,
@@ -57,6 +58,22 @@ def test_azimuthal_peak_returns_direct_observed_points_with_branch_ids() -> None
     assert all("spacing_unavailable_azimuthal_trajectory" in point.flags for point in ridge.points)
     assert not any("radial_continuity_tracking" == flag for flag in ridge.flags)
     assert all(0.22 <= point.q <= 0.78 for point in ridge.points)
+
+
+def test_annular_geometry_coverage_retains_nonfinite_intensity_pixels():
+    from butterfly_saxs.observables import _azimuthal_peak_ridges
+
+    frame, qmap = _butterfly_frame()
+    image = frame.data.copy()
+    image[(qmap.qx > 0) & (qmap.qy > 0)] = np.nan
+    diagnostics = {}
+    _azimuthal_peak_ridges(image, qmap, (.22, .78), n_annuli=20, n_angle_bins=72,
+                           diagnostics=diagnostics)
+    assert np.sum(diagnostics["geometry_counts"]) > np.sum(diagnostics["counts"])
+    missing = (diagnostics["geometry_counts"] > 0) & (diagnostics["counts"] == 0)
+    assert np.any(missing)
+    assert np.all(diagnostics["coverage"][missing] == 0)
+    assert np.all(np.isnan(diagnostics["raw_mean"][missing]))
 
 
 def test_azimuthal_peak_does_not_mirror_a_single_observed_wing() -> None:
@@ -192,3 +209,97 @@ def test_measure_observables_exposes_ellipse_controls_and_keeps_method_label() -
         (not point.valid) and (not np.isfinite(point.q_star))
         for point in strict.lobe_radial_peaks
     )
+
+
+def test_azimuthal_diagnostics_use_local_noise_and_retain_four_peaks_per_ring() -> None:
+    frame, qmap = _butterfly_frame(noise=0.05)
+    diagnostics: dict[str, object] = {}
+    points, *_ = _azimuthal_peak_ridges(
+        frame,
+        qmap,
+        (0.22, 0.78),
+        n_annuli=24,
+        n_angle_bins=144,
+        snr_threshold=3.0,
+        min_peak_fraction=0.25,
+        diagnostics=diagnostics,
+    )
+    assert len(points) >= 4 * 20
+    assert {
+        "q_edges",
+        "q_centers",
+        "angle_edges_deg",
+        "angle_centers_deg",
+        "raw_mean",
+        "raw_sum",
+        "counts",
+        "geometry_counts",
+        "coverage",
+        "smoothed",
+        "annuli",
+        "candidates",
+        "selected_points",
+        "settings",
+    } <= set(diagnostics)
+    assert np.asarray(diagnostics["raw_mean"]).shape == (24, 144)
+    assert np.asarray(diagnostics["smoothed"]).shape == (24, 144)
+    assert diagnostics["settings"]["noise_definition"].startswith("robust_adjacent")
+    annuli = diagnostics["annuli"]
+    evaluated = [row for row in annuli if row["status"] == "profile_evaluated"]
+    assert evaluated
+    assert max(float(row["noise"]) for row in evaluated) < 0.2
+    assert all("prominence" in candidate and "reason" in candidate for candidate in diagnostics["candidates"])
+    assert all(
+        point.metadata["representative_pixel_role"] == "median_of_valid_support_pixels"
+        and "raw_intensity" in point.metadata
+        and "raw_bin_chi_deg" in point.metadata
+        and "refinement" in point.metadata
+        for point in points
+    )
+
+
+def test_azimuthal_constant_noise_and_single_hot_pixel_do_not_create_ridges() -> None:
+    axis = np.linspace(-1.0, 1.0, 241)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    rng = np.random.default_rng(20260922)
+    image = 1.0 + rng.normal(0.0, 0.03, q.shape)
+    image[121, 158] = 1.0e6
+    frame = ImageFrame(image)
+    diagnostics: dict[str, object] = {}
+    points, *_ = _azimuthal_peak_ridges(
+        frame,
+        QMap(qx, qy, q_unit="nm^-1"),
+        (0.22, 0.78),
+        n_annuli=24,
+        n_angle_bins=144,
+        snr_threshold=5.0,
+        min_bin_count=2,
+        diagnostics=diagnostics,
+    )
+    assert points == []
+    reasons = {candidate["reason"] for candidate in diagnostics["candidates"]}
+    assert reasons & {"insufficient_bin_support", "hot_pixel_dominated"}
+
+
+def test_azimuthal_smoothing_keeps_masked_angular_gap_empty() -> None:
+    axis = np.linspace(-1.0, 1.0, 241)
+    qx, qy = np.meshgrid(axis, axis)
+    angle = np.arctan2(qy, qx)
+    mask_gap = np.abs(np.angle(np.exp(1j * (angle - 0.42)))) < 0.09
+    frame, qmap = _butterfly_frame(mask=mask_gap)
+    diagnostics: dict[str, object] = {}
+    _azimuthal_peak_ridges(
+        frame,
+        qmap,
+        (0.22, 0.78),
+        n_annuli=24,
+        n_angle_bins=144,
+        snr_threshold=3.0,
+        diagnostics=diagnostics,
+    )
+    counts = np.asarray(diagnostics["counts"])
+    smoothed = np.asarray(diagnostics["smoothed"])
+    missing = counts == 0
+    assert np.any(missing)
+    assert np.all(np.isnan(smoothed[missing]))

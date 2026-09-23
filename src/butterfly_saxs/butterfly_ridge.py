@@ -1569,6 +1569,43 @@ def _sparse_first_order_coverage(
     return {"sparse": sparse, "n": len(identity), "max_dev_deg": float(max_dev)}
 
 
+def _prepare_sparse_first_order_samples(
+    qx: np.ndarray,
+    qy: np.ndarray,
+    q: np.ndarray,
+    intensity: np.ndarray,
+    valid: np.ndarray,
+    *,
+    hint: float,
+) -> dict[str, np.ndarray | float]:
+    """Pack finite first-order-band pixels for reuse across azimuth sectors."""
+
+    q_lo, q_hi = 0.70 * hint, 1.45 * hint
+    qx_array = np.asarray(qx)
+    qy_array = np.asarray(qy)
+    q_array = np.asarray(q)
+    intensity_array = np.asarray(intensity)
+    band = (
+        np.asarray(valid, dtype=bool)
+        & np.isfinite(q_array)
+        & np.isfinite(intensity_array)
+        & (q_array >= q_lo)
+        & (q_array <= q_hi)
+    )
+    rows, cols = np.nonzero(band)
+    return {
+        "qx": qx_array[band],
+        "qy": qy_array[band],
+        "q": q_array[band],
+        "intensity": intensity_array[band],
+        "angle_deg": np.degrees(np.arctan2(qy_array[band], qx_array[band])),
+        "rows": rows,
+        "cols": cols,
+        "q_lo": float(q_lo),
+        "q_hi": float(q_hi),
+    }
+
+
 def _sector_first_order_peak(
     qx: np.ndarray,
     qy: np.ndarray,
@@ -1579,30 +1616,36 @@ def _sector_first_order_peak(
     sector_deg: float,
     halfwidth_deg: float,
     hint: float,
+    prepared: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Return one observed radial peak in an azimuth sector, or None."""
 
     if not (np.isfinite(hint) and hint > 0.0):
         return None
-    ang = np.degrees(np.arctan2(qy, qx))
-    delta = np.abs(((ang - float(sector_deg) + 180.0) % 360.0) - 180.0)
     q_lo, q_hi = 0.70 * hint, 1.45 * hint
-    selected = (
-        np.asarray(valid, dtype=bool)
-        & np.isfinite(q)
-        & np.isfinite(intensity)
-        & (delta <= float(halfwidth_deg))
-        & (q >= q_lo)
-        & (q <= q_hi)
+    if prepared is None:
+        prepared = _prepare_sparse_first_order_samples(qx, qy, q, intensity, valid, hint=hint)
+    # ``prepared`` is a compact, C-order subset of the finite q band.  Keeping
+    # this subset in the caller lets all sectors reuse the expensive detector
+    # angle and validity work without retaining a frame-wide cache.
+    sample_qx = prepared["qx"]
+    sample_qy = prepared["qy"]
+    sample_q = prepared["q"]
+    sample_intensity = prepared["intensity"]
+    delta = np.abs(
+        ((prepared["angle_deg"] - float(sector_deg) + 180.0) % 360.0) - 180.0
     )
+    selected = delta <= float(halfwidth_deg)
     if int(np.count_nonzero(selected)) < 12:
         return None
-    radii = np.asarray(q[selected], dtype=float)
-    values = np.asarray(intensity[selected], dtype=float)
+    radii = np.asarray(sample_q[selected], dtype=float)
+    values = np.asarray(sample_intensity[selected], dtype=float)
     edges = np.linspace(q_lo, q_hi, 9)
     profile = np.full(edges.size - 1, np.nan, dtype=float)
     counts = np.zeros(edges.size - 1, dtype=int)
-    idx = np.digitize(radii, edges) - 1
+    # Clip the right edge into the last bin: np.digitize returns one past the
+    # final bin for q == q_hi, which previously discarded those pixels.
+    idx = np.clip(np.digitize(radii, edges) - 1, 0, profile.size - 1)
     for bin_i in range(edges.size - 1):
         in_bin = idx == bin_i
         counts[bin_i] = int(np.count_nonzero(in_bin))
@@ -1617,18 +1660,23 @@ def _sector_first_order_peak(
     if not (np.isfinite(peak) and np.isfinite(baseline) and baseline > 0 and peak >= 1.30 * baseline):
         return None
     q_star = float(0.5 * (edges[peak_i] + edges[peak_i + 1]))
-    in_bin = selected & (q >= edges[peak_i]) & (q < edges[peak_i + 1])
+    in_bin = selected & (sample_q >= edges[peak_i])
+    if peak_i == profile.size - 1:
+        in_bin &= sample_q <= edges[peak_i + 1]
+    else:
+        in_bin &= sample_q < edges[peak_i + 1]
     if int(np.count_nonzero(in_bin)) < 3:
         in_bin = selected
-    sample_qx = float(np.nanmedian(qx[in_bin]))
-    sample_qy = float(np.nanmedian(qy[in_bin]))
-    if not (np.isfinite(sample_qx) and np.isfinite(sample_qy)):
+    median_qx = float(np.nanmedian(sample_qx[in_bin]))
+    median_qy = float(np.nanmedian(sample_qy[in_bin]))
+    if not (np.isfinite(median_qx) and np.isfinite(median_qy)):
         return None
-    rows, cols = np.nonzero(in_bin)
-    nearest = int(np.argmin((qx[in_bin] - sample_qx) ** 2 + (qy[in_bin] - sample_qy) ** 2))
+    rows = prepared["rows"][in_bin]
+    cols = prepared["cols"][in_bin]
+    nearest = int(np.argmin((sample_qx[in_bin] - median_qx) ** 2 + (sample_qy[in_bin] - median_qy) ** 2))
     return {
-        "qx": sample_qx,
-        "qy": sample_qy,
+        "qx": median_qx,
+        "qy": median_qy,
         "q_star": q_star,
         "intensity": peak,
         "contrast": peak / baseline,
@@ -1696,6 +1744,14 @@ def _fill_sparse_first_order_ring(
             continue
         existing_angles.append(math.degrees(math.atan2(float(point["qy"]), float(point["qx"]))))
     added: list[dict[str, Any]] = []
+    prepared = _prepare_sparse_first_order_samples(
+        qx,
+        qy,
+        q,
+        intensity,
+        valid,
+        hint=hint_q,
+    )
     for quadrant in (0.0, 90.0, 180.0, 270.0):
         for offset in (30.0, 45.0, 60.0, 75.0):
             sector = reference + quadrant + offset
@@ -1710,6 +1766,7 @@ def _fill_sparse_first_order_ring(
                 sector_deg=sector,
                 halfwidth_deg=7.5,
                 hint=hint_q,
+                prepared=prepared,
             )
             if peak is None:
                 continue

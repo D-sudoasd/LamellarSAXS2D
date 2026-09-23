@@ -13,6 +13,7 @@ from matplotlib.lines import Line2D
 import numpy as np
 
 from .serialization import json_safe
+from .settings import canonical_q_unit
 from .visualization import _diagnostic_q_axis_labels, _display_transform
 
 _SUPPORTED_WIDTHS_MM = (89.0, 183.0)
@@ -247,6 +248,7 @@ def _prepare_inputs(
     )
 
     unit = str(q_unit or "unknown")
+    canonical_unit = canonical_q_unit(unit)
     result_safe = json_safe(result)
     point_rows = result.get("points", ())
     if not isinstance(point_rows, Sequence) or isinstance(point_rows, (str, bytes)):
@@ -353,7 +355,7 @@ def _prepare_inputs(
         "color_clip_high_count": display_high_count,
         "q_axis_interpretation": (
             "unknown unit; no physical period is inferred"
-            if unit.strip().lower() in {"", "unknown", "pixel", "pixel_q", "px"}
+            if canonical_unit in {"unknown", "pixel-q"}
             else "caller-supplied unit; no period conversion is performed"
         ),
     }
@@ -587,11 +589,19 @@ def _draw_map(
         "rejected": [],
         "unspecified": [],
     }
+    annular_pairing = "annular_peaks" in data.get("result_safe", {})
+    if annular_pairing:
+        plotted.update(accepted_0=[], accepted_1=[])
     for point in data["plot_points"]:
         coordinates = _point_coordinates(point)
         if coordinates is not None:
-            plotted[_point_display_status(point)].append(coordinates)
+            status = _point_display_status(point)
+            if annular_pairing and status == "accepted" and point.get("branch_id") in (0, 1):
+                status = f"accepted_{point['branch_id']}"
+            plotted[status].append(coordinates)
     styles = {
+        "accepted_0": {"marker": "o", "color": "#0072b2", "label": "A: QI + QIII"},
+        "accepted_1": {"marker": "^", "color": "#d55e00", "label": "B: QII + QIV"},
         "accepted": {
             "marker": "o",
             "color": "#0072b2",

@@ -601,6 +601,7 @@ def _project_ellipse_arc(
     endpoint_left = (a * np.cos(t_min) - u) ** 2 + (b * np.sin(t_min) - v) ** 2
     endpoint_right = (a * np.cos(t_max) - u) ** 2 + (b * np.sin(t_max) - v) ** 2
 
+    active = np.ones(t.shape, dtype=bool)
     for _ in range(16):
         sine_t = np.sin(t)
         cosine_t = np.cos(t)
@@ -612,10 +613,11 @@ def _project_ellipse_arc(
         candidate_squared = (a * np.cos(candidate) - u) ** 2 + (b * np.sin(candidate) - v) ** 2
         improve = np.isfinite(candidate_squared) & (candidate_squared <= current)
         new_t = np.where(improve, candidate, t)
-        if np.all(np.abs(new_t - t) <= 1.0e-13):
-            t = new_t
+        converged = active & (np.abs(new_t - t) <= 1.0e-13)
+        t = np.where(active, new_t, t)
+        active &= ~converged
+        if not np.any(active):
             break
-        t = new_t
 
     squared_refined = (a * np.cos(t) - u) ** 2 + (b * np.sin(t) - v) ** 2
     choose_left = endpoint_left < squared_refined
@@ -646,6 +648,15 @@ def _project_ellipse_arc(
 
 def _side_domain(side: str) -> tuple[float, float]:
     return (0.0, math.pi) if side == "upper" else (math.pi, _TAU)
+
+
+def _projection_domain(
+    side: str,
+    manual_intervals: Sequence[tuple[float, float]] | None,
+) -> list[tuple[float, float]]:
+    if manual_intervals is None:
+        return [_side_domain(side)]
+    return list(manual_intervals) if manual_intervals else []
 
 
 def _ellipse_linear_coefficients(
@@ -900,41 +911,42 @@ def _project_point_to_support(
     rectangles: Sequence[Mapping[str, Any]],
     *,
     include_global_oracle: bool = False,
+    precomputed_unconstrained: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    domain = list(manual_intervals) if manual_intervals is not None else [ _side_domain(side) ]
-    if manual_intervals is not None and not manual_intervals:
-        domain = []
+    domain = _projection_domain(side, manual_intervals)
     candidates: list[dict[str, Any]] = []
     local_candidates: list[tuple[float, float, dict[str, Any]]] = []
-    unconstrained: list[dict[str, Any]] = []
-    point_array = np.asarray([point], dtype=float)
-    local_u, local_v = _local_coordinates(point_array, geometry) if domain else (None, None)
+    unconstrained: list[dict[str, Any]] = list(precomputed_unconstrained or ())
+    local_u, local_v = None, None
+    if domain and precomputed_unconstrained is None:
+        local_u, local_v = _local_coordinates(np.asarray([point], dtype=float), geometry)
     if rectangles:
         # Fast path for the common case: the unconstrained closest point in a
         # manual/side domain already lies inside an observed rectangle.  A
         # point that is feasible for the global domain is necessarily the
         # constrained optimum, so no sinusoid boundary enumeration is needed.
-        u, v = local_u, local_v
-        for domain_index, (domain_lo, domain_hi) in enumerate(domain):
-            raw_projection = _project_ellipse_arc(
-                u,
-                v,
-                geometry.a,
-                geometry.b,
-                np.asarray([domain_lo]),
-                np.asarray([domain_hi]),
-                include_global_oracle=include_global_oracle,
-            )
-            unconstrained.append(
-                {
-                    "t": float(raw_projection["t"][0]),
-                    "distance": float(raw_projection["distance"][0]),
-                    "global_distance": float(raw_projection["global_distance"][0]),
-                    "at_endpoint": bool(raw_projection["at_endpoint"][0]),
-                    "endpoint_clipped": bool(raw_projection["endpoint_clipped"][0]),
-                    "domain_index": domain_index,
-                }
-            )
+        if precomputed_unconstrained is None:
+            u, v = local_u, local_v
+            for domain_index, (domain_lo, domain_hi) in enumerate(domain):
+                raw_projection = _project_ellipse_arc(
+                    u,
+                    v,
+                    geometry.a,
+                    geometry.b,
+                    np.asarray([domain_lo]),
+                    np.asarray([domain_hi]),
+                    include_global_oracle=include_global_oracle,
+                )
+                unconstrained.append(
+                    {
+                        "t": float(raw_projection["t"][0]),
+                        "distance": float(raw_projection["distance"][0]),
+                        "global_distance": float(raw_projection["global_distance"][0]),
+                        "at_endpoint": bool(raw_projection["at_endpoint"][0]),
+                        "endpoint_clipped": bool(raw_projection["endpoint_clipped"][0]),
+                        "domain_index": domain_index,
+                    }
+                )
         scale = max(1.0, abs(geometry.a), abs(geometry.b))
         reachable = [
             rectangle
@@ -980,28 +992,46 @@ def _project_point_to_support(
                     },
                 )
             )
-    for lo, hi, metadata in local_candidates:
-        # The helper above works in a branch-local frame.  Convert the observed
-        # q point to that frame before evaluating it.
-        projection = _project_ellipse_arc(
-            local_u,
-            local_v,
-            geometry.a,
-            geometry.b,
-            np.asarray([lo]),
-            np.asarray([hi]),
-            include_global_oracle=include_global_oracle,
-        )
-        candidates.append(
-            {
-                "t": float(projection["t"][0]),
-                "distance": float(projection["distance"][0]),
-                "global_distance": float(projection["global_distance"][0]),
-                "at_endpoint": bool(projection["at_endpoint"][0]),
-                "endpoint_clipped": bool(projection["endpoint_clipped"][0]),
-                "metadata": metadata,
+    if local_candidates:
+        if precomputed_unconstrained is None:
+            for lo, hi, metadata in local_candidates:
+                # The helper above works in a branch-local frame.  Convert the observed
+                # q point to that frame before evaluating it.
+                projection = _project_ellipse_arc(
+                    local_u,
+                    local_v,
+                    geometry.a,
+                    geometry.b,
+                    np.asarray([lo]),
+                    np.asarray([hi]),
+                    include_global_oracle=include_global_oracle,
+                )
+                candidates.append(
+                    {
+                        "t": float(projection["t"][0]),
+                        "distance": float(projection["distance"][0]),
+                        "global_distance": float(projection["global_distance"][0]),
+                        "at_endpoint": bool(projection["at_endpoint"][0]),
+                        "endpoint_clipped": bool(projection["endpoint_clipped"][0]),
+                        "metadata": metadata,
+                    }
+                )
+        else:
+            metadata_by_index = {
+                index: metadata for index, (_, _, metadata) in enumerate(local_candidates)
             }
-        )
+            for projection in unconstrained:
+                metadata = metadata_by_index[int(projection["domain_index"])]
+                candidates.append(
+                    {
+                        "t": projection["t"],
+                        "distance": projection["distance"],
+                        "global_distance": projection["global_distance"],
+                        "at_endpoint": projection["at_endpoint"],
+                        "endpoint_clipped": projection["endpoint_clipped"],
+                        "metadata": metadata,
+                    }
+                )
     if not candidates:
         if unconstrained:
             # Rectangle intersection can be empty while the side/manual domain
@@ -1048,6 +1078,65 @@ def _project_point_to_support(
     }
 
 
+def _batched_unconstrained_arc_projections(
+    points: np.ndarray,
+    rows: np.ndarray,
+    geometry: EllipseGeometry,
+    sides: np.ndarray,
+    interval_specs: Sequence[Mapping[str, Any]],
+    *,
+    include_global_oracle: bool,
+) -> dict[int, list[dict[str, Any]]]:
+    """Project all supported rows for one branch in one vectorized call."""
+
+    flat_rows: list[int] = []
+    flat_domain_indices: list[int] = []
+    flat_domains: list[tuple[float, float]] = []
+    for row in rows:
+        spec = interval_specs[int(row)]
+        manual_intervals = spec.get("manual_intervals")
+        rectangles = spec.get("rectangles", ())
+        # Rows with neither explicit bounds nor observed support are handled by
+        # the legacy finite penalty path.  Precomputing a side projection for
+        # them would change that contract.
+        if manual_intervals is None and not rectangles:
+            continue
+        domain = _projection_domain(str(sides[row]), manual_intervals)
+        for domain_index, interval in enumerate(domain):
+            flat_rows.append(int(row))
+            flat_domain_indices.append(domain_index)
+            flat_domains.append(interval)
+    if not flat_rows:
+        return {}
+
+    flat_points = np.asarray(points[np.asarray(flat_rows, dtype=int)], dtype=float)
+    local_u, local_v = _local_coordinates(flat_points, geometry)
+    t_min = np.asarray([interval[0] for interval in flat_domains], dtype=float)
+    t_max = np.asarray([interval[1] for interval in flat_domains], dtype=float)
+    projection = _project_ellipse_arc(
+        local_u,
+        local_v,
+        geometry.a,
+        geometry.b,
+        t_min,
+        t_max,
+        include_global_oracle=include_global_oracle,
+    )
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for index, row in enumerate(flat_rows):
+        grouped.setdefault(row, []).append(
+            {
+                "t": float(projection["t"][index]),
+                "distance": float(projection["distance"][index]),
+                "global_distance": float(projection["global_distance"][index]),
+                "at_endpoint": bool(projection["at_endpoint"][index]),
+                "endpoint_clipped": bool(projection["endpoint_clipped"][index]),
+                "domain_index": flat_domain_indices[index],
+            }
+        )
+    return grouped
+
+
 def _symmetric_arc_projection(
     points: np.ndarray,
     values: Mapping[str, float],
@@ -1088,6 +1177,14 @@ def _symmetric_arc_projection(
             geometry.axis_ratio,
             reference_axis + sign * geometry.theta,
         )
+        unconstrained_by_row = _batched_unconstrained_arc_projections(
+            points,
+            np.flatnonzero(mask),
+            branch_geometry,
+            sides,
+            interval_specs,
+            include_global_oracle=include_global_oracle,
+        )
         for row in np.flatnonzero(mask):
             spec = interval_specs[int(row)]
             projection = _project_point_to_support(
@@ -1097,6 +1194,7 @@ def _symmetric_arc_projection(
                 spec.get("manual_intervals"),
                 spec.get("rectangles", ()),
                 include_global_oracle=include_global_oracle,
+                precomputed_unconstrained=unconstrained_by_row.get(int(row)),
             )
             for name in (
                 "t", "distance", "global_distance", "at_endpoint", "endpoint_clipped",
@@ -1626,6 +1724,7 @@ def fit_arc_ellipses(
     cancel_event: Any = None,
     observed_support: Mapping[Any, Any] | None = None,
     reference_center: Sequence[float] | None = None,
+    observed_tip_constraint: bool = True,
 ) -> dict[str, Any]:
     """Fit a shared-centre mirror pair to labelled bounded ellipse arcs.
 
@@ -1640,6 +1739,8 @@ def fit_arc_ellipses(
     reference_axis = math.radians(float(reference_axis_deg))
     if not np.isfinite(reference_axis):
         raise ValueError("reference_axis_deg must be finite")
+    if not isinstance(observed_tip_constraint, (bool, np.bool_)):
+        raise ValueError("observed_tip_constraint must be boolean")
     if isinstance(max_nfev, (bool, np.bool_)) or not isinstance(max_nfev, Integral) or int(max_nfev) < 1:
         raise ValueError("max_nfev must be an integer >= 1")
     multistart_count = _validate_multistart_count(multistart)
@@ -1684,7 +1785,8 @@ def fit_arc_ellipses(
     ]
     parameter_set = _parameter_set_for_arcs(xy, parameters, reference_axis)
     parameter_set = _algebraic_arc_seed(xy, source_labels, parameter_set, reference_axis)
-    parameter_set = _observed_radius_seed(xy, parameter_set)
+    if observed_tip_constraint:
+        parameter_set = _observed_radius_seed(xy, parameter_set)
     sigma_weights = 1.0 / sigmas
 
     def objective(candidate: ParameterSet, labels: np.ndarray) -> np.ndarray:

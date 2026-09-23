@@ -130,6 +130,7 @@ def test_pipeline_analysis_emits_replayable_butterfly_recipe(monkeypatch) -> Non
     )
     assert result.analysis["butterfly"] == {
         "stage": "trace",
+        "trace_method": "curvature",
         "resamples": 3,
         "seed": 20260906,
         "edits": [],

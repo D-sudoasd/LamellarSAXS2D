@@ -29,6 +29,7 @@ from .project_document import ProjectDocumentController
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .butterfly_workbench import ButterflyWorkbench
 from .butterfly_figure_export import new_figure_export_target, run_butterfly_figure_export
+from .figure_export_dialog import FigureExportDialog
 from .qspace import overlay_ring_radius, overlay_uses_first_order_ring
 from .views import PLOT_AVAILABLE, ViewGrid, _disable_auto_si_prefix
 from .workers import AnalysisWorker, GenerationGuard
@@ -635,6 +636,8 @@ def first_order_ring_overlay(payload: Mapping[str, Any] | None) -> list[dict[str
 def _result_has_failure(result: Any) -> bool:
     """Return whether a result carries an explicit failure condition."""
 
+    if _read(result, ("cancelled",), False) is True:
+        return True
     if _is_butterfly_trace_result(result):
         # Trace deliberately has no fitted ellipse/uncertainty candidate yet;
         # its ``not_fitted``/quality fields are NOT_EVALUATED state, not a job
@@ -685,6 +688,22 @@ def _result_has_failure(result: Any) -> bool:
         any(token in str(flag).lower() for token in ("failed", "error", "invalid", "no_engine", "exception"))
         for flag in (flags or [])
     )
+
+
+_BATCH_SUCCESS_STATUSES = frozenset({"ok", "success", "completed"})
+
+
+def _batch_records_have_failure(records: Any) -> bool:
+    """Return whether any batch record is explicitly unsuccessful."""
+
+    for record in _sequence(records):
+        if isinstance(record, Mapping):
+            status = str(record.get("status", "ok") or "ok").casefold()
+            if status not in _BATCH_SUCCESS_STATUSES:
+                return True
+        if _result_has_failure(record):
+            return True
+    return False
 
 
 def _new_fit_session() -> dict[str, Any]:
@@ -902,6 +921,16 @@ if QT_AVAILABLE:
             self._last_evidence_paths: dict[str, Path] = {}
             self._last_butterfly_figure_paths: dict[str, Path] = {}
             self._figure_export_result_revisions: dict[int, int] = {}
+            self._figure_export_result_guards: dict[int, tuple[Any, ...]] = {}
+            self._figure_export_result_contexts: dict[int, dict[str, Any]] = {}
+            self._figure_export_page_status: dict[int, tuple[str, str, Any]] = {}
+            self._figure_export_dialog: FigureExportDialog | None = None
+            self._figure_export_dialog_guard: tuple[Any, ...] | None = None
+            self._figure_export_dialog_stale_timer = QtCore.QTimer(self)
+            self._figure_export_dialog_stale_timer.setInterval(250)
+            self._figure_export_dialog_stale_timer.timeout.connect(
+                self._check_figure_export_dialog_staleness
+            )
             self._last_error: str | None = None
             self._fit_ridge_points: Any = []
             self._rejected_ridge_points: list[Any] = []
@@ -950,6 +979,9 @@ if QT_AVAILABLE:
             self._build_evolution_page()
             self._build_status_bar()
             initial_analysis = dict(analysis_settings or self._analysis_settings)
+            if analysis_settings is not None and isinstance(initial_analysis.get("butterfly"), Mapping):
+                initial_analysis["butterfly"] = dict(initial_analysis["butterfly"])
+                initial_analysis["butterfly"].setdefault("trace_method", "curvature")
             self.set_analysis_settings(initial_analysis, trigger_preview=False)
 
             self._debounce_timer = QtCore.QTimer(self)
@@ -1245,54 +1277,172 @@ if QT_AVAILABLE:
             if not page.result_fresh:
                 self._set_status("status.evidence_stale", flags="butterfly_figure_stale")
                 return
-            parent = QtWidgets.QFileDialog.getExistingDirectory(
-                self,
-                self._tr("dialog.export_butterfly_figure"),
-                "",
-            )
-            if not parent:
+            dialog = self._figure_export_dialog
+            if dialog is not None and dialog.isVisible():
+                dialog.raise_()
+                dialog.activateWindow()
                 return
-            choices = [
-                self._tr("figure.single_column"),
-                self._tr("figure.double_column"),
-            ]
-            choice, accepted = QtWidgets.QInputDialog.getItem(
+            context = self._butterfly_figure_dialog_context()
+            dialog = FigureExportDialog(
                 self,
-                self._tr("dialog.export_butterfly_figure"),
-                self._tr("dialog.figure_export_width"),
-                choices,
-                1,
-                False,
+                language=self._language,
+                **context,
             )
-            if not accepted:
-                return
-            width_mm = 89.0 if choice == choices[0] else 183.0
-            dpi, accepted = QtWidgets.QInputDialog.getInt(
-                self,
-                self._tr("dialog.export_butterfly_figure"),
-                self._tr("dialog.figure_export_dpi"),
-                600,
-                72,
-                2400,
-                50,
+            self._figure_export_dialog = dialog
+            self._figure_export_dialog_guard = self._butterfly_figure_export_guard()
+            dialog.startRequested.connect(self._on_figure_export_dialog_start)
+            dialog.cancelRequested.connect(self._on_figure_export_dialog_cancel)
+            dialog.openRequested.connect(self._open_butterfly_figure_package)
+            dialog.finished.connect(
+                lambda _result: self._figure_export_dialog_stale_timer.stop()
             )
-            if not accepted:
-                return
-            target = new_figure_export_target(parent)
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            self._figure_export_dialog_stale_timer.start()
+
+        def _butterfly_figure_dialog_context(self) -> dict[str, Any]:
+            """Return display-only state for the single figure-export dialog."""
+
+            page = self.butterfly_workbench
+            # This dialog only reads a handful of scalar statuses.  Avoid the
+            # page property's defensive deep copy here; a result may contain
+            # large detector arrays and opening a settings window must stay
+            # responsive.
+            result = getattr(page, "_result", {}) if page.result_fresh else {}
+            if not isinstance(result, Mapping):
+                result = {}
+            quality = result.get("quality")
+            if not isinstance(quality, Mapping):
+                quality = {}
+            metrics = quality.get("metrics")
+            if not isinstance(metrics, Mapping):
+                metrics = {}
+            settings = page.butterfly_settings
+            if not isinstance(settings, Mapping):
+                settings = {}
+            stage = settings.get("stage") or result.get("stage") or "trace"
+            quality_status = (
+                quality.get("status")
+                or result.get("quality_status")
+                or result.get("engineering_status")
+                or metrics.get("status")
+                or "unknown"
+            )
+            scientific_status = (
+                quality.get("scientific_status")
+                or quality.get("scientific_acceptance")
+                or result.get("scientific_status")
+                or result.get("scientific_acceptance")
+                or "not_assessed"
+            )
+            measurement_status = (
+                result.get("measurement_status")
+                or result.get("status")
+                or "unknown"
+            )
+            frame_data = getattr(page, "_frame_data", {})
+            if not isinstance(frame_data, Mapping):
+                frame_data = {}
+            return {
+                "q_unit": self._active_q_unit(result),
+                "stage": str(stage),
+                "quality_status": str(quality_status),
+                "measurement_status": str(measurement_status),
+                # Never infer scientific acceptance from engineering status.
+                "scientific_status": str(scientific_status),
+                "has_qx": frame_data.get("qx") is not None,
+                "has_qy": frame_data.get("qy") is not None,
+            }
+
+        def _butterfly_figure_export_guard(self) -> tuple[Any, ...]:
+            """Identify the current result and settings for the modeless dialog."""
+
+            page = self.butterfly_workbench
             try:
-                snapshot = page.figure_export_snapshot(context=self._butterfly_export_context())
+                fit_signature: Any = self._fit_state_signature()
+            except (TypeError, ValueError, RuntimeError):
+                fit_signature = None
+            result = getattr(page, "_result", {}) if page.result_fresh else {}
+            return (page.result_revision, fit_signature, self._active_q_unit(result))
+
+        def _check_figure_export_dialog_staleness(self) -> None:
+            """Mark a completed bundle when the modeless page moves on."""
+
+            dialog = self._figure_export_dialog
+            if (
+                dialog is None
+                or not dialog.isVisible()
+                or dialog.is_running
+                or not dialog.has_exported_result
+            ):
+                return
+            current_guard = self._butterfly_figure_export_guard()
+            if self._figure_export_dialog_guard == current_guard:
+                return
+            current_context = self._butterfly_figure_dialog_context()
+            # Refresh the displayed measurement state first.  The completed
+            # bundle keeps its original source_context inside the dialog, so
+            # the stale marker can still distinguish old export from current
+            # page state while a subsequent Start uses the new snapshot.
+            dialog.set_measurement_context(current_context)
+            dialog.mark_export_stale(current_context)
+            self._figure_export_dialog_guard = current_guard
+
+        def _on_figure_export_dialog_start(self, values: Any) -> None:
+            """Freeze current inputs and queue the dialog's one-click export."""
+
+            dialog = self._figure_export_dialog
+            if dialog is None:
+                return
+            if not isinstance(values, Mapping):
+                dialog.set_export_error("invalid figure export settings")
+                return
+            current_guard = self._butterfly_figure_export_guard()
+            if self._figure_export_dialog_guard != current_guard:
+                dialog.set_measurement_context(self._butterfly_figure_dialog_context())
+                self._figure_export_dialog_guard = current_guard
+                dialog.set_context_changed()
+                return
+            page = self.butterfly_workbench
+            try:
+                parent = Path(values["parent"]).expanduser().resolve()
+                target = new_figure_export_target(parent)
+                snapshot = page.figure_export_snapshot(
+                    context=self._butterfly_export_context()
+                )
                 self._start_butterfly_figure_export(
                     target,
                     snapshot,
-                    width_mm=width_mm,
-                    dpi=dpi,
+                    width_mm=float(values["width_mm"]),
+                    dpi=int(values["dpi"]),
                 )
             except (FileExistsError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                dialog.set_export_error(exc)
                 self._set_status(
                     "status.butterfly_figure_export_failed",
                     flags="butterfly_figure_export_error",
                     error=exc,
                 )
+
+        def _on_figure_export_dialog_cancel(self) -> None:
+            """Route the dialog's cancel action through the shared worker gate."""
+
+            if self._workers:
+                self.cancel_jobs()
+            elif self._figure_export_dialog is not None:
+                self._figure_export_dialog.set_export_cancelled()
+
+        def _open_butterfly_figure_package(self, path: Any) -> None:
+            """Open a completed local index only after an explicit user click."""
+
+            try:
+                chosen = Path(path).expanduser().resolve()
+            except (TypeError, ValueError, OSError):
+                return
+            if not chosen.is_file():
+                return
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(chosen)))
 
         def _start_butterfly_figure_export(
             self,
@@ -1310,6 +1460,15 @@ if QT_AVAILABLE:
             result_revision = int(snapshot.get("result_revision", -1))
             if not page.result_fresh or page.result_revision != result_revision:
                 raise ValueError("the butterfly result changed before figure export started")
+            page_status_snapshot = (
+                str(getattr(page, "_page_status_state", "result")),
+                str(getattr(page, "_page_status_kind", "")),
+                getattr(page, "_page_status_error", None),
+            )
+            export_guard = self._butterfly_figure_export_guard()
+            export_context = deepcopy(dict(snapshot.get("context") or {}))
+            export_context["figure_width_mm"] = float(width_mm)
+            export_context["figure_dpi"] = int(dpi)
             generation = self._generation.next()
             cancel_event = threading.Event()
             payload = {
@@ -1381,6 +1540,9 @@ if QT_AVAILABLE:
             self._workers[generation] = worker
             self._cancel_events[generation] = cancel_event
             self._figure_export_result_revisions[generation] = result_revision
+            self._figure_export_result_guards[generation] = export_guard
+            self._figure_export_result_contexts[generation] = export_context
+            self._figure_export_page_status[generation] = page_status_snapshot
             self._last_butterfly_figure_paths = {}
             self._set_busy(True, "butterfly_figure_export")
             self._thread_pool.start(worker)
@@ -3291,6 +3453,8 @@ if QT_AVAILABLE:
                     _refresh_workflow_guide(self)
                 except Exception:
                     pass
+            if self._figure_export_dialog is not None:
+                self._figure_export_dialog.set_language(self._language)
             self._sync_fit_session_controls(preserve_edits=True)
             self._apply_tooltips()
             self._render_status()
@@ -5433,14 +5597,23 @@ if QT_AVAILABLE:
                 if not self._workers:
                     state = "cancelled" if self._cancel_pending else "ignored"
                     self._cancel_pending = False
-                    self._set_busy(False, state)
+                    self._set_busy(
+                        False,
+                        state,
+                        page_status_kind=kind if state == "cancelled" else None,
+                    )
                 elif self._cancel_pending:
                     active_kind = next(iter(self._workers.values())).kind
                     self._set_busy(True, active_kind)
                 return
             self._last_error = None
+            result_ok = not _result_has_failure(result)
+            cancelled_batch = kind == "batch" and _read(result, ("cancelled",), False) is True
             if kind == "batch":
-                records = _result_value(result, ("records", "results", "evolution"), [])
+                records = _sequence(
+                    _result_value(result, ("records", "results", "evolution"), [])
+                )
+                result_ok = bool(records) and result_ok and not _batch_records_have_failure(records)
                 if records:
                     self.plot_evolution(records)
                     self._update_batch_rows(records)
@@ -5523,8 +5696,10 @@ if QT_AVAILABLE:
             if self._workers:
                 active_kind = next(iter(self._workers.values())).kind
                 self._set_busy(True, active_kind)
+            elif cancelled_batch:
+                self._set_busy(False, "cancelled", page_status_kind="batch")
             else:
-                self._set_busy(False, kind, result_ok=not _result_has_failure(result))
+                self._set_busy(False, kind, result_ok=result_ok)
 
         def _on_worker_error(self, generation: int, kind: str, error: Exception) -> None:
             self._workers.pop(generation, None)
@@ -5542,7 +5717,11 @@ if QT_AVAILABLE:
                 if not self._workers:
                     state = "cancelled" if self._cancel_pending else "ignored"
                     self._cancel_pending = False
-                    self._set_busy(False, state)
+                    self._set_busy(
+                        False,
+                        state,
+                        page_status_kind=kind if state == "cancelled" else None,
+                    )
                 elif self._cancel_pending:
                     active_kind = next(iter(self._workers.values())).kind
                     self._set_busy(True, active_kind)
@@ -5574,6 +5753,26 @@ if QT_AVAILABLE:
                 error=error,
             )
 
+        @staticmethod
+        def _restore_figure_export_page_status(
+            page: Any,
+            *,
+            page_result_is_current: bool,
+            snapshot: tuple[str, str, Any] | None,
+        ) -> None:
+            """Return the page to its pre-export status without invalidating data."""
+
+            if not page_result_is_current:
+                page.finish_detached_job_if_active("butterfly_figure_export")
+                return
+            if snapshot is None:
+                page.set_job_status("result" if page.result_fresh else "ready")
+                return
+            state, kind, error = snapshot
+            if state in {"running", "cancelling"}:
+                state = "result" if page.result_fresh else "ready"
+            page.set_job_status(state, kind, error=error)
+
         def _finish_butterfly_figure_export(
             self,
             generation: int,
@@ -5586,6 +5785,9 @@ if QT_AVAILABLE:
 
             page = self.butterfly_workbench
             result_revision = self._figure_export_result_revisions.pop(generation, None)
+            result_guard = self._figure_export_result_guards.pop(generation, None)
+            result_context = self._figure_export_result_contexts.pop(generation, None)
+            page_status_snapshot = self._figure_export_page_status.pop(generation, None)
             page_result_is_current = bool(
                 result_revision is not None
                 and page.result_revision == result_revision
@@ -5621,11 +5823,16 @@ if QT_AVAILABLE:
             if cancelled:
                 self._set_busy(
                     False,
-                    "cancelled",
-                    update_butterfly_status=page_result_is_current,
+                    "butterfly_figure_export",
+                    update_butterfly_status=False,
                 )
-                if not page_result_is_current:
-                    page.finish_detached_job_if_active("butterfly_figure_export")
+                self._restore_figure_export_page_status(
+                    page,
+                    page_result_is_current=page_result_is_current,
+                    snapshot=page_status_snapshot,
+                )
+                if self._figure_export_dialog is not None:
+                    self._figure_export_dialog.set_export_cancelled()
                 self._set_status("status.cancelled")
                 return
 
@@ -5634,10 +5841,20 @@ if QT_AVAILABLE:
                     False,
                     "butterfly_figure_export",
                     result_ok=True,
-                    update_butterfly_status=page_result_is_current,
+                    update_butterfly_status=False,
                 )
-                if not page_result_is_current:
-                    page.finish_detached_job_if_active("butterfly_figure_export")
+                self._restore_figure_export_page_status(
+                    page,
+                    page_result_is_current=page_result_is_current,
+                    snapshot=page_status_snapshot,
+                )
+                if self._figure_export_dialog is not None:
+                    self._figure_export_dialog.set_exported_paths(
+                        self._last_butterfly_figure_paths,
+                        source_context=result_context,
+                        stale=not page_result_is_current,
+                    )
+                    self._figure_export_dialog_guard = result_guard
                 manifest = self._last_butterfly_figure_paths.get("manifest")
                 output_dir = manifest.parent if manifest is not None else next(
                     iter(self._last_butterfly_figure_paths.values())
@@ -5653,10 +5870,15 @@ if QT_AVAILABLE:
                 False,
                 "butterfly_figure_export",
                 result_ok=False,
-                update_butterfly_status=page_result_is_current,
+                update_butterfly_status=False,
             )
-            if not page_result_is_current:
-                page.finish_detached_job_if_active("butterfly_figure_export")
+            self._restore_figure_export_page_status(
+                page,
+                page_result_is_current=page_result_is_current,
+                snapshot=page_status_snapshot,
+            )
+            if self._figure_export_dialog is not None:
+                self._figure_export_dialog.set_export_error(error)
             self._set_status(
                 "status.butterfly_figure_export_failed",
                 flags="butterfly_figure_export_error",
@@ -7155,9 +7377,37 @@ if QT_AVAILABLE:
                     current=self._source_path,
                 )
 
+        def _reject_batch_request(self, error: str, *, flags: str) -> int:
+            """Reject an invalid batch request without starting a worker."""
+
+            generation = self._generation.next()
+            self._batch_cancel_event = None
+            self.batch_progress.setVisible(False)
+            self.batch_progress_label.setVisible(False)
+            self._last_error = str(error)
+            self._set_status(
+                "status.job_error",
+                flags=flags,
+                kind_key="job.batch",
+                error=error,
+            )
+            return generation
+
         def run_batch(self, frames: Iterable[Any] | bool | None = None) -> int:
             if frames is not None and not isinstance(frames, bool):
                 self.set_batch_frames(frames)
+            stream = bool(self.batch_stream_check.isChecked())
+            output = self.batch_output_edit.text().strip() or None
+            if not self.batch_frames:
+                return self._reject_batch_request(
+                    "no batch frames selected",
+                    flags="no_batch_frames",
+                )
+            if stream and output is None:
+                return self._reject_batch_request(
+                    "streaming requires an output directory",
+                    flags="stream_output_required",
+                )
             payload = {
                 "frames": list(self.batch_frames),
                 "parameters": self.parameter_model.parameter_dict(),
@@ -7168,7 +7418,7 @@ if QT_AVAILABLE:
                 "mode": self.batch_mode_combo.currentData(),
                 "stage": self.batch_stage_combo.currentData(),
                 "full2d": self.batch_stage_combo.currentData() == "full2d",
-                "stream": bool(self.batch_stream_check.isChecked()),
+                "stream": stream,
                 "manifest": self.batch_manifest_edit.text() or None,
                 "checkpoint": self.batch_checkpoint_edit.text() or None,
                 "resume": self.batch_resume_check.isChecked(),
@@ -7177,7 +7427,7 @@ if QT_AVAILABLE:
                 "stop": None if self.batch_stop_spin.value() < 0 else self.batch_stop_spin.value(),
                 "stride": self.batch_stride_spin.value(),
                 "frame_range": self.batch_range_edit.text().strip() or None,
-                "output": self.batch_output_edit.text() or None,
+                "output": output,
                 "source": self._source_path,
                 "poni": self._poni_path,
             }
@@ -7303,6 +7553,7 @@ if QT_AVAILABLE:
             *,
             result_ok: bool | None = None,
             update_butterfly_status: bool = True,
+            page_status_kind: str | None = None,
         ) -> None:
             self.preview_button.setEnabled(not busy)
             self.optimize_button.setEnabled(not busy)
@@ -7355,10 +7606,17 @@ if QT_AVAILABLE:
                 if not self._workers:
                     self._cancel_pending = False
                 if hasattr(self, "butterfly_workbench") and update_butterfly_status:
+                    status_kind = str(page_status_kind or kind)
                     if kind in {"cancelled", "canceled"}:
-                        self.butterfly_workbench.set_job_status("cancelled", kind)
+                        self.butterfly_workbench.set_job_status("cancelled", status_kind)
                     elif result_ok is False:
-                        self.butterfly_workbench.set_job_status("error", kind)
+                        # A worker can complete with a finite diagnostic
+                        # result whose solver quality is FAIL.  Keep that
+                        # result fresh for diagnosis/export; only the true
+                        # worker exception path below is an error lifecycle.
+                        self.butterfly_workbench.set_job_status(
+                            "completed", status_kind, result_ok=False
+                        )
                     elif kind == "ignored":
                         self.butterfly_workbench.set_job_status(
                             "result" if self.butterfly_workbench.result_fresh else "ready"

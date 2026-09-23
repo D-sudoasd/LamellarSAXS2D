@@ -280,26 +280,6 @@ def test_figure_button_uses_selected_nature_width_600dpi_and_frozen_measurement_
     captured = []
     started = threading.Event()
     release = threading.Event()
-    dialog_state = {}
-
-    monkeypatch.setattr(
-        QtWidgets.QFileDialog,
-        "getExistingDirectory",
-        lambda *args, **kwargs: str(tmp_path),
-    )
-
-    def choose_item(parent, title, label, items, current, editable):
-        dialog_state["items"] = list(items)
-        dialog_state["default_index"] = current
-        dialog_state["editable"] = editable
-        return items[choice_index], True
-
-    def choose_dpi(parent, title, label, value, minimum, maximum, step):
-        dialog_state["dpi_default"] = value
-        return value, True
-
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getItem", choose_item)
-    monkeypatch.setattr(QtWidgets.QInputDialog, "getInt", choose_dpi)
 
     def fake_export(target, **kwargs):
         captured.append((target, kwargs))
@@ -324,13 +304,25 @@ def test_figure_button_uses_selected_nature_width_600dpi_and_frozen_measurement_
         assert page.figure_export_button.text() == "Export figure"
         assert page.figure_export_button.isEnabled()
         page.figure_export_button.click()
+        dialog = window._figure_export_dialog
+        assert dialog is not None and dialog.isVisible()
+        dialog.parent_dir_edit.setText(str(tmp_path))
+        dialog.width_combo.setCurrentIndex(choice_index)
+        dialog.dpi_combo.setCurrentIndex(dialog.dpi_combo.findData(600))
+        assert [dialog.width_combo.itemData(i) for i in range(dialog.width_combo.count())] == [
+            89.0,
+            183.0,
+        ]
+        assert [dialog.dpi_combo.itemData(i) for i in range(dialog.dpi_combo.count())] == [
+            300,
+            600,
+            1200,
+        ]
+        dialog.start_button.click()
         qtbot.waitUntil(started.is_set, timeout=2_000)
         qtbot.waitUntil(lambda: "47%" in page.status_label.text(), timeout=2_000)
         assert "running" in page.status_label.text().lower()
         assert "s" in page.status_label.text().lower()
-        assert dialog_state["items"] == ["Single column · 89 mm", "Double column · 183 mm"]
-        assert dialog_state["default_index"] == 1
-        assert dialog_state["dpi_default"] == 600
         target, kwargs = captured[0]
         assert kwargs["width_mm"] == expected_width
         assert kwargs["dpi"] == 600
@@ -378,26 +370,15 @@ def test_stale_result_is_blocked_but_fresh_failed_result_can_be_exported_without
         return {"manifest": Path(target) / "manifest.json"}
 
     monkeypatch.setattr(figure_module, "export_butterfly_figure", fake_export)
-    monkeypatch.setattr(
-        QtWidgets.QFileDialog,
-        "getExistingDirectory",
-        lambda *args, **kwargs: str(tmp_path),
-    )
-    monkeypatch.setattr(
-        QtWidgets.QInputDialog,
-        "getItem",
-        lambda parent, title, label, items, current, editable: (items[0], True),
-    )
-    monkeypatch.setattr(
-        QtWidgets.QInputDialog,
-        "getInt",
-        lambda parent, title, label, value, minimum, maximum, step: (value, True),
-    )
     page.set_result({"status": "failed", "points": [], "quantitative_parameters": {}})
     assert page.result_fresh
     assert page.figure_export_button.isEnabled()
     assert "failed" in page.status_label.text().lower()
     page.figure_export_button.click()
+    dialog = window._figure_export_dialog
+    assert dialog is not None and dialog.isVisible()
+    dialog.parent_dir_edit.setText(str(tmp_path))
+    dialog.start_button.click()
     qtbot.waitUntil(lambda: bool(calls), timeout=2_000)
     qtbot.waitUntil(lambda: not window._workers, timeout=3_000)
     assert calls[0]["result"]["status"] == "failed"
@@ -454,7 +435,9 @@ def test_figure_export_failure_preserves_current_measurement_and_reports_error(q
     assert page.result_fresh
     assert page.current_result["points"] == result["points"]
     assert page.figure_export_button.isEnabled()
-    assert "failed" in page.status_label.text().lower()
+    # A figure-render error belongs to the export job; it must not turn the
+    # current butterfly measurement into a failed measurement status.
+    assert "result" in page.status_label.text().lower()
     assert window._status_key == "status.butterfly_figure_export_failed"
     window.close()
 
@@ -491,7 +474,8 @@ def test_cancel_shows_draining_state_until_worker_exits(qtbot, tmp_path, monkeyp
     release.set()
     qtbot.waitUntil(lambda: not window._workers, timeout=3_000)
     assert not page.cancel_button.isEnabled()
-    assert "cancelled" in page.status_label.text().lower()
+    assert window._status_key == "status.cancelled"
+    assert "result" in page.status_label.text().lower()
     assert page.result_fresh
     assert page.figure_export_button.isEnabled()
     window.close()
@@ -539,4 +523,58 @@ def test_frame_change_during_export_does_not_attach_old_result_to_new_frame(qtbo
     assert not page.result_fresh
     assert page.figure_export_button.isEnabled() is False
     assert window._last_butterfly_figure_paths["manifest"].parent == tmp_path / "old-frame-figure"
+    window.close()
+
+
+def test_completed_modeless_export_marks_previous_snapshot_and_refreshes_before_restart(
+    qtbot, tmp_path, monkeypatch
+):
+    import butterfly_saxs.butterfly_figure as figure_module
+
+    window, _, observed, *_ = _window(qtbot)
+    page = window.butterfly_workbench
+    _set_page_result(window)
+    window._frame = "old-frame"
+    calls = []
+
+    def fake_export(target, **kwargs):
+        calls.append(kwargs)
+        target.mkdir(parents=True, exist_ok=False)
+        manifest = target / "manifest.json"
+        index = target / "index.html"
+        manifest.write_text("{}", encoding="utf-8")
+        index.write_text("<html></html>", encoding="utf-8")
+        return {"manifest": manifest, "index": index}
+
+    monkeypatch.setattr(figure_module, "export_butterfly_figure", fake_export)
+    page.figure_export_button.click()
+    dialog = window._figure_export_dialog
+    assert dialog is not None and dialog.isVisible()
+    dialog.parent_dir_edit.setText(str(tmp_path))
+    dialog.start_button.click()
+    qtbot.waitUntil(lambda: not window._workers, timeout=3_000)
+    assert calls[0]["q_unit"] == "1/nm"
+    assert not dialog.export_is_stale
+
+    replacement = np.full_like(observed, 5.0)
+    yy, xx = np.indices(replacement.shape, dtype=float)
+    window._frame = "new-frame"
+    window.set_observed_data(
+        replacement,
+        qmap={
+            "qx": (xx - 3.5) / 5.0,
+            "qy": (yy - 3.5) / 5.0,
+            "q_unit": "1/A",
+        },
+    )
+    page.set_result({"points": [], "quantitative_parameters": {}})
+    qtbot.waitUntil(lambda: dialog.export_is_stale, timeout=2_000)
+    assert "1/A" in dialog.q_unit_label.text()
+    assert "old-frame" in dialog.snapshot_label.text()
+    assert "previous frame" in dialog.status_label.text()
+
+    dialog.start_button.click()
+    qtbot.waitUntil(lambda: not window._workers, timeout=3_000)
+    assert calls[-1]["q_unit"] == "1/A"
+    assert not dialog.export_is_stale
     window.close()

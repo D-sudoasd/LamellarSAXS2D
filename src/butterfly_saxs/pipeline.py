@@ -2461,7 +2461,11 @@ def batch_analyze(
     values = _expand_inputs(inputs)
     if not values:
         raise PipelineError("没有可处理的输入帧")
-    refs = build_frame_refs(values, manifest=manifest)
+    refs = build_frame_refs(
+        values,
+        manifest=manifest,
+        allow_mixed_series=series is not None,
+    )
     if frame_range is not None:
         range_start, range_stop, range_stride = parse_frame_range(frame_range)
         if start is not None or stop is not None or stride != 1:

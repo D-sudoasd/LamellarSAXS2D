@@ -18,10 +18,12 @@ from typing import Any
 from ..butterfly_quality import classify_ellipse_publication, unpublished_ellipse_shape
 from ..butterfly_settings import normalize_butterfly_settings
 from ..fit_overlays import fit_geometry_layers
+from ..settings import canonical_q_unit
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .qspace import QSpaceView
 from .butterfly_export import export_butterfly_analysis
 from .i18n import translate
+from .butterfly_summary import ButterflyQualitySummary
 
 try:
     import numpy as _np
@@ -36,12 +38,83 @@ except Exception:  # pragma: no cover - optional plotting dependency
 
 DEFAULT_BUTTERFLY_SETTINGS: dict[str, Any] = {
     "stage": "trace",
+    # A fresh workbench follows the q-ring -> I(chi) -> four-lobe trajectory
+    # observable.  Recipes/results without an explicit method are still
+    # interpreted as the historical curvature workflow below.
+    "trace_method": "annular_peak",
+    "sector_width_deg": 10.0,
+    "sector_step_deg": 5.0,
+    "annular_radial_bins": 40,
+    "annular_angle_bins": 72,
     "edits": [],
     "resamples": 0,
     "evaluation_resamples": 32,
     "seed": 20260906,
     "sensitivity": True,
 }
+
+_TRACE_METHOD_RADIAL_SECTOR = "radial_sector"
+_TRACE_METHOD_ANNULAR_PEAK = "annular_peak"
+_TRACE_METHOD_CURVATURE = "curvature"
+
+
+def _canonical_trace_method(value: Any, *, default: str = _TRACE_METHOD_CURVATURE) -> str:
+    """Map persisted/UI aliases to the butterfly tracing choices."""
+
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {
+        "annular_peak",
+        "annular_peaks",
+        "annular_trajectory",
+        "q_ring_peak",
+        "q_ring_trajectory",
+        "azimuthal_peak",
+    }:
+        return _TRACE_METHOD_ANNULAR_PEAK
+    if text in {"radial_sector", "sector", "radial", "sector_peak"}:
+        return _TRACE_METHOD_RADIAL_SECTOR
+    if text in {
+        "curvature",
+        "butterfly_curvature",
+        "surface_curvature",
+        "curvature_ridge",
+    }:
+        return _TRACE_METHOD_CURVATURE
+    return default
+
+
+def _finite_positive(value: Any, default: float) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return result if math.isfinite(result) and result > 0.0 else float(default)
+
+
+def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
+    """Read a persisted integer control without accepting booleans/fractions."""
+
+    if isinstance(value, bool):
+        return int(default)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return int(default)
+    if number != float(value) or not minimum <= number <= maximum:
+        return int(default)
+    return number
+
+_ANALYSIS_JOB_KINDS = frozenset(
+    {
+        "preview",
+        "optimize",
+        "measure_geometry",
+        "refine_geometry",
+        "trace",
+        "evaluate",
+    }
+)
+_DETACHED_JOB_KINDS = frozenset({"butterfly_figure_export"})
 
 
 def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
@@ -172,6 +245,8 @@ if QT_AVAILABLE:
                 title = {
                     "Angular peak signal": "方位峰信号",
                     "Radial peak signal": "径向峰信号",
+                    "Radial sector I(q)": "扇区积分 I(q)",
+                    "Annular I(χ)": "q 环积分 I(χ)",
                 }.get(title, title)
                 title = {
                     "Normal profile · raw / fit / residual": "法向剖面 · 原始 / 拟合 / 残差",
@@ -198,6 +273,15 @@ if QT_AVAILABLE:
             return [self._display_series_name(name) for name in self._series_names]
 
         def _display_series_name(self, name: str) -> str:
+            if name == "smoothed" and self._title in {
+                "Radial sector I(q)",
+                "Annular I(χ)",
+            }:
+                return (
+                    "smoothed (locator only)"
+                    if self._english
+                    else "平滑（仅用于定位）"
+                )
             if name in {
                 "raw",
                 "smoothed",
@@ -210,6 +294,14 @@ if QT_AVAILABLE:
             }:
                 language = "en" if self._english else "zh_CN"
                 return translate(language, f"profile.series.{name}")
+            if name == "counts":
+                return "valid pixels (count)" if self._english else "有效像素数（像素）"
+            if name == "coverage":
+                return (
+                    "coverage (dimensionless)"
+                    if self._english
+                    else "覆盖率（无量纲）"
+                )
             return name
 
         def _update_data_accessibility(self) -> None:
@@ -242,6 +334,7 @@ if QT_AVAILABLE:
             x_label: str = "q offset",
             y_label: str = "value",
             markers: Sequence[tuple[float, str]] = (),
+            plot_names: Sequence[str] | None = None,
         ) -> None:
             values = []
             if _np is not None:
@@ -268,7 +361,7 @@ if QT_AVAILABLE:
                 self.plot.clear()
                 colors = {
                     "raw": (220, 230, 238),
-                    "smoothed": (110, 211, 255),
+                    "smoothed": (255, 166, 76),
                     "isotropic_reference": (155, 139, 232),
                     "detection": (255, 145, 106),
                     "fit": (72, 190, 242),
@@ -276,14 +369,30 @@ if QT_AVAILABLE:
                     "u": (72, 190, 242),
                     "v": (243, 157, 73),
                 }
+                plot_name_set = (
+                    None
+                    if plot_names is None
+                    else {str(name) for name in plot_names}
+                )
                 for name, y in series.items():
                     if not name:
                         continue
+                    if plot_name_set is not None and str(name) not in plot_name_set:
+                        continue
                     try:
+                        pen_style = (
+                            QtCore.Qt.PenStyle.DashLine
+                            if str(name) == "smoothed"
+                            else QtCore.Qt.PenStyle.SolidLine
+                        )
                         self.plot.plot(
                             values,
                             _np.asarray(y, dtype=float) if _np is not None else list(y),
-                            pen=_pg.mkPen(colors.get(name, (190, 190, 200)), width=2),
+                            pen=_pg.mkPen(
+                                colors.get(name, (190, 190, 200)),
+                                width=2,
+                                style=pen_style,
+                            ),
                             symbol="o" if name == "raw" else None,
                             symbolSize=4,
                             name=self._display_series_name(str(name)),
@@ -431,6 +540,15 @@ if QT_AVAILABLE:
             self._selected_landmark_id: str | None = None
             self._requested_q_window: tuple[float, float] | None = None
             self._landmark_zoomed = False
+            self._excluded_count = 0
+            self._batch_success_count: int | None = None
+            self._batch_failure_items: list[Any] = []
+            self._detached_status_restore: tuple[str, str, Any] | None = None
+            self._radial_sector_seen = False
+            self._auto_hidden_radial_landmarks = False
+            self._landmark_visibility_user_override = False
+            self._suppress_landmark_visibility_tracking = False
+            self._selected_profile_point_id: str | None = None
             self._manual_review: dict[str, Any] = {
                 "manual_status": "unreviewed",
                 "reviewed_by": "",
@@ -458,6 +576,8 @@ if QT_AVAILABLE:
             self.status_label.setObjectName("butterflyStatusLabel")
             header.addWidget(self.status_label)
             root.addLayout(header)
+            self.quality_summary = ButterflyQualitySummary(self, language=self._language)
+            root.addWidget(self.quality_summary)
             self.workflow_hint_label = QtWidgets.QLabel(self)
             self.workflow_hint_label.setObjectName("butterflyWorkflowHint")
             self.workflow_hint_label.setWordWrap(True)
@@ -577,8 +697,17 @@ if QT_AVAILABLE:
             )
             right_panel = QtWidgets.QWidget(right_scroll)
             right_panel.setObjectName("butterflyControlsPanel")
+            # QGroupBox titles start at the frame's x=0 in the native style;
+            # shift them inward so the first glyph remains visible when the
+            # narrow scroll viewport clips the content widget's right side.
+            right_panel.setStyleSheet(
+                "QGroupBox::title { subcontrol-origin: margin; left: 6px; }"
+            )
             right_layout = QtWidgets.QVBoxLayout(right_panel)
-            right_layout.setContentsMargins(4, 2, 4, 4)
+            # Leave a few extra pixels before group-box titles.  The scroll
+            # viewport otherwise clips the first CJK glyph at its left edge
+            # on the narrow 980 px workbench layout.
+            right_layout.setContentsMargins(8, 2, 8, 4)
             right_layout.setSpacing(7)
 
             analysis_group = QtWidgets.QGroupBox("Analysis range", right_panel)
@@ -605,6 +734,79 @@ if QT_AVAILABLE:
             self.q_max_edit.editingFinished.connect(self._on_analysis_range_changed)
             self.reference_axis_spin.valueChanged.connect(self._on_analysis_range_changed)
             right_layout.addWidget(analysis_group)
+
+            trace_group = QtWidgets.QGroupBox("Trace localization", right_panel)
+            trace_group.setObjectName("butterflyTraceLocalization")
+            trace_form = QtWidgets.QFormLayout(trace_group)
+            self._trace_form = trace_form
+            self.trace_method_combo = QtWidgets.QComboBox(trace_group)
+            self.trace_method_combo.setObjectName("butterflyTraceMethod")
+            self.trace_method_combo.addItem(
+                "Annular q-ring angular peaks · I(χ)",
+                _TRACE_METHOD_ANNULAR_PEAK,
+            )
+            self.trace_method_combo.addItem(
+                "Sector-integrated radial peak · I(q)",
+                _TRACE_METHOD_RADIAL_SECTOR,
+            )
+            self.trace_method_combo.addItem(
+                "Curvature local candidates · advanced",
+                _TRACE_METHOD_CURVATURE,
+            )
+            self.trace_method_combo.setAccessibleName("Butterfly tracing method")
+            self.trace_method_combo.setToolTip(
+                "For annular mode, each q ring is integrated over angle to find up to four lobe peaks and track them across q; "
+                "radial sectors and curvature remain compatibility modes."
+            )
+            trace_form.addRow("Identification method", self.trace_method_combo)
+            self.annular_radial_bins = QtWidgets.QSpinBox(trace_group)
+            self.annular_radial_bins.setObjectName("butterflyAnnularRadialBins")
+            self.annular_radial_bins.setRange(4, 192)
+            self.annular_radial_bins.setSingleStep(1)
+            self.annular_radial_bins.setValue(40)
+            self.annular_radial_bins.setToolTip(
+                "Number of q annuli used to build I(χ) profiles and link lobe trajectories."
+            )
+            trace_form.addRow("q-ring bins", self.annular_radial_bins)
+            self.annular_angle_bins = QtWidgets.QSpinBox(trace_group)
+            self.annular_angle_bins.setObjectName("butterflyAnnularAngleBins")
+            self.annular_angle_bins.setRange(16, 720)
+            self.annular_angle_bins.setSingleStep(1)
+            self.annular_angle_bins.setValue(72)
+            self.annular_angle_bins.setToolTip(
+                "Number of angular bins in each I(χ) profile; no missing angular support is synthesized."
+            )
+            trace_form.addRow("angular bins", self.annular_angle_bins)
+            self.sector_width_spin = QtWidgets.QDoubleSpinBox(trace_group)
+            self.sector_width_spin.setObjectName("butterflySectorWidth")
+            self.sector_width_spin.setRange(0.5, 180.0)
+            self.sector_width_spin.setDecimals(1)
+            self.sector_width_spin.setSingleStep(0.5)
+            self.sector_width_spin.setValue(10.0)
+            self.sector_width_spin.setSuffix("°")
+            self.sector_width_spin.setToolTip(
+                "Azimuth width integrated into each radial I(q) profile."
+            )
+            trace_form.addRow("Sector width", self.sector_width_spin)
+            self.sector_step_spin = QtWidgets.QDoubleSpinBox(trace_group)
+            self.sector_step_spin.setObjectName("butterflySectorStep")
+            self.sector_step_spin.setRange(0.5, 180.0)
+            self.sector_step_spin.setDecimals(1)
+            self.sector_step_spin.setSingleStep(0.5)
+            self.sector_step_spin.setValue(5.0)
+            self.sector_step_spin.setSuffix("°")
+            self.sector_step_spin.setToolTip(
+                "Azimuth step between adjacent sector centers."
+            )
+            trace_form.addRow("Sector step", self.sector_step_spin)
+            self.trace_method_combo.currentIndexChanged.connect(
+                self._on_trace_settings_changed
+            )
+            self.sector_width_spin.valueChanged.connect(self._on_trace_settings_changed)
+            self.sector_step_spin.valueChanged.connect(self._on_trace_settings_changed)
+            self.annular_radial_bins.valueChanged.connect(self._on_trace_settings_changed)
+            self.annular_angle_bins.valueChanged.connect(self._on_trace_settings_changed)
+            right_layout.addWidget(trace_group)
 
             evaluation_group = QtWidgets.QGroupBox("Evaluation", right_panel)
             evaluation_group.setObjectName("butterflyEvaluationControls")
@@ -936,18 +1138,30 @@ if QT_AVAILABLE:
                 supported_peaks=True,
             )
             self._update_edit_buttons()
+            self._sync_trace_method_controls()
             self.set_language(self._language)
             self._sync_action_state()
 
         @property
         def butterfly_settings(self) -> dict[str, Any]:
             result = deepcopy(self._settings)
+            result["trace_method"] = self._trace_method()
+            result["sector_width_deg"] = float(self.sector_width_spin.value())
+            result["sector_step_deg"] = float(self.sector_step_spin.value())
+            result["annular_radial_bins"] = int(self.annular_radial_bins.value())
+            result["annular_angle_bins"] = int(self.annular_angle_bins.value())
             result["edits"] = deepcopy(self._edits)
             return result
 
         @property
         def analysis_settings(self) -> dict[str, Any]:
-            return {"ridge_method": "butterfly_curvature", "butterfly": self.butterfly_settings}
+            return {
+                # Keep the butterfly workflow family seam stable.  The
+                # selected observable is carried by butterfly.trace_method;
+                # generic azimuthal_peak is a separate observables workflow.
+                "ridge_method": "butterfly_curvature",
+                "butterfly": self.butterfly_settings,
+            }
 
         @property
         def edits(self) -> list[dict[str, Any]]:
@@ -1010,6 +1224,305 @@ if QT_AVAILABLE:
                 return translate(self._language, key, **values)
             except (KeyError, ValueError):
                 return key
+
+        def _trace_method(self) -> str:
+            return _canonical_trace_method(
+                self._settings.get("trace_method"),
+                default=_TRACE_METHOD_ANNULAR_PEAK,
+            )
+
+        @staticmethod
+        def _result_trace_method(result: Mapping[str, Any]) -> str:
+            """Infer the method that produced a payload before rendering it."""
+
+            settings = result.get("settings")
+            settings = settings if isinstance(settings, Mapping) else {}
+            for source in (settings, result):
+                explicit = source.get("trace_method")
+                if explicit not in (None, ""):
+                    return _canonical_trace_method(
+                        explicit, default=_TRACE_METHOD_CURVATURE
+                    )
+            # ``ridge_method=butterfly_curvature`` is the stable family seam
+            # for this page.  The payload-specific annular/sector blocks are
+            # therefore checked before that historical family label.
+            if isinstance(result.get("annular_peaks"), Mapping):
+                return _TRACE_METHOD_ANNULAR_PEAK
+            if isinstance(result.get("sector_peaks"), Mapping):
+                return _TRACE_METHOD_RADIAL_SECTOR
+            for source in (settings, result):
+                ridge_method = source.get("ridge_method")
+                if ridge_method not in (None, ""):
+                    return _canonical_trace_method(
+                        ridge_method, default=_TRACE_METHOD_CURVATURE
+                    )
+            method_version = str(result.get("method_version", "") or "").lower()
+            if method_version.startswith("butterfly-annular-"):
+                return _TRACE_METHOD_ANNULAR_PEAK
+            if method_version.startswith("butterfly-radial-sector-"):
+                return _TRACE_METHOD_RADIAL_SECTOR
+            points = result.get("points")
+            if isinstance(points, Sequence) and not isinstance(points, (str, bytes)):
+                if any(
+                    isinstance(point, Mapping)
+                    and str(point.get("source_method", "") or "").lower()
+                    in {_TRACE_METHOD_ANNULAR_PEAK, "annular_trajectory"}
+                    for point in points
+                ):
+                    return _TRACE_METHOD_ANNULAR_PEAK
+                if any(
+                    isinstance(point, Mapping)
+                    and str(point.get("source_method", "") or "").lower()
+                    == _TRACE_METHOD_RADIAL_SECTOR
+                    for point in points
+                ):
+                    return _TRACE_METHOD_RADIAL_SECTOR
+            # A payload without explicit method metadata is a legacy curvature
+            # result. Do not let the new-session annular default reinterpret
+            # its landmarks.
+            return _TRACE_METHOD_CURVATURE
+
+        def _adopt_result_trace_method(self, result: Mapping[str, Any]) -> None:
+            """Synchronize controls with a loaded result without invalidating it."""
+
+            method = self._result_trace_method(result)
+            self._settings["trace_method"] = method
+            result_settings = result.get("settings")
+            result_settings = result_settings if isinstance(result_settings, Mapping) else {}
+            annular_bundle = result.get("annular_peaks")
+            annular_settings = (
+                annular_bundle.get("settings")
+                if isinstance(annular_bundle, Mapping)
+                else None
+            )
+            annular_settings = annular_settings if isinstance(annular_settings, Mapping) else {}
+            for key in ("annular_radial_bins", "annular_angle_bins"):
+                if key in result_settings:
+                    self._settings[key] = result_settings[key]
+                elif key in annular_settings:
+                    self._settings[key] = annular_settings[key]
+            for key in ("sector_width_deg", "sector_step_deg"):
+                if key in result_settings:
+                    self._settings[key] = result_settings[key]
+            self._sync_trace_method_controls()
+            self._render_trace_method_label()
+            self._apply_trace_method_landmark_visibility()
+            self._apply_trace_method_diagnostic_visibility()
+
+        def _render_trace_method_label(self) -> None:
+            english = self._language.lower().startswith("en")
+            method = self._trace_method()
+            if method == _TRACE_METHOD_ANNULAR_PEAK:
+                text = "Annular I(χ) four-lobe tracks" if english else "环积分 I(χ) 四瓣轨迹"
+                tooltip = (
+                    "Each q annulus is integrated over angle; up to four supported lobe peaks are linked across q."
+                    if english
+                    else "对每个 q 环沿方位积分得到 I(χ)，每环最多保留四个有支撑峰并沿 q 连成轨迹。"
+                )
+            elif method == _TRACE_METHOD_RADIAL_SECTOR:
+                text = "Radial sector I(q) peak" if english else "扇区积分 I(q) 主峰"
+                tooltip = (
+                    "One radial I(q) profile is integrated per azimuth sector; q* is its selected peak."
+                    if english
+                    else "沿每个方位扇区积分得到 I(q)，每个扇区只定位一个主峰 q*。"
+                )
+            else:
+                text = "Curvature local candidates · advanced" if english else "曲率局部候选（高级）"
+                tooltip = (
+                    "Advanced pixel-curvature candidates; use only when the sector profile is insufficient."
+                    if english
+                    else "高级像素曲率候选；仅在扇区积分剖面不足时使用。"
+                )
+            self.method_label.setText(text)
+            self.method_label.setToolTip(tooltip)
+            self.method_label.setAccessibleName(text)
+
+        def _render_trace_method_controls(self) -> None:
+            english = self._language.lower().startswith("en")
+            group = self.findChild(QtWidgets.QGroupBox, "butterflyTraceLocalization")
+            if group is None:
+                return
+            group.setTitle("Trace localization" if english else "峰位识别方式")
+            form = group.layout()
+            if isinstance(form, QtWidgets.QFormLayout):
+                form.labelForField(self.trace_method_combo).setText(
+                    "Identification method" if english else "识别方式"
+                )
+                form.labelForField(self.annular_radial_bins).setText(
+                    "q-ring bins" if english else "q 环数量"
+                )
+                form.labelForField(self.annular_angle_bins).setText(
+                    "Angular bins" if english else "方位角分箱"
+                )
+                form.labelForField(self.sector_width_spin).setText(
+                    "Sector width" if english else "扇区宽度"
+                )
+                form.labelForField(self.sector_step_spin).setText(
+                    "Sector step" if english else "扇区步长"
+                )
+            labels = (
+                (
+                    "Annular q-ring peaks · I(χ)"
+                    if english
+                    else "q 环方位峰 · I(χ)",
+                    _TRACE_METHOD_ANNULAR_PEAK,
+                ),
+                (
+                    "Sector-integrated radial peak · I(q)"
+                    if english
+                    else "扇区积分径向主峰 · I(q)",
+                    _TRACE_METHOD_RADIAL_SECTOR,
+                ),
+                (
+                    "Curvature local candidates · advanced"
+                    if english
+                    else "曲率局部候选 · 高级",
+                    _TRACE_METHOD_CURVATURE,
+                ),
+            )
+            for text, value in labels:
+                index = self.trace_method_combo.findData(value)
+                if index >= 0:
+                    self.trace_method_combo.setItemText(index, text)
+            self.trace_method_combo.setToolTip(
+                "Annular mode integrates I(χ) on each q ring and links up to four lobe peaks; radial sectors and curvature are compatibility modes."
+                if english
+                else "环积分模式在每个 q 环上得到 I(χ)，沿 q 连接最多四个瓣峰；扇区积分和曲率保留为兼容模式。"
+            )
+            self.annular_radial_bins.setToolTip(
+                "Number of q annuli used for I(χ) profiles and trajectory linking."
+                if english
+                else "用于生成 I(χ) 和连接轨迹的 q 环数量。"
+            )
+            self.annular_angle_bins.setToolTip(
+                "Angular bins per annulus; masked angular gaps remain unsupported."
+                if english
+                else "每个 q 环的方位角分箱数；掩膜造成的方位缺口不补点。"
+            )
+            if hasattr(self, "identify_button"):
+                if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
+                    identify_tip = (
+                        "Build I(χ) on each q annulus and link up to four lobe tracks."
+                        if english
+                        else "在每个 q 环构建 I(χ)，并沿 q 连接最多四条瓣轨迹。"
+                    )
+                else:
+                    identify_tip = (
+                        "Trace observed arcs using the selected butterfly method"
+                        if english
+                        else "使用当前蝴蝶识别方式提取观测轨迹"
+                    )
+                self.identify_button.setToolTip(identify_tip)
+            self.sector_width_spin.setToolTip(
+                "Azimuth width integrated into each radial I(q) profile."
+                if english
+                else "每个径向 I(q) 剖面所积分的方位角宽度。"
+            )
+            self.sector_step_spin.setToolTip(
+                "Azimuth step between adjacent sector centers."
+                if english
+                else "相邻扇区中心之间的方位角步长。"
+            )
+
+        def _sync_trace_method_controls(self) -> None:
+            method = self._trace_method()
+            width = _finite_positive(self._settings.get("sector_width_deg"), 10.0)
+            step = _finite_positive(self._settings.get("sector_step_deg"), 5.0)
+            radial_bins = _bounded_int(
+                self._settings.get("annular_radial_bins"),
+                40,
+                minimum=4,
+                maximum=192,
+            )
+            angle_bins = _bounded_int(
+                self._settings.get("annular_angle_bins"),
+                72,
+                minimum=16,
+                maximum=720,
+            )
+            self.trace_method_combo.blockSignals(True)
+            self.sector_width_spin.blockSignals(True)
+            self.sector_step_spin.blockSignals(True)
+            self.annular_radial_bins.blockSignals(True)
+            self.annular_angle_bins.blockSignals(True)
+            try:
+                index = self.trace_method_combo.findData(method)
+                self.trace_method_combo.setCurrentIndex(max(0, index))
+                self.sector_width_spin.setValue(min(180.0, max(0.5, width)))
+                self.sector_step_spin.setValue(min(180.0, max(0.5, step)))
+                self.annular_radial_bins.setValue(radial_bins)
+                self.annular_angle_bins.setValue(angle_bins)
+            finally:
+                self.trace_method_combo.blockSignals(False)
+                self.sector_width_spin.blockSignals(False)
+                self.sector_step_spin.blockSignals(False)
+                self.annular_radial_bins.blockSignals(False)
+                self.annular_angle_bins.blockSignals(False)
+            self._settings["trace_method"] = method
+            self._settings["sector_width_deg"] = float(self.sector_width_spin.value())
+            self._settings["sector_step_deg"] = float(self.sector_step_spin.value())
+            self._settings["annular_radial_bins"] = int(self.annular_radial_bins.value())
+            self._settings["annular_angle_bins"] = int(self.annular_angle_bins.value())
+            annular = method == _TRACE_METHOD_ANNULAR_PEAK
+            for widget in (self.annular_radial_bins, self.annular_angle_bins):
+                widget.setVisible(annular)
+            for widget in (self.sector_width_spin, self.sector_step_spin):
+                widget.setVisible(method == _TRACE_METHOD_RADIAL_SECTOR)
+            if isinstance(getattr(self, "_trace_form", None), QtWidgets.QFormLayout):
+                for widget, visible in (
+                    (self.annular_radial_bins, annular),
+                    (self.annular_angle_bins, annular),
+                    (self.sector_width_spin, method == _TRACE_METHOD_RADIAL_SECTOR),
+                    (self.sector_step_spin, method == _TRACE_METHOD_RADIAL_SECTOR),
+                ):
+                    label = self._trace_form.labelForField(widget)
+                    if label is not None:
+                        label.setVisible(visible)
+
+        def _on_trace_settings_changed(self, *_: Any) -> None:
+            method = _canonical_trace_method(
+                self.trace_method_combo.currentData(),
+                default=_TRACE_METHOD_CURVATURE,
+            )
+            width = float(self.sector_width_spin.value())
+            step = float(self.sector_step_spin.value())
+            radial_bins = int(self.annular_radial_bins.value())
+            angle_bins = int(self.annular_angle_bins.value())
+            changed = (
+                method != self._trace_method()
+                or width != _finite_positive(self._settings.get("sector_width_deg"), 10.0)
+                or step != _finite_positive(self._settings.get("sector_step_deg"), 5.0)
+                or radial_bins != _bounded_int(
+                    self._settings.get("annular_radial_bins"),
+                    40,
+                    minimum=4,
+                    maximum=192,
+                )
+                or angle_bins != _bounded_int(
+                    self._settings.get("annular_angle_bins"),
+                    72,
+                    minimum=16,
+                    maximum=720,
+                )
+            )
+            self._settings.update(
+                {
+                    "trace_method": method,
+                    "sector_width_deg": width,
+                    "sector_step_deg": step,
+                    "annular_radial_bins": radial_bins,
+                    "annular_angle_bins": angle_bins,
+                }
+            )
+            self._sync_trace_method_controls()
+            self._render_trace_method_label()
+            self._apply_trace_method_landmark_visibility()
+            self._apply_trace_method_diagnostic_visibility()
+            if not changed:
+                return
+            self.clear_result()
+            self.analysisChanged.emit({"butterfly": self.butterfly_settings})
+            self._sync_action_state()
 
         def _refresh_fit_layers(self) -> None:
             if not self._result_fresh or not self._result:
@@ -1292,9 +1805,66 @@ if QT_AVAILABLE:
             self.peak_table.blockSignals(False)
 
         def _on_landmark_visibility_changed(self, *_: Any) -> None:
+            if not self._suppress_landmark_visibility_tracking:
+                # A manual toggle takes ownership of the pixel-diagnostic
+                # visibility. Switching methods or loading a result must not
+                # undo the user's explicit choice.
+                self._landmark_visibility_user_override = True
+                self._auto_hidden_radial_landmarks = False
             self.qspace.set_landmark_visibility(
                 global_raw_max=self.global_max_check.isChecked(),
                 supported_peaks=self.supported_peaks_check.isChecked(),
+            )
+
+        def _apply_trace_method_landmark_visibility(self) -> None:
+            """Keep pixel extrema secondary to radial sector profiles."""
+
+            if self._trace_method() in {
+                _TRACE_METHOD_RADIAL_SECTOR,
+                _TRACE_METHOD_ANNULAR_PEAK,
+            }:
+                self._radial_sector_seen = True
+                if self._landmark_visibility_user_override:
+                    return
+                self._auto_hidden_radial_landmarks = True
+                self._suppress_landmark_visibility_tracking = True
+                try:
+                    self.global_max_check.setChecked(False)
+                    self.supported_peaks_check.setChecked(False)
+                finally:
+                    self._suppress_landmark_visibility_tracking = False
+                self.qspace.set_landmark_visibility(
+                    global_raw_max=False,
+                    supported_peaks=False,
+                )
+                return
+            if (
+                not self._auto_hidden_radial_landmarks
+                or self._landmark_visibility_user_override
+            ):
+                return
+            self._auto_hidden_radial_landmarks = False
+            self._suppress_landmark_visibility_tracking = True
+            try:
+                self.global_max_check.setChecked(True)
+                self.supported_peaks_check.setChecked(True)
+            finally:
+                self._suppress_landmark_visibility_tracking = False
+            # Keep the automatic state alive so returning to radial mode
+            # hides the two diagnostic layers again. A real user toggle above
+            # clears this state and takes precedence.
+            self._auto_hidden_radial_landmarks = True
+            self.qspace.set_landmark_visibility(
+                global_raw_max=True,
+                supported_peaks=True,
+            )
+
+        def _apply_trace_method_diagnostic_visibility(self) -> None:
+            """Give the radial I(q) profile the diagnostic height it needs."""
+
+            self.ellipse_diagnostic.setVisible(
+                self._trace_method()
+                not in {_TRACE_METHOD_RADIAL_SECTOR, _TRACE_METHOD_ANNULAR_PEAK}
             )
 
         def _on_overlay_mode_changed(self, *_: Any) -> None:
@@ -1515,6 +2085,134 @@ if QT_AVAILABLE:
                 return True
             return False
 
+        def _result_points(self) -> list[Any]:
+            points = _read(self._result, ("points",), None)
+            if isinstance(points, Sequence) and not isinstance(points, (str, bytes)):
+                return list(points)
+            sector_bundle = _read(self._result, ("sector_peaks",), {})
+            points = _read(sector_bundle, ("points",), [])
+            return list(points) if isinstance(points, Sequence) and not isinstance(points, (str, bytes)) else []
+
+        def _is_sector_result(self) -> bool:
+            if self._trace_method() != _TRACE_METHOD_RADIAL_SECTOR:
+                return False
+            if isinstance(_read(self._result, ("sector_peaks",), None), Mapping):
+                return True
+            for point in self._result_points():
+                if isinstance(point, Mapping) and str(
+                    _read(point, ("source_method",), "") or ""
+                ).strip().lower() == _TRACE_METHOD_RADIAL_SECTOR:
+                    return True
+            return any(
+                isinstance(profile, Mapping)
+                and str(_read(profile, ("profile_axis",), "") or "").lower() == "radial"
+                for profile in self._profiles.values()
+            )
+
+        def _is_annular_result(self) -> bool:
+            if self._trace_method() != _TRACE_METHOD_ANNULAR_PEAK:
+                return False
+            if isinstance(_read(self._result, ("annular_peaks",), None), Mapping):
+                return True
+            return any(
+                isinstance(profile, Mapping)
+                and str(_read(profile, ("profile_axis",), "") or "").lower()
+                in {"azimuthal", "angular", "chi"}
+                for profile in self._profiles.values()
+            )
+
+        def _point_list_points(self) -> list[Any]:
+            """Return selectable rows, including profile-only sectors."""
+
+            if self._trace_method() == _TRACE_METHOD_RADIAL_SECTOR:
+                sector_bundle = _read(self._result, ("sector_peaks",), {})
+                sectors = _read(sector_bundle, ("sectors",), [])
+                if (
+                    isinstance(sectors, Sequence)
+                    and not isinstance(sectors, (str, bytes))
+                    and sectors
+                ):
+                    return list(sectors)
+            if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
+                annular_bundle = _read(self._result, ("annular_peaks",), {})
+                annuli = _read(annular_bundle, ("annuli",), [])
+                if (
+                    isinstance(annuli, Sequence)
+                    and not isinstance(annuli, (str, bytes))
+                    and annuli
+                ):
+                    return list(annuli)
+            return self._result_points()
+
+        def _render_quality_summary(self) -> None:
+            """Keep the compact evidence summary synchronized with page state."""
+
+            trace_method = self._settings.get("trace_method", _TRACE_METHOD_ANNULAR_PEAK)
+            # The page defaults to the new method for a new session, while a
+            # loaded legacy result may carry no method metadata at all. Do
+            # not reinterpret that old candidate's arc radius as a sector
+            # median merely because the current controls have a new default.
+            if (
+                trace_method == _TRACE_METHOD_RADIAL_SECTOR
+                and self._result
+                and not self._is_sector_result()
+            ):
+                trace_method = _TRACE_METHOD_CURVATURE
+            if (
+                trace_method == _TRACE_METHOD_ANNULAR_PEAK
+                and self._result
+                and not self._is_annular_result()
+            ):
+                trace_method = _TRACE_METHOD_CURVATURE
+            self.quality_summary.set_state(
+                self._result if self._result_fresh else {},
+                stage=str(self._settings.get("stage", "trace")),
+                page_state=self._page_status_state,
+                result_fresh=self._result_fresh,
+                data_ready=self._data_ready(),
+                busy=self._busy,
+                q_unit=self._frame_data.get("q_unit"),
+                poor_match=self._poor_geometry_fit(),
+                error=self._page_status_error,
+                trace_method=trace_method,
+            )
+
+        def _render_excluded_count(self) -> None:
+            english = self._language.lower().startswith("en")
+            self.excluded_count_label.setText(
+                f"{self._excluded_count} excluded"
+                if english
+                else f"已排除 {self._excluded_count} 个"
+            )
+            self.excluded_count_label.setToolTip(
+                "Points excluded from the active butterfly result"
+                if english
+                else "当前蝴蝶结果中未接受或无效的点数"
+            )
+
+        def _render_batch_feedback(self) -> None:
+            if self._batch_success_count is None:
+                self.batch_feedback_label.clear()
+                return
+            english = self._language.lower().startswith("en")
+            success_count = int(self._batch_success_count)
+            failures = list(self._batch_failure_items)
+            if failures:
+                details = "; ".join(str(item) for item in failures[:4])
+                if len(failures) > 4:
+                    details += f" (+{len(failures) - 4})"
+                self.batch_feedback_label.setText(
+                    f"Batch applied: {success_count} ready; failures: {details}"
+                    if english
+                    else f"批处理已应用：{success_count} 帧可用；失败：{details}"
+                )
+            else:
+                self.batch_feedback_label.setText(
+                    f"Batch applied: {success_count} frame(s) ready"
+                    if english
+                    else f"批处理已应用：{success_count} 帧可用"
+                )
+
         def _render_page_status(self) -> None:
             """Render the retained readiness/job/result state in the active language."""
 
@@ -1550,7 +2248,7 @@ if QT_AVAILABLE:
                 suffix = f": {visible_detail}" if visible_detail else ""
                 text = f"Failed · {kind_label}{suffix}" if english else f"失败 · {kind_label}{suffix}"
             elif state == "result":
-                count = len(self._result.get("points", []) or [])
+                count = len(self._result_points())
                 stage = self._settings.get("stage", "trace")
                 text = (
                     f"Result · {stage} · {count} points"
@@ -1558,7 +2256,7 @@ if QT_AVAILABLE:
                     else f"结果 · {'评估' if stage == 'evaluate' else '追踪'} · {count} 个点"
                 )
             elif state == "completed":
-                count = len(self._result.get("points", []) or [])
+                count = len(self._result_points())
                 text = (
                     f"Completed · {kind_label} · {count} points"
                     if english
@@ -1578,6 +2276,7 @@ if QT_AVAILABLE:
                 str(self._page_status_error or "") if state == "failed" else ""
             )
             self._render_workflow_hint()
+            self._render_quality_summary()
 
         def _render_workflow_hint(self) -> None:
             """Show the next useful operation without implying scientific acceptance."""
@@ -1612,10 +2311,10 @@ if QT_AVAILABLE:
             self._language = str(language)
             english = self._language.lower().startswith("en")
             self.qspace.set_language(self._language)
+            self.quality_summary.set_language(self._language)
             self.title_label.setText("Butterfly analysis" if english else "蝴蝶分析 / Butterfly analysis")
-            self.method_label.setText(
-                "Curvature ridge" if english else "论文曲率脊线"
-            )
+            self._render_trace_method_controls()
+            self._render_trace_method_label()
             self.frame_title_label.setText("Frames" if english else "帧 / Frames")
             self.point_title_label.setText("Points" if english else "点 / Points")
             self.frame_list.setAccessibleName("Frames" if english else "帧列表")
@@ -1684,6 +2383,18 @@ if QT_AVAILABLE:
             )
             self.global_max_check.setText(self._tr("check.raw_global_max"))
             self.supported_peaks_check.setText(self._tr("check.supported_peaks"))
+            self.global_max_check.setToolTip(
+                "Pixel raw-maximum diagnostic layer; it does not select the sector q*."
+                if english
+                else "像素原始最大值诊断图层；它不用于选择扇区 q*。"
+            )
+            self.supported_peaks_check.setToolTip(
+                "Pixel-supported-peak diagnostic layer; it does not replace sector-integrated I(q)."
+                if english
+                else "像素支持峰诊断图层；它不替代扇区积分 I(q)。"
+            )
+            self._apply_trace_method_landmark_visibility()
+            self._apply_trace_method_diagnostic_visibility()
             self.reset_peak_zoom_button.setText(self._tr("button.reset_peak_zoom"))
             previous_landmark = self._selected_landmark_id
             self._render_peak_table()
@@ -1695,6 +2406,17 @@ if QT_AVAILABLE:
             self.ellipse_diagnostic.set_language(english=english)
             self.peak_angular_profile.set_language(english=english)
             self.peak_radial_profile.set_language(english=english)
+            if self._selected_profile_point_id:
+                selected_point = None
+                for row in range(self.point_list.count()):
+                    item = self.point_list.item(row)
+                    candidate = item.data(QtCore.Qt.ItemDataRole.UserRole) if item else None
+                    if isinstance(candidate, Mapping) and str(
+                        candidate.get("point_id", "")
+                    ) == self._selected_profile_point_id:
+                        selected_point = candidate
+                        break
+                self._render_profile(self._selected_profile_point_id, selected_point)
             self.diagnostics_tabs.setTabText(
                 0, "Point diagnostics" if english else "测量点诊断"
             )
@@ -1744,6 +2466,10 @@ if QT_AVAILABLE:
                 if english
                 else "候选值为缓存且未验证，仅供诊断，不等同于定量值。"
             )
+            if self._result:
+                self._render_quantities(
+                    _read(self._result, ("quantitative_parameters",), {}) or {}
+                )
             self.findChild(QtWidgets.QGroupBox, "butterflyCorrections").setTitle(
                 "Corrections" if english else "校正 / 编辑"
             )
@@ -1799,6 +2525,8 @@ if QT_AVAILABLE:
                 "Select a measured point" if english else "请选择测量点"
             )
             self._render_magnification_label()
+            self._render_excluded_count()
+            self._render_batch_feedback()
             self._render_page_status()
             self._sync_action_state()
 
@@ -2151,6 +2879,11 @@ if QT_AVAILABLE:
             self._render_q_range_feedback()
             recipe_keys = {
                 "stage",
+                "trace_method",
+                "sector_width_deg",
+                "sector_step_deg",
+                "annular_radial_bins",
+                "annular_angle_bins",
                 "resamples",
                 "evaluation_resamples",
                 "seed",
@@ -2177,6 +2910,21 @@ if QT_AVAILABLE:
                 return
             recipe_source = {} if replace else deepcopy(self._settings)
             recipe_source.update(deepcopy(dict(nested)))
+            explicit_method = nested.get("trace_method")
+            if explicit_method in (None, ""):
+                explicit_method = settings.get("trace_method")
+            if explicit_method in (None, ""):
+                explicit_method = settings.get("ridge_method")
+            if explicit_method not in (None, ""):
+                recipe_source["trace_method"] = _canonical_trace_method(
+                    explicit_method,
+                    default=_TRACE_METHOD_CURVATURE,
+                )
+            elif replace and "trace_method" not in nested:
+                # A replaced recipe without the new field is an old project
+                # recipe.  Keep its curvature semantics instead of silently
+                # upgrading it to the new annular-trajectory default.
+                recipe_source["trace_method"] = _TRACE_METHOD_CURVATURE
             if "evaluation_resamples" in nested:
                 recipe_source["evaluation_resamples"] = nested["evaluation_resamples"]
             elif recipe_source.get("stage") == "evaluate" and "resamples" in nested:
@@ -2198,7 +2946,55 @@ if QT_AVAILABLE:
                     "butterfly evaluation_resamples must be a non-negative integer"
                 ) from exc
             normalized = normalize_butterfly_settings(recipe_source)
+            normalized["trace_method"] = _canonical_trace_method(
+                normalized.get("trace_method"),
+                default=_TRACE_METHOD_CURVATURE if replace else self._trace_method(),
+            )
+            normalized["sector_width_deg"] = min(
+                180.0,
+                max(0.5, _finite_positive(normalized.get("sector_width_deg"), 10.0)),
+            )
+            normalized["sector_step_deg"] = min(
+                180.0,
+                max(0.5, _finite_positive(normalized.get("sector_step_deg"), 5.0)),
+            )
+            normalized["annular_radial_bins"] = _bounded_int(
+                normalized.get("annular_radial_bins"),
+                40,
+                minimum=4,
+                maximum=192,
+            )
+            normalized["annular_angle_bins"] = _bounded_int(
+                normalized.get("annular_angle_bins"),
+                72,
+                minimum=16,
+                maximum=720,
+            )
             old_settings = normalize_butterfly_settings(self._settings)
+            old_settings["trace_method"] = _canonical_trace_method(
+                old_settings.get("trace_method"),
+                default=_TRACE_METHOD_ANNULAR_PEAK,
+            )
+            old_settings["sector_width_deg"] = min(
+                180.0,
+                max(0.5, _finite_positive(old_settings.get("sector_width_deg"), 10.0)),
+            )
+            old_settings["sector_step_deg"] = min(
+                180.0,
+                max(0.5, _finite_positive(old_settings.get("sector_step_deg"), 5.0)),
+            )
+            old_settings["annular_radial_bins"] = _bounded_int(
+                old_settings.get("annular_radial_bins"),
+                40,
+                minimum=4,
+                maximum=192,
+            )
+            old_settings["annular_angle_bins"] = _bounded_int(
+                old_settings.get("annular_angle_bins"),
+                72,
+                minimum=16,
+                maximum=720,
+            )
             self._settings = normalized
             edits = normalized.get("edits", [])
             self._edits = [dict(edit) for edit in edits if isinstance(edit, Mapping)]
@@ -2207,6 +3003,10 @@ if QT_AVAILABLE:
             self.qspace.set_edits(self._edits)
             self._update_edit_buttons()
             self._sync_evaluation_controls()
+            self._sync_trace_method_controls()
+            self._render_trace_method_label()
+            self._apply_trace_method_landmark_visibility()
+            self._apply_trace_method_diagnostic_visibility()
             if normalized != old_settings:
                 self.clear_result(
                     message=(
@@ -2223,7 +3023,9 @@ if QT_AVAILABLE:
         def reset_analysis_settings(self) -> None:
             """Reset the page recipe when a legacy project has no recipe."""
 
-            self.set_analysis_settings(DEFAULT_BUTTERFLY_SETTINGS, replace=True)
+            legacy_recipe = deepcopy(DEFAULT_BUTTERFLY_SETTINGS)
+            legacy_recipe["trace_method"] = _TRACE_METHOD_CURVATURE
+            self.set_analysis_settings(legacy_recipe, replace=True)
 
         def set_legacy_method(self, method: Any) -> None:
             value = str(method or "radial_peak")
@@ -2235,10 +3037,87 @@ if QT_AVAILABLE:
                 )
             self.legacy_banner.setVisible(bool(self._legacy_method))
 
+        def _point_list_label(
+            self,
+            point: Mapping[str, Any],
+            index: int,
+            *,
+            marker: str | None = None,
+        ) -> str:
+            if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
+                selected = _read(point, ("selected_peaks", "peaks"), ())
+                has_selected = bool(
+                    isinstance(selected, Sequence)
+                    and not isinstance(selected, (str, bytes))
+                    and len(selected)
+                )
+                accepted = bool(
+                    _read(
+                        point,
+                        ("accepted",),
+                        _read(point, ("valid",), has_selected),
+                    )
+                )
+            else:
+                accepted = bool(_read(point, ("accepted",), _read(point, ("valid",), True)))
+            marker_text = marker or ("✓" if accepted else "×")
+            if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
+                q_center = _read(point, ("q_center", "q"), None)
+                q_min = _read(point, ("q_min",), None)
+                q_max = _read(point, ("q_max",), None)
+                selected = _read(point, ("selected_peaks", "peaks"), ())
+                selected_count = (
+                    len(selected)
+                    if isinstance(selected, Sequence) and not isinstance(selected, (str, bytes))
+                    else 0
+                )
+                reason = _read(point, ("reason", "status", "failure_reason"), None)
+                if q_min not in (None, "") and q_max not in (None, ""):
+                    q_label = f"q=[{_fmt(q_min)}, {_fmt(q_max)}]"
+                elif q_center not in (None, ""):
+                    q_label = f"q={_fmt(q_center)}"
+                else:
+                    q_label = f"ring {index + 1}"
+                peak_label = (
+                    f"{selected_count} peaks"
+                    if self._language.lower().startswith("en")
+                    else f"{selected_count} 个峰"
+                )
+                if not selected_count and reason not in (None, ""):
+                    peak_label = str(reason)
+                return f"{marker_text} {q_label} · {peak_label}"
+            if self._trace_method() == _TRACE_METHOD_RADIAL_SECTOR:
+                center = _read(
+                    point,
+                    ("sector_center_deg", "chi_deg", "angular_peak_deg"),
+                    None,
+                )
+                q_star = _read(
+                    point,
+                    ("q_star", "selected_peak_q", "q"),
+                    None,
+                )
+                if center in (None, ""):
+                    center = f"sector {index + 1}"
+                else:
+                    center = f"χ={_fmt(center)}°"
+                if q_star in (None, ""):
+                    reason = _read(point, ("failure_reason", "reason", "status"), None)
+                    q_label = str(reason or ("unlocated" if self._language.lower().startswith("en") else "未定位"))
+                else:
+                    q_label = f"q*={_fmt(q_star)}"
+                return f"{marker_text} {center} · {q_label}"
+            point_id = str(_read(point, ("point_id",), "") or "")
+            qx = _fmt(_read(point, ("qx",), None))
+            qy = _fmt(_read(point, ("qy",), None))
+            return f"{marker_text} {point_id}  ({qx}, {qy})"
+
         def set_result(self, result: Any = None) -> None:
             butterfly = result if isinstance(result, Mapping) else {}
             self._result = deepcopy(dict(butterfly))
             self._result_fresh = bool(self._result)
+            if self._result:
+                self._adopt_result_trace_method(self._result)
             self._model_parameters = None
             self._model_reference_axis_deg = None
             self._model_status = None
@@ -2251,12 +3130,28 @@ if QT_AVAILABLE:
                 "review_notes": "",
                 "result_revision": self._result_revision if self._result_fresh else None,
             }
-            self.qspace.set_butterfly(self._result)
+            points = self._result_points()
+            list_points = self._point_list_points()
+            profiles = _read(self._result, ("profiles",), {})
+            profiles = dict(profiles) if isinstance(profiles, Mapping) else {}
+            sector_bundle = _read(self._result, ("sector_peaks",), {})
+            nested_profiles = _read(sector_bundle, ("profiles",), {})
+            if isinstance(nested_profiles, Mapping):
+                profiles.update(dict(nested_profiles))
+            annular_bundle = _read(self._result, ("annular_peaks",), {})
+            nested_profiles = _read(annular_bundle, ("profiles",), {})
+            if isinstance(nested_profiles, Mapping):
+                profiles.update(dict(nested_profiles))
+            display_result = dict(self._result)
+            display_result["points"] = points
+            display_result["profiles"] = profiles
+            self.qspace.set_butterfly(display_result)
             self._peak_landmarks = dict(
                 _read(self._result, ("peak_landmarks",), {}) or {}
             )
             self._selected_landmark = {}
             self._selected_landmark_id = None
+            self._selected_profile_point_id = None
             self._reset_landmark_zoom()
             self.qspace.set_peak_landmarks(self._peak_landmarks)
             self._render_peak_table()
@@ -2265,29 +3160,50 @@ if QT_AVAILABLE:
             self._refresh_fit_layers()
             self.point_list.blockSignals(True)
             self.point_list.clear()
-            for point in self._result.get("points", []) or []:
+            for index, point in enumerate(list_points):
                 if not isinstance(point, Mapping):
                     continue
-                point_id = str(_read(point, ("point_id",), "") or "")
-                qx = _fmt(_read(point, ("qx",), None))
-                qy = _fmt(_read(point, ("qy",), None))
-                accepted = bool(_read(point, ("accepted",), True))
+                if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
+                    selected = _read(point, ("selected_peaks", "peaks"), ())
+                    has_selected = bool(
+                        isinstance(selected, Sequence)
+                        and not isinstance(selected, (str, bytes))
+                        and len(selected)
+                    )
+                    accepted = bool(
+                        _read(
+                            point,
+                            ("accepted",),
+                            _read(point, ("valid",), has_selected),
+                        )
+                    )
+                else:
+                    accepted = bool(_read(point, ("accepted",), _read(point, ("valid",), True)))
                 marker = "✓" if accepted else "×"
-                item = QtWidgets.QListWidgetItem(f"{marker} {point_id}  ({qx}, {qy})")
+                item = QtWidgets.QListWidgetItem(
+                    self._point_list_label(point, index, marker=marker)
+                )
+                source_reason = _read(
+                    point,
+                    ("failure_reason", "reason", "status"),
+                    None,
+                )
+                if source_reason not in (None, ""):
+                    item.setToolTip(str(source_reason))
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(point))
                 self.point_list.addItem(item)
             self.point_list.blockSignals(False)
-            excluded_count = sum(
+            self._excluded_count = sum(
                 1
-                for point in (self._result.get("points", []) or [])
+                for point in points
                 if isinstance(point, Mapping)
                 and (
                     not bool(_read(point, ("valid",), True))
                     or not bool(_read(point, ("accepted",), True))
                 )
             )
-            self.excluded_count_label.setText(f"{excluded_count} excluded")
-            self._profiles = dict(_read(self._result, ("profiles",), {}) or {})
+            self._render_excluded_count()
+            self._profiles = dict(profiles or {}) if isinstance(profiles, Mapping) else {}
             self._ellipse_local = dict(_read(self._result, ("ellipse_local",), {}) or {})
             self._render_quantities(_read(self._result, ("quantitative_parameters",), {}) or {})
             diagnostics = _read(self._result, ("diagnostics",), {}) or {}
@@ -2336,16 +3252,26 @@ if QT_AVAILABLE:
             self.point_list.clear()
             self.point_list.blockSignals(False)
             self._selected_ellipse_point = {}
-            self.excluded_count_label.setText("0 excluded")
+            self._excluded_count = 0
+            self._render_excluded_count()
             self.quantity_table.setRowCount(0)
             self.normal_profile.clear()
             self.ellipse_diagnostic.clear()
+            self._selected_profile_point_id = None
             del message  # The structured state is rendered afresh on language changes.
             self._page_status_state = str(state or ("ready" if self._data_ready() else "empty"))
             self._page_status_kind = ""
             self._page_status_error = None
             self._render_page_status()
             self._sync_export_state()
+
+        def _set_quantity_cell(self, row: int, column: int, text: Any) -> None:
+            """Keep the complete value available when a narrow cell elides it."""
+
+            value = str(text)
+            item = QtWidgets.QTableWidgetItem(value)
+            item.setToolTip(value)
+            self.quantity_table.setItem(row, column, item)
 
         def _render_quantities(self, quantities: Mapping[str, Any]) -> None:
             self.quantity_table.setRowCount(0)
@@ -2399,7 +3325,7 @@ if QT_AVAILABLE:
                 for column, text in enumerate(
                     (display_name, _fmt(value), status_text, _fmt(candidate_value), interval_text, reason_text)
                 ):
-                    self.quantity_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
+                    self._set_quantity_cell(row, column, text)
             self._render_review_observables()
 
         def _render_review_observables(self) -> None:
@@ -2444,7 +3370,98 @@ if QT_AVAILABLE:
                 reading = "fail" if english else "失败"
             else:
                 reading = "ellipse" if english else "椭圆"
-            review_rows = (
+            sector_result = self._is_sector_result()
+            annular_result = self._is_annular_result()
+            q_star_label = (
+                "q* sector median (unassigned order)"
+                if english
+                else "主峰 q*中位数（未定级）"
+            ) if sector_result else ("q* (first-order)" if english else "一阶 q*")
+            ring_length_label = (
+                "2π/q* (apparent)"
+                if english
+                else "2π/q*（表观）"
+            ) if sector_result else ("L ring (nm)" if english else "环 L（nm）")
+            sector_summary = result.get("measurement_summary")
+            sector_summary = sector_summary if isinstance(sector_summary, Mapping) else {}
+            if sector_result:
+                # The selected-sector statistic is the authoritative radial
+                # readout for this method. Never populate it from the legacy
+                # arc-radius aliases, which describe a different observable.
+                sector_q_star = sector_summary.get(
+                    "q_star_sector_median", result.get("q_star_sector_median")
+                )
+                sector_q_source = sector_summary.get(
+                    "aggregation", "median of selected sector-profile peaks"
+                )
+                sector_period = sector_summary.get(
+                    "apparent_period_from_sector_median_nm",
+                    result.get("apparent_period_from_sector_median_nm"),
+                )
+                sector_q_unit = sector_summary.get(
+                    "q_star_sector_median_unit", result.get("q_unit", "unknown")
+                )
+                if canonical_q_unit(sector_q_unit) not in {"nm⁻¹", "Å⁻¹"}:
+                    sector_period = None
+            else:
+                sector_q_star = None
+                sector_q_source = None
+                sector_period = None
+            annular_points = [
+                point
+                for point in (result.get("points") or ())
+                if isinstance(point, Mapping)
+                and bool(point.get("accepted", point.get("valid", False)))
+                and bool(point.get("valid", True))
+            ] if annular_result else []
+            trajectory_ids = {
+                str(point.get("trajectory_id"))
+                for point in annular_points
+                if point.get("trajectory_id") not in (None, "")
+            }
+            annular_bundle = result.get("annular_peaks")
+            annuli = annular_bundle.get("annuli", ()) if isinstance(annular_bundle, Mapping) else ()
+            annular_rows = (
+                (
+                    "reading" if english else "判读",
+                    "annular I(χ) tracks" if english else "q 环 I(χ) 四瓣轨迹",
+                    quality.get("status"),
+                    None,
+                    None,
+                    "angular maxima are linked across q; no q* median or spacing is inferred"
+                    if english
+                    else "沿 q 连接每个环的方位峰；不由此推导 q* 中位数或周期",
+                ),
+                (
+                    "quality" if english else "质量",
+                    quality.get("status"),
+                    quality.get("status"),
+                    None,
+                    None,
+                    ", ".join(str(item) for item in (quality.get("flags") or ()) if item),
+                ),
+                (
+                    "track support" if english else "轨迹支持",
+                    f"{len(trajectory_ids)} tracks" if trajectory_ids else "—",
+                    "pending evaluation" if str(self._settings.get("stage", "trace")) == "trace" else None,
+                    None,
+                    None,
+                    "multiple q rings; up to four peaks per ring"
+                    if english
+                    else "多个 q 环；每环最多四个方位峰",
+                ),
+                (
+                    "annuli" if english else "q 环",
+                    len(annuli) if isinstance(annuli, Sequence) and not isinstance(annuli, (str, bytes)) else "—",
+                    None,
+                    None,
+                    None,
+                    "profiles include raw counts and coverage"
+                    if english
+                    else "剖面保留原始像素数和覆盖率",
+                ),
+            )
+            review_rows = annular_rows if annular_result else (
                 (
                     "reading" if english else "判读",
                     reading,
@@ -2470,18 +3487,23 @@ if QT_AVAILABLE:
                     None,
                 ),
                 (
-                    "q* (first-order)" if english else "一阶 q*",
-                    candidate.get("q_star_from_arcs", result.get("q_star_from_arcs")),
-                    candidate.get("q_star_source", result.get("q_star_source")),
+                    q_star_label,
+                    sector_q_star
+                    if sector_result
+                    else candidate.get("q_star_from_arcs", result.get("q_star_from_arcs")),
+                    sector_q_source
+                    if sector_result
+                    else candidate.get("q_star_source", result.get("q_star_source")),
                     None,
                     None,
                     None,
                 ),
                 (
-                    "L ring (nm)" if english else "环 L（nm）",
-                    candidate.get(
-                        "L_from_observed_radius_nm",
-                        result.get("L_from_observed_radius_nm"),
+                    ring_length_label,
+                    sector_period
+                    if sector_result
+                    else candidate.get(
+                        "L_from_observed_radius_nm", result.get("L_from_observed_radius_nm")
                     ),
                     None,
                     None,
@@ -2489,7 +3511,7 @@ if QT_AVAILABLE:
                     None,
                 ),
             )
-            if not unpublished_shape:
+            if not unpublished_shape and not annular_result:
                 extra = []
                 ln = candidate.get("Ln_from_minor_axis_nm", candidate.get("L_N"))
                 lz = candidate.get("Lz_from_draw_axis_nm", candidate.get("L_z"))
@@ -2551,17 +3573,17 @@ if QT_AVAILABLE:
                         "" if reason is None else str(reason),
                     )
                 ):
-                    self.quantity_table.setItem(row, column, QtWidgets.QTableWidgetItem(text))
+                    self._set_quantity_cell(row, column, text)
 
         def _on_point_selected(self, point: Any) -> None:
             if not isinstance(point, Mapping):
                 return
-            point_id = str(_read(point, ("point_id",), "") or "")
+            point_id = self._profile_id_for_entry(point)
             self.point_list.blockSignals(True)
             for row in range(self.point_list.count()):
                 item = self.point_list.item(row)
                 data = item.data(QtCore.Qt.ItemDataRole.UserRole)
-                if isinstance(data, Mapping) and str(data.get("point_id", "")) == point_id:
+                if isinstance(data, Mapping) and self._profile_id_for_entry(data) == point_id:
                     self.point_list.setCurrentRow(row)
                     break
             self.point_list.blockSignals(False)
@@ -2575,12 +3597,30 @@ if QT_AVAILABLE:
             point = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
             if not isinstance(point, Mapping):
                 return
-            self.qspace.set_selected_point(_read(point, ("point_id",), None))
+            if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
+                # An annulus row is an angular profile, not one editable
+                # q-space point.  Its selected peaks are shown in the profile.
+                self.qspace.set_selected_point(None)
+            elif bool(_read(point, ("profile_only",), False)):
+                self.qspace.set_selected_point(None)
+            else:
+                self.qspace.set_selected_point(_read(point, ("point_id",), None))
             self._on_point_selected(point)
+
+        @staticmethod
+        def _profile_id_for_entry(entry: Mapping[str, Any] | None) -> str:
+            if not isinstance(entry, Mapping):
+                return ""
+            value = _read(entry, ("profile_id", "point_id", "annulus_id"), "")
+            return str(value or "")
 
         def _exclude_selected_point(self) -> None:
             item = self.point_list.currentItem()
             point = item.data(QtCore.Qt.ItemDataRole.UserRole) if item is not None else None
+            if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
+                return
+            if isinstance(point, Mapping) and bool(_read(point, ("profile_only",), False)):
+                return
             point_id = _read(point, ("point_id",), None)
             if point_id not in (None, ""):
                 self._on_edit_requested({"type": "exclude_point", "point_id": str(point_id)})
@@ -2594,14 +3634,387 @@ if QT_AVAILABLE:
             if isinstance(y, Mapping):
                 y = _read(y, ("values", "data"), [])
             try:
-                return list(x or []), list(y or [])
+                return ([] if x is None else list(x)), ([] if y is None else list(y))
             except TypeError:
                 return [], []
 
+        def _sector_failure_text(
+            self,
+            point: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None = None,
+        ) -> str:
+            source = point if isinstance(point, Mapping) else {}
+            profile_map = profile if isinstance(profile, Mapping) else {}
+            reason = _read(
+                source,
+                ("failure_reason", "reason", "status"),
+                _read(profile_map, ("failure_reason", "reason", "status"), None),
+            )
+            raw_reason = str(reason or "").strip().lower()
+            translated = {
+                "selected": ("located" if self._language.lower().startswith("en") else "已定位"),
+                "no_peak": ("no peak located" if self._language.lower().startswith("en") else "未找到主峰"),
+                "ambiguous": ("ambiguous peaks" if self._language.lower().startswith("en") else "峰不唯一"),
+                "ambiguous_multiple_peaks": (
+                    "ambiguous peaks" if self._language.lower().startswith("en") else "峰不唯一"
+                ),
+                "low_coverage": (
+                    "insufficient coverage" if self._language.lower().startswith("en") else "覆盖不足"
+                ),
+                "insufficient_coverage": (
+                    "insufficient coverage" if self._language.lower().startswith("en") else "覆盖不足"
+                ),
+                "excluded_point_edit": (
+                    "manually excluded" if self._language.lower().startswith("en") else "手动排除"
+                ),
+            }
+            if raw_reason:
+                return translated.get(raw_reason, str(reason))
+            if not bool(_read(source, ("accepted", "valid"), True)):
+                return "rejected" if self._language.lower().startswith("en") else "未通过"
+            return "supported" if self._language.lower().startswith("en") else "可用"
+
+        @staticmethod
+        def _sector_failure_code(
+            point: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None = None,
+        ) -> str:
+            source = point if isinstance(point, Mapping) else {}
+            profile_map = profile if isinstance(profile, Mapping) else {}
+            reason = _read(
+                source,
+                ("failure_reason", "reason", "status"),
+                _read(profile_map, ("failure_reason", "reason", "status"), None),
+            )
+            if reason not in (None, ""):
+                return str(reason)
+            if not bool(_read(source, ("accepted", "valid"), True)):
+                return "rejected"
+            return "supported"
+
+        def _radial_profile_title(
+            self,
+            point_id: str,
+            point: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None,
+        ) -> str:
+            source = point if isinstance(point, Mapping) else {}
+            profile_map = profile if isinstance(profile, Mapping) else {}
+            center = _read(
+                source,
+                ("sector_center_deg", "chi_deg", "angular_peak_deg"),
+                _read(profile_map, ("sector_center_deg", "chi_deg"), None),
+            )
+            width = _read(
+                source,
+                ("sector_width_deg",),
+                _read(profile_map, ("sector_width_deg",), self._settings.get("sector_width_deg")),
+            )
+            selected_q = _read(
+                profile_map,
+                ("selected_peak_q",),
+                _read(source, ("q_star", "selected_peak_q", "q"), None),
+            )
+            reason = self._sector_failure_text(source, profile_map)
+            if self._language.lower().startswith("en"):
+                return (
+                    f"Radial sector I(q) · χ={_fmt(center)}° · "
+                    f"width={_fmt(width)}° · q*={_fmt(selected_q)} · {reason}"
+                )
+            return (
+                f"扇区积分 I(q) · χ={_fmt(center)}° · "
+                f"宽度={_fmt(width)}° · q*={_fmt(selected_q)} · {reason}"
+            )
+
+        def _radial_profile_tooltip(
+            self,
+            point_id: str,
+            point: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None,
+            title: str,
+        ) -> str:
+            source = point if isinstance(point, Mapping) else {}
+            profile_map = profile if isinstance(profile, Mapping) else {}
+            source_method = _read(
+                source,
+                ("source_method",),
+                _read(profile_map, ("source_method",), _TRACE_METHOD_RADIAL_SECTOR),
+            )
+            reason = self._sector_failure_code(source, profile_map)
+            return (
+                f"{title}\npoint_id={point_id}\nsource_method={source_method}\n"
+                f"reason={reason}"
+            )
+
+        def _annular_profile_title(
+            self,
+            profile_id: str,
+            annulus: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None,
+        ) -> str:
+            source = annulus if isinstance(annulus, Mapping) else {}
+            profile_map = profile if isinstance(profile, Mapping) else {}
+            q_center = _read(source, ("q_center",), _read(profile_map, ("q_center",), None))
+            q_min = _read(source, ("q_min",), _read(profile_map, ("q_min",), None))
+            q_max = _read(source, ("q_max",), _read(profile_map, ("q_max",), None))
+            peaks = _read(source, ("selected_peaks",), _read(profile_map, ("peak_angles_deg",), ()))
+            peak_count = (
+                len(peaks)
+                if isinstance(peaks, Sequence) and not isinstance(peaks, (str, bytes))
+                else 0
+            )
+            reason = self._sector_failure_text(source, profile_map)
+            q_unit = str(_read(profile_map, ("q_unit",), _read(source, ("q_unit",), "q")) or "q")
+            if q_min not in (None, "") and q_max not in (None, ""):
+                q_text = f"q=[{_fmt(q_min)}, {_fmt(q_max)}]"
+            else:
+                q_text = f"q={_fmt(q_center)}"
+            if self._language.lower().startswith("en"):
+                return f"Annular I(χ) · {q_text} {q_unit} · {peak_count} peaks · {reason}"
+            readable_reason = {
+                "four_observed_lobes": "四瓣均有支撑",
+                "partial_or_missing_lobe_support": "部分花瓣未形成连续轨迹",
+            }.get(reason, reason)
+            return f"q 环积分 I(χ) · {q_text} {q_unit} · {peak_count} 个峰 · {readable_reason}"
+
+        def _annular_profile_tooltip(
+            self,
+            profile_id: str,
+            annulus: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None,
+            title: str,
+        ) -> str:
+            source = annulus if isinstance(annulus, Mapping) else {}
+            profile_map = profile if isinstance(profile, Mapping) else {}
+            q_center = _read(source, ("q_center",), _read(profile_map, ("q_center",), None))
+            q_min = _read(source, ("q_min",), _read(profile_map, ("q_min",), None))
+            q_max = _read(source, ("q_max",), _read(profile_map, ("q_max",), None))
+            status = _read(source, ("status", "reason"), _read(profile_map, ("status", "reason"), ""))
+            return (
+                f"{title}\nprofile_id={profile_id}\n"
+                f"q_center={_fmt(q_center)}\nq_range=[{_fmt(q_min)}, {_fmt(q_max)}]\n"
+                f"status={status or '—'}\n"
+                "Each ring is an angular I(χ) profile; selected peaks are observed candidates."
+            )
+
+        def _render_annular_profile(
+            self,
+            profile_id: str,
+            annulus: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None,
+        ) -> None:
+            title = self._annular_profile_title(profile_id, annulus, profile)
+            self.normal_profile._title = "Annular I(χ)"
+            self.normal_profile.title_label.setText(title)
+            self.normal_profile.title_label.setToolTip(
+                self._annular_profile_tooltip(profile_id, annulus, profile, title)
+            )
+            self._selected_ellipse_point = {}
+            if not isinstance(profile, Mapping):
+                self.normal_profile.clear(
+                    message=(
+                        "No angular annulus profile; see the ring reason."
+                        if self._language.lower().startswith("en")
+                        else "暂无 q 环方位剖面；请查看该环的状态原因。"
+                    )
+                )
+                self.ellipse_diagnostic.clear(
+                    "No ellipse-local diagnostic in annular mode"
+                    if self._language.lower().startswith("en")
+                    else "q 环轨迹模式不提供椭圆局部诊断"
+                )
+                return
+            x, raw = self._series(profile, ("angle_deg", "chi_deg", "chi", "x"), ("raw_intensity", "raw", "intensity"))
+            _, smoothed = self._series(profile, ("angle_deg", "chi_deg", "chi", "x"), ("smoothed_intensity", "smoothed"))
+            _, counts = self._series(profile, ("angle_deg", "chi_deg", "chi", "x"), ("counts", "valid_counts"))
+            _, coverage = self._series(profile, ("angle_deg", "chi_deg", "chi", "x"), ("coverage",))
+            series = {
+                name: values
+                for name, values in (
+                    ("raw", raw),
+                    ("smoothed", smoothed),
+                    ("counts", counts),
+                    ("coverage", coverage),
+                )
+                if values
+            }
+            marker_values: list[float] = []
+            peak_angles = _read(profile, ("peak_angles_deg",), None)
+            if isinstance(peak_angles, Sequence) and not isinstance(peak_angles, (str, bytes)):
+                marker_values.extend(
+                    value for value in (_finite(item) for item in peak_angles) if value is not None
+                )
+            if not marker_values and isinstance(annulus, Mapping):
+                selected = _read(annulus, ("selected_peaks",), ())
+                if isinstance(selected, Sequence) and not isinstance(selected, (str, bytes)):
+                    marker_values.extend(
+                        value
+                        for value in (
+                            _finite(_read(item, ("chi_deg", "angle_deg", "chi"), None))
+                            if isinstance(item, Mapping)
+                            else _finite(item)
+                            for item in selected
+                        )
+                        if value is not None
+                    )
+            markers = [(value, f"χ={value:g}°") for value in marker_values]
+            if x and series:
+                self.normal_profile.set_series(
+                    x,
+                    series,
+                    x_label="χ (deg)" if self._language.lower().startswith("en") else "χ（deg）",
+                    y_label="I(χ)" if self._language.lower().startswith("en") else "I(χ) 强度",
+                    markers=markers,
+                    plot_names=("raw", "smoothed"),
+                )
+                self.normal_profile.title_label.setText(title)
+                self.normal_profile.title_label.setToolTip(
+                    self._annular_profile_tooltip(profile_id, annulus, profile, title)
+                )
+                if self.normal_profile.plot is not None:
+                    self.normal_profile.plot.getAxis("bottom").enableAutoSIPrefix(False)
+                    self.normal_profile.plot.setAccessibleDescription(
+                        "Angular I(χ) profile; raw and locator-only smoothed intensity; vertical lines mark selected lobe peaks"
+                        if self._language.lower().startswith("en")
+                        else "方位 I(χ) 剖面；显示原始强度和仅用于定位的平滑强度；竖线标记已选瓣峰"
+                    )
+            else:
+                self.normal_profile.clear(
+                    message=(
+                        "Angular annulus profile is empty; see the ring reason."
+                        if self._language.lower().startswith("en")
+                        else "q 环方位剖面为空；请查看该环的状态原因。"
+                    )
+                )
+                self.normal_profile.title_label.setText(title)
+                self.normal_profile.title_label.setToolTip(
+                    self._annular_profile_tooltip(profile_id, annulus, profile, title)
+                )
+            self.ellipse_diagnostic.clear(
+                "No ellipse-local diagnostic in annular mode"
+                if self._language.lower().startswith("en")
+                else "q 环轨迹模式不提供椭圆局部诊断"
+            )
+
+        def _render_radial_profile(
+            self,
+            point_id: str,
+            point: Mapping[str, Any] | None,
+            profile: Mapping[str, Any] | None,
+        ) -> None:
+            title = self._radial_profile_title(point_id, point, profile)
+            self.normal_profile._title = "Radial sector I(q)"
+            self.normal_profile.title_label.setText(title)
+            self.normal_profile.title_label.setToolTip(
+                self._radial_profile_tooltip(point_id, point, profile, title)
+            )
+            self._selected_ellipse_point = dict(point or {})
+            if not isinstance(profile, Mapping):
+                self.normal_profile.clear(
+                    message=(
+                        "No radial sector profile; see the point reason."
+                        if self._language.lower().startswith("en")
+                        else "暂无扇区径向剖面；请查看该点的失败原因。"
+                    )
+                )
+                self.ellipse_diagnostic.clear(
+                    "No ellipse-local diagnostic in radial sector mode"
+                    if self._language.lower().startswith("en")
+                    else "扇区积分模式不提供椭圆局部诊断"
+                )
+                return
+            x, raw = self._series(profile, ("q",), ("raw_intensity",))
+            _, smoothed = self._series(profile, ("q",), ("smoothed_intensity",))
+            _, counts = self._series(profile, ("q",), ("counts", "valid_counts"))
+            _, coverage = self._series(profile, ("q",), ("coverage",))
+            series = {
+                name: values
+                for name, values in (
+                    ("raw", raw),
+                    ("smoothed", smoothed),
+                    ("counts", counts),
+                    ("coverage", coverage),
+                )
+                if values
+            }
+            selected_q = _finite(_read(profile, ("selected_peak_q",), None))
+            if selected_q is None:
+                selected_q = _finite(_read(point, ("q_star", "selected_peak_q"), None))
+            q_unit = str(_read(profile, ("q_unit",), None) or self._frame_data.get("q_unit") or "q")
+            if x and series:
+                self.normal_profile.set_series(
+                    x,
+                    series,
+                    x_label=(f"q ({q_unit})" if self._language.lower().startswith("en") else f"q（{q_unit}）"),
+                    y_label="I(q)" if self._language.lower().startswith("en") else "I(q) 强度",
+                    markers=[] if selected_q is None else [(selected_q, "q*")],
+                    plot_names=("raw", "smoothed"),
+                )
+                self.normal_profile.title_label.setText(title)
+                self.normal_profile.title_label.setToolTip(
+                    self._radial_profile_tooltip(point_id, point, profile, title)
+                )
+                if self.normal_profile.plot is not None:
+                    self.normal_profile.plot.getAxis("bottom").enableAutoSIPrefix(False)
+                    self.normal_profile.plot.setAccessibleDescription(
+                        "Radial sector I(q); smoothed curve is only used for peak localization"
+                        if self._language.lower().startswith("en")
+                        else "扇区径向 I(q)；平滑曲线仅用于定位主峰"
+                    )
+            else:
+                self.normal_profile.clear(
+                    message=(
+                        "Radial sector profile is empty; see the point reason."
+                        if self._language.lower().startswith("en")
+                        else "扇区径向剖面为空；请查看该点的失败原因。"
+                    )
+                )
+                self.normal_profile.title_label.setText(title)
+                self.normal_profile.title_label.setToolTip(
+                    self._radial_profile_tooltip(point_id, point, profile, title)
+                )
+            self.ellipse_diagnostic.clear(
+                "No ellipse-local diagnostic in radial sector mode"
+                if self._language.lower().startswith("en")
+                else "扇区积分模式不提供椭圆局部诊断"
+            )
+
         def _render_profile(self, point_id: str, point: Mapping[str, Any] | None = None) -> None:
+            self._selected_profile_point_id = str(point_id)
             profile = self._profiles.get(point_id)
             if profile is None:
                 profile = self._profiles.get(str(point_id))
+            profile_axis = str(_read(profile, ("profile_axis",), "") or "").strip().lower()
+            is_annular = profile_axis in {"azimuthal", "angular", "chi"} or (
+                self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK
+                and (
+                    profile is None
+                    or (
+                        isinstance(profile, Mapping)
+                        and any(
+                            key in profile
+                            for key in ("angle_deg", "chi_deg", "peak_angles_deg")
+                        )
+                    )
+                )
+            )
+            if is_annular:
+                self._render_annular_profile(point_id, point, profile)
+                return
+            is_radial = profile_axis == "radial" or (
+                self._trace_method() == _TRACE_METHOD_RADIAL_SECTOR
+                and (
+                    profile is None
+                    or (
+                        isinstance(profile, Mapping)
+                        and "q" in profile
+                        and "raw_intensity" in profile
+                    )
+                )
+            )
+            if is_radial:
+                self._render_radial_profile(point_id, point, profile)
+                return
             if not isinstance(profile, Mapping):
                 self.normal_profile.clear()
                 self.ellipse_diagnostic.clear()
@@ -2810,15 +4223,9 @@ if QT_AVAILABLE:
             self.applyToBatchRequested.emit({"analysis": self.analysis_settings, "edits": self.edits})
 
         def set_batch_feedback(self, successes: Sequence[Any] = (), failures: Sequence[Any] = ()) -> None:
-            success_count = len(list(successes))
-            failure_items = list(failures)
-            if failure_items:
-                details = "; ".join(str(item) for item in failure_items[:4])
-                if len(failure_items) > 4:
-                    details += f" (+{len(failure_items) - 4})"
-                self.batch_feedback_label.setText(f"Batch applied: {success_count} ok; failures: {details}")
-            else:
-                self.batch_feedback_label.setText(f"Batch applied: {success_count} frame(s) ready")
+            self._batch_success_count = len(list(successes))
+            self._batch_failure_items = list(failures)
+            self._render_batch_feedback()
 
         def set_busy(self, busy: bool) -> None:
             self._busy = bool(busy)
@@ -2840,22 +4247,78 @@ if QT_AVAILABLE:
             """Route asynchronous worker outcomes into the page-local status."""
 
             state = str(state or "ready").lower()
+            lifecycle_state = state
             label = str(kind or "analysis")
             retain_error = state in {"error", "failed"} or result_ok is False
             if state == "canceled":
                 state = "cancelled"
             if result_ok is False:
                 state = "failed"
-            if state in {"cancelled", "ignored", "stale"} and label in {
-                "preview",
-                "optimize",
-                "measure_geometry",
-                "refine_geometry",
-                "trace",
-                "evaluate",
-            }:
-                self._result_fresh = False
-                self._clear_diagnostic_layers()
+            # A completed worker may have submitted a fresh diagnostic
+            # payload whose engineering quality is FAIL.  Preserve that
+            # payload; only an exception/error lifecycle invalidates the old
+            # measurement.
+            diagnostic_failure = bool(
+                result_ok is False
+                and lifecycle_state in {"completed", "complete", "result"}
+            )
+            detached_job = label in _DETACHED_JOB_KINDS or (
+                state in {"cancelled", "canceled"}
+                and self._detached_status_restore is not None
+            )
+            analysis_job = (
+                label in _ANALYSIS_JOB_KINDS
+                or (
+                    state in {"cancelled", "ignored", "stale"}
+                    and label in {"cancelled", "canceled", "ignored", "stale"}
+                )
+            ) and not detached_job
+            if detached_job and state in {"running", "cancelling"} and self._result_fresh:
+                # MainWindow first sends a generic ``running`` update from
+                # set_busy(), then the detached export kind.  Reconstruct the
+                # measurement state here so an export error can restore it.
+                self._detached_status_restore = (
+                    "result",
+                    str(self._settings.get("stage", "trace")),
+                    self._page_status_error,
+                )
+            elif detached_job and state in {
+                "cancelled",
+                "failed",
+                "error",
+                "completed",
+                "complete",
+                "ready",
+            } and self._result_fresh and self._detached_status_restore is None:
+                # A detached exporter may report an error without a preceding
+                # page-local running callback (for example in a direct test or
+                # a fast worker failure). Preserve the measurement in that
+                # case as well.
+                self._detached_status_restore = (
+                    "result",
+                    str(self._settings.get("stage", "trace")),
+                    self._page_status_error,
+                )
+            restoring_detached_page = bool(
+                self._detached_status_restore
+                and not detached_job
+                and label == self._detached_status_restore[1]
+                and state
+                in {"cancelled", "failed", "error", "completed", "complete", "result", "ready"}
+            )
+            terminal_analysis = analysis_job and state in {
+                "cancelled",
+                "ignored",
+                "stale",
+                "failed",
+                "error",
+            } and not restoring_detached_page and not diagnostic_failure
+            if terminal_analysis:
+                # A failed/cancelled analysis invalidates the displayed
+                # measurement itself.  Do not leave q*/L or export controls
+                # backed by a result that no longer belongs to the current job.
+                self.clear_result(state=state)
+                self._sync_action_state()
             if state in {"running", "cancelling"}:
                 if elapsed_s is not None:
                     self._job_elapsed_s = max(0.0, float(elapsed_s))
@@ -2867,12 +4330,28 @@ if QT_AVAILABLE:
                 self._job_elapsed_s = None
                 self._job_progress_percent = None
                 self._job_progress_phase = ""
-            self._page_status_state = {
-                "error": "failed",
-                "complete": "completed",
-            }.get(state, state)
-            self._page_status_kind = label
-            self._page_status_error = error if retain_error else None
+            restored_detached = (
+                detached_job
+                and state in {"cancelled", "failed", "error", "completed", "complete", "ready"}
+                and self._detached_status_restore
+            )
+            if restored_detached and self._result_fresh:
+                self._page_status_state, self._page_status_kind, restored_error = (
+                    self._detached_status_restore
+                )
+                self._page_status_error = restored_error
+                self._detached_status_restore = None
+            else:
+                self._page_status_state = {
+                    "error": "failed",
+                    "complete": "completed",
+                }.get(state, state)
+                self._page_status_kind = label
+                self._page_status_error = error if retain_error else None
+                if detached_job and state not in {"running", "cancelling"}:
+                    self._detached_status_restore = None
+                if restoring_detached_page:
+                    self._detached_status_restore = None
             self._render_page_status()
             try:
                 QtGui.QAccessible.updateAccessibility(

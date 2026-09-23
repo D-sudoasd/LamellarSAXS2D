@@ -18,7 +18,9 @@ from .butterfly_settings import METHOD_VERSION, normalize_butterfly_settings
 from .butterfly_quality import PARAMETERS, evaluate_arc_evidence
 from .cancellation import raise_if_cancelled
 from .public_ellipse import canonical_ellipse_payload, observed_arc_radius_period
+from .ridge_inputs import canonical_inputs
 from .serialization import strict_jsonable
+from .settings import canonical_q_unit
 
 
 def _read(value, name, default=None):
@@ -41,15 +43,6 @@ def _qmap_unit(qmap: Any) -> str:
             if nested not in (None, ""):
                 unit = nested
     return str(unit or "unknown")
-
-
-def _image(frame):
-    if isinstance(frame, np.ndarray):
-        return np.asarray(frame, dtype=float)
-    value = _read(frame, "data", _read(frame, "image", None))
-    if value is None:
-        raise ValueError("butterfly analysis requires a two-dimensional image")
-    return np.asarray(value, dtype=float)
 
 
 def _attach_candidate_diagnostics(candidate, source):
@@ -126,10 +119,14 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
         )
     try:
         reference_center = _trace_reference_center(trace)
+        sampling_options = (
+            {"observed_tip_constraint": False}
+            if trace.get("method_version", "").startswith("butterfly-annular-") else {}
+        )
         result = fit_arc_ellipses(trace["points"], parameters=parameters,
                                   reference_axis_deg=reference, multistart=multistart,
                                   max_nfev=max_nfev, cancel_event=cancel_event,
-                                  reference_center=reference_center)
+                                  reference_center=reference_center, **sampling_options)
     except ValueError as exc:
         # Keep the observed trace and candidate diagnostics available to the
         # correction/export boundary when the optimizer rejects its input.
@@ -194,6 +191,10 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
     q_star, radius_period, radius_flags = observed_arc_radius_period(
         supported, unit, first_order_q=hint
     )
+    annular = trace.get("method_version", "").startswith("butterfly-annular-")
+    if annular:
+        q_star, radius_period = None, None
+        radius_flags = ("prescribed_q_not_radial_peak",)
     bound_flags = getattr(fit, "bound_flags", {}) or {}
     extra_flags = list(radius_flags)
     if bound_flags.get("axis_ratio"):
@@ -201,7 +202,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
     payload["q_star_from_arcs"] = q_star
     payload["L_from_observed_radius_nm"] = radius_period
     payload["q_star_source"] = (
-        "first_order_iq"
+        "unavailable_prescribed_annuli" if annular else "first_order_iq"
         if "spacing_from_first_order_iq" in radius_flags
         else "observed_arc_radius"
     )
@@ -686,10 +687,16 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
     if qstep is not None and window[1] - window[0] > 4 * qstep:
         variants.extend([("q_contract", [window[0] + qstep, window[1] - qstep], {}),
                          ("q_expand", [max(0., window[0] - qstep), window[1] + qstep], {})])
-    scales = options.get("smoothing_scales", options.get("scales_px", [1.2, 2.2, 3.6]))
-    variants.extend((f"smoothing_{factor}", window,
-                     {"smoothing_scales": [float(x) * factor for x in scales]})
-                    for factor in (0.75, 1.25))
+    if options.get("trace_method") == "annular_peak":
+        variants.extend((f"annular_bins_{factor}", window,
+                         {"annular_radial_bins": max(4, round(options.get("annular_radial_bins", 40) * factor)),
+                          "annular_angle_bins": max(16, round(options.get("annular_angle_bins", 72) * factor))})
+                        for factor in (.75, 1.25))
+    else:
+        scales = options.get("smoothing_scales", options.get("scales_px", [1.2, 2.2, 3.6]))
+        variants.extend((f"smoothing_{factor}", window,
+                         {"smoothing_scales": [float(x) * factor for x in scales]})
+                        for factor in (0.75, 1.25))
     if qstep is not None:
         for axis in ("center_qx", "center_qy"):
             for sign in (-1, 1):
@@ -843,6 +850,90 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
             "center_perturbation_kind": "half_pixel_sensitivity_not_instrument_uncertainty"}
 
 
+def _sector_measurement_summary(trace: Mapping[str, Any], q_unit: Any, edits: Any) -> dict[str, Any]:
+    """Summarize selected radial-sector peaks without changing fit fields.
+
+    The sector tracer measures one profile per finite azimuthal footprint. Its
+    median is therefore an observed-sector statistic, rather than the radius
+    of a fitted ellipse or a claim that every azimuth contains one identical
+    ring. Keep this summary separate from ``candidate_fit`` so the historical
+    ``q_star_from_arcs`` field continues to describe the value actually
+    produced by the arc-fit path.
+    """
+
+    bundle = trace.get("sector_peaks") if isinstance(trace, Mapping) else None
+    bundle = bundle if isinstance(bundle, Mapping) else {}
+    sectors = bundle.get("sectors")
+    sectors = sectors if isinstance(sectors, (list, tuple)) else []
+    excluded_ids = {
+        str(edit.get("point_id"))
+        for edit in (edits if isinstance(edits, (list, tuple)) else [])
+        if isinstance(edit, Mapping)
+        and str(edit.get("type", "")) == "exclude_point"
+        and edit.get("point_id") not in (None, "")
+    }
+    selected_before: list[float] = []
+    selected_after: list[float] = []
+    for sector in sectors:
+        if not isinstance(sector, Mapping):
+            continue
+        peak = sector.get("selected_peak")
+        if isinstance(peak, Mapping):
+            q_value = peak.get("q_star", sector.get("selected_peak_q", sector.get("q_star")))
+        else:
+            q_value = sector.get("selected_peak_q", sector.get("q_star"))
+        try:
+            q_value = float(q_value)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(q_value) or q_value <= 0.0:
+            continue
+        selected_before.append(q_value)
+        point_id = str(sector.get("point_id", ""))
+        manually_excluded = point_id in excluded_ids or str(
+            sector.get("geometry_reason", sector.get("reason", ""))
+        ) == "excluded_point_edit"
+        if not manually_excluded:
+            selected_after.append(q_value)
+
+    q_median = float(np.median(np.asarray(selected_after, dtype=float))) if selected_after else None
+    try:
+        canonical_unit = canonical_q_unit(q_unit)
+    except (TypeError, ValueError):
+        canonical_unit = str(q_unit or "unknown")
+    if canonical_unit == "nm⁻¹":
+        q_to_nm_inverse = 1.0
+    elif canonical_unit == "Å⁻¹":
+        q_to_nm_inverse = 10.0
+    else:
+        q_to_nm_inverse = None
+    apparent_period = (
+        float(2.0 * np.pi / (q_median * q_to_nm_inverse))
+        if q_median is not None and q_to_nm_inverse is not None
+        else None
+    )
+    overlap = bundle.get("sector_overlap")
+    overlap = dict(overlap) if isinstance(overlap, Mapping) else {}
+    return {
+        "q_star_sector_median": q_median,
+        "q_star_sector_median_unit": str(q_unit or "unknown"),
+        "q_unit": str(q_unit or "unknown"),
+        "q_star_source": "selected_sector_peak_median",
+        "apparent_period_from_sector_median_nm": apparent_period,
+        "apparent_period_unit": "nm" if apparent_period is not None else None,
+        "n_selected_sector_peaks": len(selected_after),
+        "n_selected_sector_peaks_before_manual_exclusion": len(selected_before),
+        "n_manual_excluded_sector_peaks": len(selected_before) - len(selected_after),
+        "aggregation": "median of selected finite sector-profile peaks after manual exclusion",
+        "peak_order": "unassigned",
+        "interpretation": (
+            "selected-sector q* median; it does not assert one ring at every angle; "
+            "overlapping sectors are correlated and reflection order is unassigned"
+        ),
+        "sector_overlap": overlap,
+    }
+
+
 def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
                       parameters=None, reference_axis_deg=0., multistart=7, cancel_event=None,
                       _radial_hint_cache=None):
@@ -853,9 +944,9 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
     settings = normalize_butterfly_settings(options)
     settings.setdefault("snr_threshold", DEFAULT_ANALYSIS_SETTINGS["ridge_snr_threshold"])
     settings.setdefault("max_nfev", DEFAULT_ANALYSIS_SETTINGS["max_nfev"])
-    image = _image(image)
-    if image.ndim != 2:
-        raise ValueError("butterfly analysis requires a 2D image")
+    image, _qx, _qy, _q, input_invalid = canonical_inputs(image, qmap, mask=mask)
+    mask = input_invalid
+    base_invalid = np.asarray(input_invalid, dtype=bool)
     q_unit = _qmap_unit(qmap)
     for qname, pname in (("center_qx", "cx"), ("center_qy", "cy")):
         if isinstance(parameters, Mapping) and pname in parameters:
@@ -864,15 +955,37 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
     radial_hint_cache = _radial_hint_cache
     if (
         radial_hint_cache is None
+        and settings["trace_method"] == "curvature"
         and settings["stage"] == "evaluate"
         and settings["resamples"] > 0
     ):
         radial_hint_cache = _RadialHintGeometryCache()
     raise_if_cancelled(cancel_event, "butterfly:trace")
-    trace = trace_butterfly_ridges(image, qmap, q_window, mask=mask,
-                                  reference_axis_deg=reference_axis_deg, options=settings,
-                                  edits=settings["edits"], cancel_event=cancel_event,
-                                  radial_hint_cache=radial_hint_cache)
+    if settings["trace_method"] == "annular_peak":
+        from .annular_trace import trace_butterfly_annuli
+
+        trace = trace_butterfly_annuli(
+            image, qmap, q_window, mask=mask, reference_axis_deg=reference_axis_deg,
+            options=settings, edits=settings["edits"], cancel_event=cancel_event,
+        )
+    elif settings["trace_method"] == "radial_sector":
+        from .sector_trace import trace_butterfly_sector_peaks
+
+        trace = trace_butterfly_sector_peaks(
+            image, qmap, q_window, mask=mask, reference_axis_deg=reference_axis_deg,
+            options=settings, edits=settings["edits"], cancel_event=cancel_event,
+        )
+    else:
+        # UI-only sector controls must not change the historical curvature
+        # point identity or invalidate saved point exclusions for that method.
+        curvature_settings = {
+            key: value for key, value in settings.items()
+            if key != "trace_method" and not key.startswith(("sector_", "annular_"))
+        }
+        trace = trace_butterfly_ridges(image, qmap, q_window, mask=mask,
+                                      reference_axis_deg=reference_axis_deg, options=curvature_settings,
+                                      edits=settings["edits"], cancel_event=cancel_event,
+                                      radial_hint_cache=radial_hint_cache)
     candidate = _empty_candidate(q_unit, reference_axis_deg, diagnostics=trace)
     uncertainty = {"intervals": {}, "coverage_calibrated": False, "status": "not_run"}
     sensitivity = {"completed": False, "records": [], "held_out_arcs": []}
@@ -886,7 +999,18 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
             def refit(perturbed, overrides):
                 overrides = dict(overrides)
                 perturbed_qmap = overrides.pop("qmap", qmap)
-                perturbed_mask = overrides.pop("mask", mask)
+                override_mask = overrides.pop("mask", None)
+                if override_mask is None:
+                    perturbed_mask = base_invalid
+                else:
+                    try:
+                        override_mask = np.asarray(
+                            np.broadcast_to(np.asarray(override_mask, dtype=bool), base_invalid.shape),
+                            dtype=bool,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("resampling mask must broadcast to image shape") from exc
+                    perturbed_mask = base_invalid | override_mask
                 replicate_radial_cache = radial_hint_cache
                 qmap_perturbation = overrides.get("qmap_perturbation")
                 if isinstance(qmap_perturbation, Mapping):
@@ -925,13 +1049,55 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
         for row in evidence["quantitative_parameters"].values():
             row.update(status="not_evaluated", empirical_status="not_evaluated",
                        reason="geometry_not_evaluated", reasons=["geometry_not_evaluated"])
+    method_version = trace["method_version"] if settings["trace_method"] != "curvature" else METHOD_VERSION
+    sector_measurement = None
+    if settings["trace_method"] == "radial_sector":
+        candidate["flags"] = list(dict.fromkeys([
+            *(candidate.get("flags") or ()), "peak_order_unassigned", "finite_sector_footprint",
+        ]))
+        evidence["quality"]["measurement_definition"] = "dominant peak of a finite azimuthal-sector radial mean profile"
+        # Keep this observed-sector statistic independent from the historical
+        # arc-fit aliases.  In particular, do not relabel a fitted
+        # ``q_star_from_arcs`` value as a sector median when the two happen to
+        # be numerically close.
+        sector_measurement = _sector_measurement_summary(
+            trace, q_unit, settings.get("edits", [])
+        )
+    if settings["trace_method"] == "annular_peak":
+        candidate["flags"] = list(dict.fromkeys([
+            *(candidate.get("flags") or ()), "prescribed_q_not_radial_peak", "angular_scan_not_normal_ridge",
+        ]))
+        evidence["quality"]["measurement_definition"] = "azimuthal maxima on successive prescribed q annuli"
+        candidate["major_axis_prior"] = {
+            "observed_tip_constraint": False,
+            "reason": "the analysis q boundary is not evidence of an ellipse tip",
+            "explicit_user_bounds_preserved": True,
+        }
+        observed_radii = [float(np.hypot(p["qx"], p["qy"])) for p in trace["points"] if p.get("accepted")]
+        extent = max(observed_radii, default=0.)
+        major = candidate.get("a")
+        extrapolated = bool(major is not None and extent > 0 and major > 3 * extent)
+        candidate["axis_identifiability"] = {
+            "major_axis_status": "not_identified" if extrapolated else "requires_sensitivity_review",
+            "observed_radius_max_q": extent or None,
+            "a_over_observed_radius_max": float(major / extent) if major is not None and extent else None,
+            "sampling_scale_is_not_measurement_uncertainty": True,
+            "optimizer_weighting": "inverse angular-bin sampling scale; not detector-error weighting",
+        }
     payload = {**trace, **evidence, "candidate_fit": candidate, "uncertainty": uncertainty,
                "sensitivity": sensitivity, "edits": settings["edits"], "settings": settings,
-               "method_version": METHOD_VERSION}
+               "method_version": method_version}
+    if sector_measurement is not None:
+        payload["measurement_summary"] = sector_measurement
+        payload["q_star_sector_median"] = sector_measurement["q_star_sector_median"]
+        payload["q_star_sector_median_unit"] = sector_measurement["q_star_sector_median_unit"]
+        payload["apparent_period_from_sector_median_nm"] = sector_measurement[
+            "apparent_period_from_sector_median_nm"
+        ]
     payload["ellipse_local"] = ellipse_local_views(trace.get("points", []), candidate)
     payload["recipe_sha256"] = hashlib.sha256(json.dumps(settings, sort_keys=True,
         ensure_ascii=True, allow_nan=False).encode()).hexdigest()
-    candidate.update({**evidence, "method_version": METHOD_VERSION,
+    candidate.update({**evidence, "method_version": method_version,
                       "uncertainty": uncertainty, "sensitivity": sensitivity})
     return strict_jsonable(payload)
 
@@ -955,7 +1121,6 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
     # Landmarks are independent display/measurement diagnostics. Calculate
     # them once at this public adapter, never in each uncertainty refit.
     from .peak_landmarks import compute_peak_landmarks
-    from .ridge_inputs import canonical_inputs
     from .butterfly_ridge import _parse_q_window, _apply_edits
 
     peak_image, peak_qx, peak_qy, peak_q, peak_invalid = canonical_inputs(frame, qmap, mask=mask)
@@ -964,6 +1129,7 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
                   & np.isfinite(peak_qy) & np.isfinite(peak_q)
                   & (peak_q >= peak_window[0]) & (peak_q <= peak_window[1]))
     peak_valid, peak_edits, _ = _apply_edits(peak_valid, peak_qx, peak_qy, result.get("edits", []))
+    companion_mask = ~peak_valid
     peak_hint = result.get("diagnostics", {}).get("first_order_q_hint", {})
     signal_window = peak_hint.get("band") if peak_hint.get("selection_status") == "selected" else None
     peak_options = dict(settings.get("peak_landmark_options") or {})
@@ -977,17 +1143,27 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
         options=peak_options, cancel_event=cancel_event,
     )
     result["peak_landmarks"]["domain"]["applied_polygon_edits"] = peak_edits
-    unit = str(_read(qmap, "q_unit", "unknown"))
+    unit = _qmap_unit(qmap)
     if settings.get("companion_observables", True):
         raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
-        angular = measure_angular_spectrum(frame, qmap, q_window, n_bins=n_angular_bins, mask=mask)
+        angular = measure_angular_spectrum(
+            frame, qmap, q_window, n_bins=n_angular_bins, mask=companion_mask
+        )
         raise_if_cancelled(cancel_event, "butterfly:angular-spectrum")
         lobes = measure_four_lobe_peaks(angular, symmetric_refine=True,
                                        reference_axis_deg=draw_axis_deg - 90.)
         raise_if_cancelled(cancel_event, "butterfly:lobe-peaks")
-        profiles, radial_peaks = _measure_lobe_radial_observables(frame, qmap, q_window, lobes,
-            n_radial_bins=n_radial_bins, snr_threshold=float(result["settings"]["snr_threshold"]),
-            min_coverage=0., mask=mask, cancel_event=cancel_event)
+        profiles, radial_peaks = _measure_lobe_radial_observables(
+            frame,
+            qmap,
+            q_window,
+            lobes,
+            n_radial_bins=n_radial_bins,
+            snr_threshold=float(result["settings"]["snr_threshold"]),
+            min_coverage=0.,
+            mask=companion_mask,
+            cancel_event=cancel_event,
+        )
         raise_if_cancelled(cancel_event, "butterfly:lobe-profiles")
         tilt, spread = apparent_lamellar_tilt(lobes, draw_axis_deg=draw_axis_deg)
         raise_if_cancelled(cancel_event, "butterfly:lobe-summary")
@@ -1008,9 +1184,10 @@ def measure_butterfly_observables(frame, qmap, q_window, *, mask=None, options=N
         profiles, radial_peaks = [], []
         tilt, spread = float("nan"), float("nan")
     points = result.get("points", [])
-    ridge = {"points": points, "q_unit": unit, "flags": [METHOD_VERSION],
+    ridge = {"points": points, "q_unit": unit,
+             "flags": [str(result.get("method_version") or METHOD_VERSION)],
              "valid_fraction": sum(bool(p.get("accepted")) for p in points) / max(1, len(points)),
-             "method": "butterfly_curvature"}
+             "method": result["settings"]["trace_method"] if result["settings"]["trace_method"] != "curvature" else "butterfly_curvature"}
     return ObservableSet(angular=angular, lobes=lobes, ridge=ridge,
         ellipse=result["candidate_fit"], phi_app_deg=tilt, phi_app_std_deg=spread,
         draw_axis_deg=draw_axis_deg, q_unit=unit, lobe_radial_profiles=profiles,

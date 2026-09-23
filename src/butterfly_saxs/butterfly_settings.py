@@ -26,6 +26,25 @@ def normalize_butterfly_settings(settings=None) -> dict:
     result.setdefault("seed", 20260906)
     result.setdefault("edits", [])
     result.setdefault("sensitivity", True)
+    # Existing project recipes retain their historical curvature observable.
+    # Sector-profile peak measurement is an explicit, separately versioned choice.
+    result.setdefault("trace_method", "curvature")
+    if result["trace_method"] not in {"curvature", "radial_sector", "annular_peak"}:
+        raise ValueError("butterfly trace_method must be curvature, radial_sector or annular_peak")
+    for name, minimum, maximum in (("annular_radial_bins", 4, 192), ("annular_angle_bins", 16, 720)):
+        if name in result:
+            result[name] = strict_int(result[name], name, minimum=minimum)
+            if result[name] > maximum:
+                raise ValueError(f"{name} must be <= {maximum}")
+    for name in ("sector_width_deg", "sector_step_deg"):
+        if name in result:
+            value = result[name]
+            if isinstance(value, bool):
+                raise ValueError(f"{name} must be a positive finite angle")
+            value = float(value)
+            if not math.isfinite(value) or not 0 < value <= 180:
+                raise ValueError(f"{name} must be in (0, 180] degrees")
+            result[name] = value
     if result["stage"] not in {"trace", "evaluate"}:
         raise ValueError("butterfly stage must be trace or evaluate")
     for key in ("resamples", "seed"):
