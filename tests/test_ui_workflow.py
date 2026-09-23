@@ -33,6 +33,31 @@ class _BatchEngine:
         }
 
 
+class _PartialFailureBatchEngine:
+    def __init__(self) -> None:
+        self.payloads: list[dict] = []
+
+    def batch(self, *, parameters, payload):
+        del parameters
+        self.payloads.append(payload)
+        return {
+            "records": [
+                {"frame": "good-frame.tif", "status": "ok"},
+                {
+                    "frame": "bad-frame.tif",
+                    "status": "failed",
+                    "error": "read failed",
+                },
+            ]
+        }
+
+
+class _CancelledBatchEngine:
+    def batch(self, *, parameters, payload):
+        del parameters, payload
+        return {"records": [{"frame": "first.tif", "status": "ok"}], "cancelled": True}
+
+
 class _StateEngine:
     def __init__(self) -> None:
         self.parameters = {
@@ -110,6 +135,66 @@ def test_pattern_views_force_row_major_for_rectangular_detector_arrays(qtbot) ->
         assert rect.width() == pytest.approx(observed.shape[1])
         assert rect.height() == pytest.approx(observed.shape[0])
     grid.close()
+
+
+def test_run_batch_rejects_empty_frame_selection(qtbot) -> None:
+    engine = _BatchEngine()
+    window = MainWindow(engine=engine, auto_preview=False)
+    qtbot.addWidget(window)
+
+    generation = window.run_batch()
+
+    assert generation > 0
+    assert engine.payloads == []
+    assert not window._workers
+    assert window._status_key == "status.job_error"
+    assert window._status_values["error"] == "no batch frames selected"
+    window.close()
+
+
+def test_run_batch_stream_requires_output_directory(qtbot) -> None:
+    engine = _BatchEngine()
+    window = MainWindow(engine=engine, auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_batch_frames(["frame.tif"])
+    window.batch_stream_check.setChecked(True)
+
+    generation = window.run_batch()
+
+    assert generation > 0
+    assert engine.payloads == []
+    assert not window._workers
+    assert window._status_key == "status.job_error"
+    assert window._status_values["error"] == "streaming requires an output directory"
+    window.close()
+
+
+def test_batch_failed_record_sets_failed_completion_status(qtbot) -> None:
+    engine = _PartialFailureBatchEngine()
+    window = MainWindow(engine=engine, auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_batch_frames(["good-frame.tif", "bad-frame.tif"])
+
+    window.run_batch()
+    qtbot.waitUntil(lambda: window._status_key == "status.job_failed", timeout=2_000)
+
+    assert engine.payloads
+    assert "batch failed" in window.status_message.text().lower()
+    assert "bad-frame.tif" in window.butterfly_workbench.batch_feedback_label.text()
+    window.close()
+
+
+def test_partially_cancelled_batch_shows_cancelled_status(qtbot) -> None:
+    window = MainWindow(engine=_CancelledBatchEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_batch_frames(["first.tif", "second.tif"])
+
+    window.run_batch()
+    qtbot.waitUntil(lambda: window._status_key == "status.cancelled", timeout=2_000)
+
+    assert "cancelled" in window.status_message.text().lower()
+    assert window.butterfly_workbench.batch_feedback_label.text()
+    window.close()
 
 
 def test_parameter_edit_invalidates_an_inflight_worker_result(qtbot) -> None:

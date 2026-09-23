@@ -229,10 +229,20 @@ def _file_content_fingerprint(value: Any) -> dict[str, Any] | None:
     return record
 
 
-def _config_with_file_fingerprints(value: Any, *, key: str | None = None) -> Any:
+def _config_with_file_fingerprints(
+    value: Any,
+    *,
+    key: str | None = None,
+    require_content_hash: bool = False,
+) -> Any:
     """Copy config while binding geometry/mask/uncertainty file contents."""
 
-    return _config_with_file_fingerprints_cached(value, key=key, cache={})
+    return _config_with_file_fingerprints_cached(
+        value,
+        key=key,
+        cache={},
+        require_content_hash=require_content_hash,
+    )
 
 
 def _config_with_file_fingerprints_cached(
@@ -240,6 +250,7 @@ def _config_with_file_fingerprints_cached(
     *,
     key: str | None = None,
     cache: dict[str, dict[str, Any] | None],
+    require_content_hash: bool = False,
 ) -> Any:
     """Recursive implementation with one bounded digest per canonical path."""
 
@@ -284,20 +295,46 @@ def _config_with_file_fingerprints_cached(
             fingerprint = _file_content_fingerprint(candidate)
             if cache_key is not None:
                 cache[cache_key] = fingerprint
+        candidate_is_file_path = (
+            isinstance(candidate, (str, os.PathLike, Path))
+            and str(candidate).strip().casefold() not in {"in-memory", "in_memory"}
+        )
+        if (
+            require_content_hash
+            and candidate_is_file_path
+            and (fingerprint is None or fingerprint.get("sha256") is None)
+        ):
+            raise ValueError(
+                "configured analysis file SHA-256 is unavailable; "
+                f"refusing checkpoint/resume for {candidate!s}"
+            )
         if fingerprint is not None:
             return {"value": _json_safe(value), "content": fingerprint}
     if isinstance(value, Mapping):
         return {
-            str(name): _config_with_file_fingerprints_cached(item, key=str(name), cache=cache)
+            str(name): _config_with_file_fingerprints_cached(
+                item,
+                key=str(name),
+                cache=cache,
+                require_content_hash=require_content_hash,
+            )
             for name, item in value.items()
         }
     if is_dataclass(value):
         return _config_with_file_fingerprints_cached(
-            {item.name: getattr(value, item.name) for item in fields(value)}
-            , cache=cache
+            {item.name: getattr(value, item.name) for item in fields(value)},
+            cache=cache,
+            require_content_hash=require_content_hash,
         )
     if isinstance(value, (list, tuple, set, frozenset)):
-        return [_config_with_file_fingerprints_cached(item, cache=cache) for item in value]
+        return [
+            _config_with_file_fingerprints_cached(
+                item,
+                cache=cache,
+                require_content_hash=require_content_hash,
+            )
+            for item in value
+        ]
     return _json_safe(value)
 
 
@@ -896,6 +933,7 @@ def input_fingerprint(
     *,
     progress: Callable[[Mapping[str, Any]], Any] | None = None,
     cancel_event: Any = None,
+    require_content_hash: bool = False,
 ) -> str:
     """SHA-256 identity of every selected frame file.
 
@@ -906,6 +944,7 @@ def input_fingerprint(
 
     items = list(refs)
     records: list[dict[str, Any]] = []
+    unavailable: list[str] = []
     total = len(items)
     for index, ref in enumerate(items):
         if _is_cancelled(cancel_event):
@@ -947,6 +986,16 @@ def input_fingerprint(
                 stat["content_hash_algorithm"] = "sha256"
                 stat["content_sha256"] = None
                 stat["content_hash_unavailable"] = True
+        else:
+            stat.update(
+                {
+                    "content_hash_algorithm": "sha256",
+                    "content_sha256": None,
+                    "content_hash_unavailable": True,
+                }
+            )
+        if require_content_hash and stat.get("content_sha256") is None:
+            unavailable.append(str(path))
         ref_record = ref.to_dict()
         ref_record["path"] = _canonical_path(path)
         records.append({"ref": ref_record, "file": stat})
@@ -958,14 +1007,27 @@ def input_fingerprint(
                 "total": total,
             }
         )
+    if unavailable:
+        raise ValueError(
+            "input content SHA-256 is unavailable; refusing checkpoint/resume for: "
+            + ", ".join(unavailable[:5])
+        )
     return _hash_json(records)
 
 
-def config_fingerprint(config: Any = None, *, mode: str = "independent") -> str:
+def config_fingerprint(
+    config: Any = None,
+    *,
+    mode: str = "independent",
+    require_content_hash: bool = False,
+) -> str:
     return _hash_json(
         {
             "mode": mode,
-            "config": _config_with_file_fingerprints(config),
+            "config": _config_with_file_fingerprints(
+                config,
+                require_content_hash=require_content_hash,
+            ),
         }
     )
 
@@ -1224,6 +1286,13 @@ def _quality_failure_reason(result: Any) -> str | None:
 
     if result is None:
         return "result=None"
+    quality_status = _named_value(result, "quality_status")
+    if _is_failure_status(quality_status):
+        return f"quality_status={quality_status}"
+    quality = _named_value(result, "quality")
+    nested_quality_status = _named_value(quality, "status")
+    if _is_failure_status(nested_quality_status):
+        return f"quality.status={nested_quality_status}"
     butterfly = _butterfly_payload(result)
     if butterfly is None:
         butterfly = _named_value(result, "butterfly")
@@ -1705,6 +1774,9 @@ def run_batch(
     )
     callback = progress if progress is not None else on_progress
     started_batch = __import__("time").perf_counter()
+    # Checkpointed runs must carry content identities from the start.  A
+    # resumed run repeats the same gate before comparing the stored hashes.
+    require_content_hash = checkpoint_file is not None or resume
 
     def cancelled() -> bool:
         return _is_cancelled(cancel_event)
@@ -1739,11 +1811,16 @@ def run_batch(
             refs,
             progress=hash_progress if callback is not None else None,
             cancel_event=cancelled,
+            require_content_hash=require_content_hash,
         )
         if cancelled():
             raise AnalysisCancelled("batch cancelled while hashing inputs")
         emit_phase("config_fingerprint")
-        config_hash = config_fingerprint(fingerprint_config, mode=mode)
+        config_hash = config_fingerprint(
+            fingerprint_config,
+            mode=mode,
+            require_content_hash=require_content_hash,
+        )
         if cancelled():
             raise AnalysisCancelled("batch cancelled while hashing config")
         emit_phase("analyze")

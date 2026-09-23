@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from butterfly_saxs.batch import FrameFitResult, FrameRef, build_frame_refs, run_batch
-from butterfly_saxs.export import _contains_omitted_array, export_batch
+from butterfly_saxs.export import _contains_omitted_array, _parameters, export_batch
 
 
 def _touch_frames(root: Path, names: list[str]) -> list[Path]:
@@ -231,6 +231,83 @@ def test_batch_rejects_top_level_fail_status(tmp_path: Path) -> None:
 
     assert run[0].status == "failed"
     assert "status=FAIL" in (run[0].error or "")
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ({"quality_status": "FAIL"}, "quality_status=FAIL"),
+        ({"quality": {"status": "FAIL"}}, "quality.status=FAIL"),
+    ],
+)
+def test_batch_rejects_root_quality_failure_status(
+    tmp_path: Path, result: dict[str, object], expected: str
+) -> None:
+    path = _touch_frames(tmp_path, ["frame1.tif"])[0]
+
+    run = run_batch([path], lambda _frame: result)
+
+    assert run[0].status == "failed"
+    assert expected in (run[0].error or "")
+
+
+def test_checkpoint_requires_input_content_sha256(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.tif"
+    with pytest.raises(ValueError, match="input content SHA-256 is unavailable"):
+        run_batch(
+            [missing],
+            lambda _frame: {"parameters": {"value": 1.0}},
+            checkpoint=tmp_path / "missing-checkpoint.json",
+        )
+
+    source = _touch_frames(tmp_path, ["frame1.tif"])[0]
+    checkpoint = tmp_path / "checkpoint.json"
+    run_batch(
+        [source],
+        lambda _frame: {"parameters": {"value": 1.0}},
+        checkpoint=checkpoint,
+    )
+    source.unlink()
+    source.mkdir()
+
+    with pytest.raises(ValueError, match="input content SHA-256 is unavailable"):
+        run_batch(
+            [source],
+            lambda _frame: {"parameters": {"value": 1.0}},
+            checkpoint=checkpoint,
+            resume=True,
+        )
+
+
+def test_checkpoint_requires_config_file_content_sha256(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import butterfly_saxs.batch as batch_module
+
+    source = _touch_frames(tmp_path, ["frame1.tif"])[0]
+    config_file = tmp_path / "mask.npy"
+    config_file.write_bytes(b"mask")
+
+    checkpoint = tmp_path / "checkpoint.json"
+    run_batch(
+        [source],
+        lambda _frame: {"parameters": {"value": 1.0}},
+        config={"mask": config_file},
+        checkpoint=checkpoint,
+    )
+    monkeypatch.setattr(
+        batch_module,
+        "_file_content_fingerprint",
+        lambda _value: {"path": str(config_file), "exists": True, "sha256": None},
+    )
+    with pytest.raises(ValueError, match="configured analysis file SHA-256 is unavailable"):
+        run_batch(
+            [source],
+            lambda _frame: {"parameters": {"value": 1.0}},
+            config={"mask": config_file},
+            checkpoint=checkpoint,
+            resume=True,
+        )
 
 
 def test_frame_ref_key_uses_canonical_path_frame_and_dataset_identity(tmp_path: Path) -> None:
@@ -729,6 +806,43 @@ def test_parameter_long_extracts_top_level_and_nested_pipeline_parameters(tmp_pa
     numpy_scalar = next(row for row in rows if row["parameter"] == "numpy_scalar")
     assert numpy_scalar["value"] == "0.25"
     assert json.loads(numpy_scalar["flags"]) == ["empirical_model_only"]
+
+
+def test_unaccepted_ellipse_periods_are_candidate_only_in_batch_parameters() -> None:
+    result = {
+        "parameters": {
+            "L_N": 109.6,
+            "Ln_from_minor_axis_nm": 109.6,
+            "L_z": 78.9,
+            "Lz_from_draw_axis_nm": 78.9,
+            "L_from_major_axis_nm": 0.55,
+            "L_from_observed_radius_nm": 15.0,
+        },
+        "ellipse_fit": {
+            "quantitative_parameters": {
+                name: {"status": "undetermined", "value": None, "candidate_value": 1.0}
+                for name in ("a", "b", "axis_ratio", "theta_deg")
+            }
+        },
+    }
+
+    rows = {row["parameter"]: row for row in _parameters(result)}
+    for name in (
+        "L_N", "Ln_from_minor_axis_nm", "L_z", "Lz_from_draw_axis_nm",
+        "L_from_major_axis_nm",
+    ):
+        assert rows[name]["value"] == ""
+        assert rows[name]["candidate_value"] != ""
+        assert rows[name]["identifiability_status"] == "undetermined"
+    assert rows["L_from_observed_radius_nm"]["value"] == 15.0
+
+    missing_evidence = {row["parameter"]: row for row in _parameters({
+        "parameters": {"L_N": 109.6, "L_z": 78.9},
+        "ellipse_fit": {},
+    })}
+    assert missing_evidence["L_N"]["value"] == ""
+    assert missing_evidence["L_N"]["candidate_value"] == 109.6
+    assert missing_evidence["L_z"]["value"] == ""
 
 
 def test_evolution_plot_uses_separate_panels_for_different_units(tmp_path: Path) -> None:

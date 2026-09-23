@@ -2579,6 +2579,11 @@ class ButterflyAnalysisService:
                     "dataset": dataset,
                     "time": _read(item.frame, ("time",), None),
                     "status": item.status,
+                    "error": item.error,
+                    "traceback": item.traceback,
+                    "warm_start_from": item.warm_start_from,
+                    "elapsed_s": item.elapsed_s,
+                    "resumed": bool(item.resumed),
                     "stage": str(_read(result, ("stage",), stage)),
                     "parameter_stage": str(
                         _read(result, ("parameter_stage",), stage)

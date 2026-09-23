@@ -68,6 +68,15 @@ def _config(value: str | None) -> ProjectConfig | None:
     return load_project(source).resolve_paths(source.parent)
 
 
+def _unattended_source_path(value: str | os.PathLike[str], package_root: Path) -> str:
+    """Resolve a CLI source path once for preflight and batch fitting."""
+
+    candidate = Path(value).expanduser()
+    if not candidate.is_absolute() and not candidate.exists():
+        candidate = package_root / candidate
+    return str(candidate.resolve(strict=False))
+
+
 def _analysis_overrides(args: argparse.Namespace) -> dict[str, Any]:
     """Collect explicit CLI refinement controls without overriding TOML defaults."""
 
@@ -120,12 +129,20 @@ def _analysis_overrides(args: argparse.Namespace) -> dict[str, Any]:
         mapping["ellipse"] = ellipse
     butterfly = {}
     for argument, key in (("butterfly_stage", "stage"), ("butterfly_resamples", "resamples"),
-                          ("butterfly_seed", "seed"), ("butterfly_sensitivity", "sensitivity")):
+                          ("butterfly_seed", "seed"), ("butterfly_sensitivity", "sensitivity"),
+                          ("butterfly_trace_method", "trace_method"),
+                          ("sector_width", "sector_width_deg"), ("sector_step", "sector_step_deg"),
+                          ("annular_rings", "annular_radial_bins"), ("annular_angles", "annular_angle_bins")):
         value = getattr(args, argument, None)
         if value is not None:
             butterfly[key] = value
     if butterfly:
         mapping["butterfly"] = butterfly
+    if getattr(args, "butterfly_trace_method", None) is not None:
+        selected = mapping.get("ridge_method")
+        if selected is not None and selected != "butterfly_curvature":
+            raise ValueError("--butterfly-trace-method requires the butterfly workflow; omit --ridge-method or use butterfly_curvature")
+        mapping["ridge_method"] = "butterfly_curvature"
     return mapping
 
 
@@ -166,6 +183,12 @@ def _add_refinement_options(parser: argparse.ArgumentParser) -> None:
         help="observed ridge method, including side-aware butterfly_curvature",
     )
     parser.add_argument("--butterfly-stage", choices=("trace", "evaluate"), default=None)
+    parser.add_argument("--butterfly-trace-method", choices=("curvature", "radial_sector", "annular_peak"),
+                        help="butterfly observable: fixed-q angular tracks, radial sector peaks, or curvature candidates")
+    parser.add_argument("--sector-width", type=float, help="radial-sector full angular width in degrees (default 10)")
+    parser.add_argument("--annular-rings", type=int, help="number of fixed-q annuli (default 40; limited by pixel q sampling)")
+    parser.add_argument("--annular-angles", type=int, help="angular bins per q annulus (default 72)")
+    parser.add_argument("--sector-step", type=float, help="radial-sector angular sampling step in degrees (default 5)")
     parser.add_argument("--butterfly-resamples", type=int, default=None,
                         help="image-level resampling count; zero skips empirical intervals")
     parser.add_argument("--butterfly-seed", type=int, default=None)
@@ -373,6 +396,11 @@ def build_parser() -> argparse.ArgumentParser:
     batch_parser.add_argument("--checkpoint", help="批量检查点 JSON 路径")
     batch_parser.add_argument("--resume", action="store_true", help="从已有检查点恢复")
     batch_parser.add_argument("--force", action="store_true", help="允许覆盖已有输出")
+    batch_parser.add_argument(
+        "--unattended", metavar="PACKAGE",
+        help="先预检数据包，再以流式导出和自动检查点运行；预检红灯阻止拟合",
+    )
+    batch_parser.add_argument("--preflight-context", help="无人值守预检的 project_context.yaml/yml")
     batch_parser.add_argument(
         "--stream",
         action="store_true",
@@ -661,6 +689,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
     mode = args.mode or str(analysis.get("batch_mode", analysis.get("mode", "independent")))
     checkpoint = args.checkpoint or analysis.get("checkpoint")
     resume = bool(args.resume or analysis.get("resume", False))
+    unattended = args.unattended is not None
     series = args.series if args.series is not None else analysis.get("series")
     start = args.start if args.start is not None else analysis.get("start")
     stop = args.stop if args.stop is not None else analysis.get("stop")
@@ -685,13 +714,29 @@ def _handle_batch(args: argparse.Namespace) -> int:
             else analysis.get("frame_range")
         )
     output_dir = Path(args.output or (config.output_dir if config else "results"))
+    poni = args.poni or (config.poni_path if config else None)
+    if unattended:
+        if not args.output and not (config and config.output_dir):
+            raise PipelineError("unattended batch requires an explicit output directory")
+        if poni is None:
+            raise PipelineError("unattended batch requires a PONI calibration")
+        package_root = Path(args.unattended).expanduser().resolve(strict=False)
+        poni = _unattended_source_path(poni, package_root)
+        output_root = output_dir.expanduser().resolve(strict=False)
+        if output_root == package_root or output_root.is_relative_to(package_root):
+            raise PipelineError("unattended output must be outside the raw package")
+        if checkpoint is None:
+            checkpoint = output_dir / "checkpoint.json"
+        checkpoint_root = Path(checkpoint).expanduser().resolve(strict=False)
+        if not checkpoint_root.is_relative_to(output_root):
+            raise PipelineError("unattended checkpoint must be inside the output directory")
+    stream = bool(args.stream or unattended)
     # A resumed run has already validated input/config/mode hashes before its
     # exports are written.  It may therefore refresh its own known bundle
     # targets; a fresh run still refuses a non-empty directory by default.
     if output_dir.exists() and any(output_dir.iterdir()) and not args.force and not resume:
         raise FileExistsError(f"输出目录已有内容，未覆盖：{output_dir}（需要 --force）")
 
-    poni = args.poni or (config.poni_path if config else None)
     full2d = args.full2d or (config.full2d if config else False)
 
     # CLI path overrides are part of the batch configuration identity.  This
@@ -706,6 +751,11 @@ def _handle_batch(args: argparse.Namespace) -> int:
     ):
         if value is not None:
             path_analysis[name] = value
+    if unattended:
+        for name in ("mask", "valid_mask"):
+            source_path = path_analysis.get(name)
+            if isinstance(source_path, (str, os.PathLike)):
+                path_analysis[name] = _unattended_source_path(source_path, package_root)
     if explicit_sequence and frame_range is None:
         path_analysis.pop("frame_range", None)
     for name, value in (
@@ -717,6 +767,20 @@ def _handle_batch(args: argparse.Namespace) -> int:
     ):
         if value is not None:
             path_analysis[name] = value
+    if unattended:
+        selected_method = path_analysis.setdefault("ridge_method", "butterfly_curvature")
+        if selected_method != "butterfly_curvature":
+            raise PipelineError("unattended butterfly analysis requires ridge_method=butterfly_curvature")
+        configured_recipe = path_analysis.get("butterfly") or {}
+        if not isinstance(configured_recipe, Mapping):
+            raise PipelineError("analysis.butterfly must be a mapping")
+        butterfly_recipe = dict(configured_recipe)
+        butterfly_recipe.setdefault("stage", "evaluate")
+        butterfly_recipe.setdefault("trace_method", "annular_peak")
+        butterfly_recipe.setdefault("resamples", 0)
+        if butterfly_recipe["stage"] != "evaluate":
+            raise PipelineError("unattended butterfly analysis requires butterfly.stage=evaluate")
+        path_analysis["butterfly"] = butterfly_recipe
     path_analysis["stage"] = "full2d" if full2d else "geometry"
     if isinstance(config, ProjectConfig) and (
         poni != config.poni_path or path_analysis != config.analysis
@@ -773,19 +837,121 @@ def _handle_batch(args: argparse.Namespace) -> int:
             for name, value in (("frame", args.frame), ("dataset", args.dataset))
             if value is not None
         }
-        if config is None:
-            batch_config = {"analysis": selector_config}
-        else:
+        if isinstance(batch_config, ProjectConfig):
             batch_config = ProjectConfig(
                 input_paths=batch_config.input_paths,
                 poni_path=batch_config.poni_path,
-                output_dir=config.output_dir,
-                q_unit=config.q_unit,
+                output_dir=batch_config.output_dir,
+                q_unit=batch_config.q_unit,
                 full2d=full2d,
                 analysis=deep_merge_mapping(batch_config.analysis, selector_config),
                 export=batch_config.export,
                 metadata=batch_config.metadata,
             )
+        else:
+            batch_config = {"analysis": deep_merge_mapping(path_analysis, selector_config)}
+
+    preflight_summary: dict[str, Any] | None = None
+    if unattended:
+        from .service import ButterflyAnalysisService
+
+        allow_mixed = bool(
+            series is not None
+            or path_analysis.get("allow_mixed_series", path_analysis.get("independent_series", False))
+        )
+        selected_refs = batch_module.build_frame_refs(
+            batch_inputs, manifest=batch_manifest, allow_mixed_series=allow_mixed,
+        )
+        preflight_start, preflight_stop, preflight_stride = start, stop, stride
+        if frame_range is not None:
+            preflight_start, preflight_stop, preflight_stride = batch_module.parse_frame_range(frame_range)
+            if start is not None or stop is not None or stride != 1:
+                raise ValueError("frame_range cannot be combined with start/stop/stride")
+        selected_refs = batch_module.select_frame_refs(
+            selected_refs,
+            series=series, start=preflight_start, stop=preflight_stop,
+            stride=preflight_stride,
+        )
+        if not selected_refs:
+            raise ValueError("batch selection matched no frames")
+        mask = path_analysis.get("mask")
+        valid_mask = path_analysis.get("valid_mask")
+        if mask is not None and valid_mask is not None:
+            raise PipelineError("unattended preflight cannot represent mask and valid_mask together")
+        q_window = path_analysis.get("q_window")
+        if q_window is None and path_analysis.get("q_min") is not None and path_analysis.get("q_max") is not None:
+            q_window = (path_analysis["q_min"], path_analysis["q_max"])
+        if q_window is None and (path_analysis.get("q_min") is None) != (path_analysis.get("q_max") is None):
+            raise PipelineError("unattended preflight requires both q_min and q_max when q_window is absent")
+        preflight_dir = output_dir / "preflight"
+        preflight_report = ButterflyAnalysisService().preflight(
+            args.unattended,
+            manifest=[
+                {**ref.to_dict(), "path": str(ref.path.expanduser().resolve(strict=False))}
+                for ref in selected_refs
+            ],
+            poni=poni,
+            mask=mask if mask is not None else valid_mask,
+            mask_convention=("1_valid_0_invalid" if valid_mask is not None else "0_valid_1_invalid"),
+            mask_frame=path_analysis.get("mask_frame"),
+            mask_dataset=path_analysis.get("mask_dataset"),
+            q_window=q_window,
+            context=(
+                _unattended_source_path(args.preflight_context, package_root)
+                if args.preflight_context else None
+            ),
+            output=preflight_dir,
+            force=bool(args.force or resume),
+        )
+        if not isinstance(preflight_report, Mapping):
+            raise PipelineError("preflight returned no report")
+        preflight_status = preflight_report.get("status")
+        if not isinstance(preflight_status, Mapping):
+            raise PipelineError("preflight returned no status envelope")
+        preflight_color = preflight_status.get("status_color")
+        preflight_code = preflight_status.get("exit_code")
+        if {"green": 0, "yellow": 1, "red": 2}.get(preflight_color) != preflight_code:
+            raise PipelineError("preflight returned an inconsistent status envelope")
+        selector = preflight_report.get("selector")
+        selected_mask = selector.get("mask") if isinstance(selector, Mapping) else None
+        if isinstance(selected_mask, Mapping):
+            selected_mask_path = selected_mask.get("path")
+            expected_mask = mask if mask is not None else valid_mask
+            if expected_mask is None and selected_mask_path is not None:
+                raise PipelineError("preflight context selected a mask absent from the batch recipe")
+            if expected_mask is not None:
+                if selected_mask_path is None:
+                    raise PipelineError("preflight did not apply the batch mask")
+                actual = Path(selected_mask_path)
+                actual = actual if actual.is_absolute() else package_root / actual
+                if actual.resolve(strict=False) != Path(expected_mask).expanduser().resolve(strict=False):
+                    raise PipelineError("preflight mask differs from the batch mask")
+        geometry = preflight_report.get("geometry")
+        if isinstance(geometry, Mapping) and q_window is None:
+            observed_window = geometry.get("q_window")
+            full_range = geometry.get("q_range")
+            if isinstance(observed_window, Mapping) and isinstance(full_range, Mapping):
+                for edge in ("min", "max"):
+                    observed = float(observed_window[edge])
+                    expected = float(full_range[edge])
+                    if abs(observed - expected) > max(1e-9, 1e-6 * abs(expected)):
+                        raise PipelineError("preflight context q_window differs from the batch recipe")
+        preflight_summary = {
+            "status_color": preflight_color,
+            "scientific_status": preflight_status.get("scientific_status"),
+            "exit_code": preflight_code,
+            "report": str(preflight_dir / "preflight.json"),
+            "selected_frames": len(selected_refs),
+        }
+        if preflight_color == "red":
+            blocked = annotate_report(
+                {"unattended": True, "blocked_stage": "preflight", "preflight": preflight_summary,
+                 "n_frames": 0, "n_success": 0, "n_failed": 0,
+                 "outputs": {"preflight": str(preflight_dir / "preflight.json")}},
+                command="batch", exit_code=2,
+            )
+            _print_json(blocked)
+            return 2
 
     geometry_cache: dict[Any, Any] = {}
 
@@ -807,15 +973,15 @@ def _handle_batch(args: argparse.Namespace) -> int:
             initial_parameters=initial_parameters,
             frame=selected_frame,
             dataset=selected_dataset,
-            mask=args.mask,
-            mask_frame=args.mask_frame,
-            mask_dataset=args.mask_dataset,
-            valid_mask=args.valid_mask,
+            mask=path_analysis.get("mask") if unattended else args.mask,
+            mask_frame=path_analysis.get("mask_frame") if unattended else args.mask_frame,
+            mask_dataset=path_analysis.get("mask_dataset") if unattended else args.mask_dataset,
+            valid_mask=path_analysis.get("valid_mask") if unattended else args.valid_mask,
             geometry_cache=geometry_cache,
         )
 
     stream_writer = None
-    if args.stream:
+    if stream:
         stream_writer = export_module.StreamingBatchExporter(
             output_dir,
             provenance={"command": "bsaxs batch", "full2d": full2d, "stream": True},
@@ -866,7 +1032,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
             # boundary; lossless arrays remain in results.npz and the object
             # returned by the Python API.
             result_mapping = item.result.to_mapping()
-            if args.stream and isinstance(result_mapping, Mapping):
+            if stream and isinstance(result_mapping, Mapping):
                 # Stream mode already writes detector/profile arrays to NPZ;
                 # keep stdout bounded to longitudinal diagnostics and rows.
                 result_mapping = {
@@ -879,7 +1045,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
                     if key in result_mapping
                 }
             record["result"] = result_mapping
-        elif args.stream and isinstance(item.result, Mapping):
+        elif stream and isinstance(item.result, Mapping):
             record["result"] = {
                 key: item.result.get(key)
                 for key in (
@@ -889,6 +1055,10 @@ def _handle_batch(args: argparse.Namespace) -> int:
                 )
                 if key in item.result
             }
+        if unattended:
+            # The streamed bundle is the evidence archive.  Keep headless
+            # stdout bounded to per-frame control state for long acquisitions.
+            record.pop("result", None)
         compact_records.append(record)
     report = {
         "mode": run.mode,
@@ -906,7 +1076,12 @@ def _handle_batch(args: argparse.Namespace) -> int:
         "total_count": run.total_count,
         "outputs": {key: str(path) for key, path in exports.items()},
     }
-    exit_code = 1 if run.failures else 0
+    if unattended:
+        report["unattended"] = True
+        report["preflight"] = preflight_summary
+        report["outputs"]["preflight"] = str(output_dir / "preflight" / "preflight.json")
+    exit_code = 1 if (run.failures or run.cancelled or
+                      (preflight_summary is not None and preflight_summary["status_color"] != "green")) else 0
     report = annotate_report(report, command="batch", exit_code=exit_code)
     _print_json(report)
     # Partial exports remain available for inspection, while automation gets
@@ -1136,8 +1311,8 @@ def _handle_project(args: argparse.Namespace) -> int:
         compact_records.append(record)
     if args.legacy_json:
         _print_json(compact_records)
-        return 1 if run.failures else 0
-    exit_code = 1 if run.failures else 0
+        return 1 if run.failures or run.cancelled else 0
+    exit_code = 1 if run.failures or run.cancelled else 0
     report = annotate_report(
         {
             "schema_version": "lamellarsaxs2d.project_run.v2",
@@ -1148,6 +1323,11 @@ def _handle_project(args: argparse.Namespace) -> int:
             "n_frames": len(run.frame_results),
             "n_success": len(run.successful),
             "n_failed": len(run.failures),
+            "cancelled": run.cancelled,
+            "selection": run.selection,
+            "processed_count": run.processed_count,
+            "total_count": run.total_count,
+            "elapsed_s": run.elapsed_s,
             "checkpoint": (
                 str(run.checkpoint) if run.checkpoint is not None else None
             ),

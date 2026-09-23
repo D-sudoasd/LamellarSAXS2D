@@ -585,6 +585,72 @@ def test_selector_range_and_series_are_explicit() -> None:
     assert [ref.id for ref in selected] == ["f2"]
 
 
+def test_pipeline_series_selection_filters_mixed_manifest_before_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = [tmp_path / "a.dat", tmp_path / "b.dat"]
+    for path in paths:
+        path.write_bytes(b"frame")
+    manifest = [
+        {"path": paths[0], "source": "A", "frame_id": "a"},
+        {"path": paths[1], "source": "B", "frame_id": "b"},
+    ]
+    seen: list[Path] = []
+
+    def fake_analyze(source, **kwargs):
+        del kwargs
+        seen.append(Path(source))
+        return PipelineResult(
+            image=np.ones((2, 2), dtype=float),
+            qmap={},
+            observables={},
+            ridges=[],
+            ellipse_fit={},
+        )
+
+    monkeypatch.setattr(pipeline, "analyze_frame", fake_analyze)
+    results = batch_analyze(paths, manifest=manifest, series="A")
+
+    assert seen == [paths[0]]
+    assert len(results) == 1
+
+
+def test_service_batch_records_preserve_frame_execution_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "frame.dat"
+    frame = FrameRef(source)
+    item = FrameFitResult(
+        frame=frame,
+        result={"metrics": {}},
+        status="failed",
+        error="read failed",
+        traceback="Traceback (most recent call last): ...",
+        warm_start_from="previous-frame",
+        elapsed_s=0.25,
+        resumed=True,
+    )
+    run = BatchRunResult(
+        frame_results=[item],
+        mode="warm_start",
+        elapsed_s=0.5,
+        processed_count=1,
+        total_count=1,
+    )
+    monkeypatch.setattr(service_module, "run_batch", lambda *args, **kwargs: run)
+
+    result = ButterflyAnalysisService().batch(
+        payload={"frames": [source], "mode": "warm_start"}
+    )
+
+    record = result["records"][0]
+    assert record["error"] == "read failed"
+    assert record["traceback"].startswith("Traceback")
+    assert record["warm_start_from"] == "previous-frame"
+    assert record["elapsed_s"] == pytest.approx(0.25)
+    assert record["resumed"] is True
+
+
 @pytest.mark.parametrize("manifest", ([], {"frames": []}))
 def test_empty_explicit_manifest_fails_closed(manifest) -> None:
     with pytest.raises(ValueError, match="manifest contains no frame entries"):
@@ -595,6 +661,8 @@ def test_batch_cancel_reports_progress_and_checkpoint_state(tmp_path: Path) -> N
     event = __import__("threading").Event()
     progress: list[dict[str, object]] = []
     paths = [tmp_path / f"frame_{index}.npy" for index in range(3)]
+    for path in paths:
+        path.write_bytes(b"pending")
 
     def analyzer(frame, initial=None):
         del initial
@@ -764,6 +832,30 @@ def test_stream_cancel_then_resume_completes_previous_partial_bundle(tmp_path: P
         assert metadata["complete"] is True
         assert "frame_0000__image" in bundle.files
         assert "frame_0001__image" in bundle.files
+
+
+def test_stream_npz_complete_requires_quality_success(tmp_path: Path) -> None:
+    source = tmp_path / "frame.dat"
+    source.write_bytes(b"frame")
+    output = tmp_path / "stream"
+    writer = StreamingBatchExporter(output)
+    run = run_batch(
+        [source],
+        lambda _frame: {
+            "image": np.ones((2, 2), dtype=float),
+            "quality_status": "FAIL",
+        },
+        result_sink=writer.write,
+        retain_results=False,
+    )
+    writer.finalize(run)
+
+    with np.load(output / "results.npz", allow_pickle=False) as bundle:
+        metadata = json.loads(str(bundle["__metadata__"].item()))
+    assert metadata["complete"] is False
+    assert metadata["artifact_complete"] is True
+    assert metadata["quality_complete"] is False
+    assert metadata["quality_failed_frames"] == [0]
 
 
 def test_direct_batch_mapping_resolves_base_dir_before_file_validation(tmp_path: Path) -> None:

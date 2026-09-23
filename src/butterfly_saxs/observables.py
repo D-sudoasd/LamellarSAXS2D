@@ -808,6 +808,132 @@ def _robust_noise(values: np.ndarray) -> float:
     return noise
 
 
+def _circular_supported_runs(support: np.ndarray) -> list[np.ndarray]:
+    """Return contiguous supported angular-bin runs without crossing gaps.
+
+    The angular coordinate is periodic, so the first and last bins belong to
+    the same run when both are supported.  A run is deliberately kept as an
+    explicit index array: callers can smooth or estimate noise within that
+    run without ever borrowing a value across a masked detector gap.
+    """
+
+    support = np.asarray(support, dtype=bool).ravel()
+    n_bins = int(support.size)
+    if n_bins == 0 or not np.any(support):
+        return []
+    if np.all(support):
+        return [np.arange(n_bins, dtype=int)]
+    starts = np.flatnonzero(support & ~np.roll(support, 1))
+    runs: list[np.ndarray] = []
+    for start in starts.tolist():
+        indices: list[int] = []
+        index = int(start)
+        while support[index]:
+            indices.append(index)
+            index = (index + 1) % n_bins
+            if index == int(start):
+                break
+        runs.append(np.asarray(indices, dtype=int))
+    return runs
+
+
+def _smooth_supported_angular_profile(
+    profile: np.ndarray,
+    support: np.ndarray,
+    *,
+    sigma: float = 1.0,
+) -> np.ndarray:
+    """Smooth only within contiguous supported angular bins.
+
+    ``gaussian_filter1d(..., mode='wrap')`` is valid for a complete angular
+    profile, but it silently leaks intensity across a masked gap.  This helper
+    uses periodic wrapping only for a fully supported profile and otherwise
+    processes each contiguous run independently.
+    """
+
+    profile = np.asarray(profile, dtype=float).ravel()
+    support = np.asarray(support, dtype=bool).ravel() & np.isfinite(profile)
+    smoothed = np.full(profile.shape, np.nan, dtype=float)
+    if not np.any(support):
+        return smoothed
+    if gaussian_filter1d is None or not np.isfinite(float(sigma)) or float(sigma) <= 0.0:
+        smoothed[support] = profile[support]
+        return smoothed
+    runs = _circular_supported_runs(support)
+    if len(runs) == 1 and runs[0].size == profile.size:
+        smoothed[:] = gaussian_filter1d(profile, float(sigma), mode="wrap")
+        return smoothed
+    for run in runs:
+        values = profile[run]
+        if values.size == 1:
+            smoothed[run] = values
+        else:
+            # ``nearest`` remains inside the supported run.  It never samples
+            # the opposite side of a missing/masked angular interval.
+            smoothed[run] = gaussian_filter1d(values, float(sigma), mode="nearest")
+    return smoothed
+
+
+def _supported_angular_noise(
+    profile: np.ndarray,
+    support: np.ndarray,
+) -> tuple[float, str, dict[str, int]]:
+    """Estimate detector noise from local angular changes, not lobe height.
+
+    The MAD of an entire angular profile measures the physical four-lobe
+    contrast as if it were detector noise.  Robust adjacent differences are
+    therefore preferred; a local three-point detrended residual is a fallback
+    for short supported runs.  Differences are added across the periodic
+    boundary only when that boundary is actually supported.
+    """
+
+    profile = np.asarray(profile, dtype=float).ravel()
+    support = np.asarray(support, dtype=bool).ravel() & np.isfinite(profile)
+    runs = _circular_supported_runs(support)
+    differences: list[np.ndarray] = []
+    residuals: list[np.ndarray] = []
+    for run in runs:
+        values = profile[run]
+        if values.size >= 2:
+            differences.append(np.diff(values))
+            if run.size == profile.size:
+                differences.append(np.asarray([values[0] - values[-1]], dtype=float))
+        if values.size >= 3:
+            residuals.append(values[1:-1] - 0.5 * (values[:-2] + values[2:]))
+    diff_values = (
+        np.concatenate(differences).astype(float, copy=False)
+        if differences
+        else np.asarray([], dtype=float)
+    )
+    residual_values = (
+        np.concatenate(residuals).astype(float, copy=False)
+        if residuals
+        else np.asarray([], dtype=float)
+    )
+    if diff_values.size >= 2:
+        noise = _robust_noise(diff_values) / np.sqrt(2.0)
+        if np.isfinite(noise) and noise > np.finfo(float).eps:
+            return float(noise), "adjacent_difference_mad", {
+                "difference_count": int(diff_values.size),
+                "detrended_residual_count": int(residual_values.size),
+            }
+    if residual_values.size >= 2:
+        noise = _robust_noise(residual_values) / np.sqrt(6.0)
+        if np.isfinite(noise) and noise > np.finfo(float).eps:
+            return float(noise), "local_detrended_residual_mad", {
+                "difference_count": int(diff_values.size),
+                "detrended_residual_count": int(residual_values.size),
+            }
+    # Preserve a finite floor for the peak detector without falling back to
+    # the full profile MAD: that would re-introduce the physical lobe contrast
+    # as detector noise.  A constant or locally linear profile has no local
+    # prominence and therefore remains safely peak-free at this floor.
+    return float(np.finfo(float).eps), "local_difference_floor_short_or_constant", {
+        "difference_count": int(diff_values.size),
+        "detrended_residual_count": int(residual_values.size),
+    }
+
+
 def _wrap_distance(angle: np.ndarray | float, centre: float) -> np.ndarray:
     return np.abs(np.angle(np.exp(1j * (np.asarray(angle) - float(centre)))))
 
@@ -2173,7 +2299,10 @@ def _azimuthal_peak_ridges(
     snr_threshold: float = 2.0,
     min_peak_fraction: float = 0.0,
     min_coverage: float = 0.0,
+    min_bin_count: int = 1,
     mask: Any = None,
+    diagnostics: dict[str, Any] | None = None,
+    cancel_event: Any = None,
 ) -> tuple[list[RidgePoint], np.ndarray, np.ndarray, float, float, float, tuple[str, ...]]:
     """Extract directly observed angular maxima in sampled q annuli.
 
@@ -2195,8 +2324,20 @@ def _azimuthal_peak_ridges(
         raise ValueError("ridge_min_peak_fraction must be in [0, 1]")
     if not np.isfinite(float(min_coverage)) or not 0.0 <= float(min_coverage) <= 1.0:
         raise ValueError("ridge_min_coverage must be in [0, 1]")
+    if isinstance(min_bin_count, (bool, np.bool_)) or int(min_bin_count) != min_bin_count or int(min_bin_count) < 1:
+        raise ValueError("min_bin_count must be a positive integer")
+    min_bin_count = int(min_bin_count)
 
     values, q, angle, valid = _extract_maps(frame, qmap, mask)
+    source_data = _array_field(frame, ("data", "intensity", "image", "values"))
+    source_shape = tuple(np.asarray(source_data).shape) if source_data is not None else ()
+    if len(source_shape) >= 2:
+        source_indices = np.unravel_index(np.arange(values.size), source_shape)
+        pixel_y = np.asarray(source_indices[-2], dtype=float)
+        pixel_x = np.asarray(source_indices[-1], dtype=float)
+    else:
+        pixel_y = np.zeros(values.size, dtype=float)
+        pixel_x = np.arange(values.size, dtype=float)
     q_unit = _q_unit(qmap)
     q_min, q_max = _q_limits(q, q_window, q_range)
     q_edges = np.linspace(q_min, q_max, n_annuli + 1, dtype=float)
@@ -2205,6 +2346,9 @@ def _azimuthal_peak_ridges(
     angle_edges = np.linspace(-np.pi, np.pi, n_angle_bins + 1, dtype=float)
     angle_centres = 0.5 * (angle_edges[:-1] + angle_edges[1:])
     angle_step = float(angle_edges[1] - angle_edges[0])
+
+    if diagnostics is not None:
+        diagnostics.clear()
 
     q_index_float = (
         (q - q_min) / max(q_max - q_min, np.finfo(float).eps) * n_annuli
@@ -2217,13 +2361,12 @@ def _azimuthal_peak_ridges(
     ).astype(np.int64)
     angle_index = np.clip(angle_index, 0, n_angle_bins - 1)
     candidate = (
-        np.isfinite(values)
-        & np.isfinite(q)
+        np.isfinite(q)
         & np.isfinite(angle)
         & (q >= q_min)
         & (q <= q_max)
     )
-    selected = candidate & valid
+    selected = candidate & valid & np.isfinite(values)
     flat_candidate = q_index[candidate] * n_angle_bins + angle_index[candidate]
     flat_selected = q_index[selected] * n_angle_bins + angle_index[selected]
     total = n_annuli * n_angle_bins
@@ -2256,37 +2399,55 @@ def _azimuthal_peak_ridges(
     )
     points: list[RidgePoint] = []
     annulus_indices: dict[int, list[int]] = {}
+    smoothed_matrix = np.full_like(profile, np.nan, dtype=float)
+    annulus_diagnostics: list[dict[str, Any]] = []
+    all_candidates: list[dict[str, Any]] = []
     rejected_boundary = False
     rejected_support = False
     for annulus in range(n_annuli):
+        raise_if_cancelled(cancel_event, "ridges:annulus")
+        annulus_diag: dict[str, Any] = {
+            "annulus_index": int(annulus),
+            "q_min": float(q_edges[annulus]),
+            "q_max": float(q_edges[annulus + 1]),
+            "q_center": float(q_centres[annulus]),
+            "candidate_count": int(annulus_candidate[annulus]),
+            "valid_count": int(annulus_valid[annulus]),
+            "coverage": float(annulus_coverage[annulus]),
+            "baseline": float("nan"),
+            "noise": float("nan"),
+            "noise_method": None,
+            "noise_details": {},
+            "supported_bins": [],
+            "candidates": [],
+            "status": "not_evaluated",
+        }
+        annulus_diagnostics.append(annulus_diag)
         if annulus_candidate[annulus] <= 0 or annulus_coverage[annulus] < float(min_coverage):
             if annulus_candidate[annulus] > 0:
                 rejected_support = True
+                annulus_diag["status"] = "rejected_low_annulus_coverage"
+            else:
+                annulus_diag["status"] = "no_geometry_support"
             continue
         values_angular = profile[annulus]
         finite_profile = np.isfinite(values_angular) & (counts[annulus] > 0)
+        support_mask = finite_profile & (coverage[annulus] >= float(min_coverage))
+        annulus_diag["supported_bins"] = np.flatnonzero(support_mask).astype(int).tolist()
         if np.count_nonzero(finite_profile) < 3:
+            annulus_diag["status"] = "insufficient_angular_support"
             continue
         baseline = float(np.nanpercentile(values_angular[finite_profile], 10.0))
-        noise = _robust_noise(values_angular[finite_profile] - baseline)
-        if not np.isfinite(noise) or noise <= np.finfo(float).eps:
-            noise = max(float(np.nanstd(values_angular[finite_profile])), np.finfo(float).eps)
-        if gaussian_filter1d is not None:
-            support_weights = finite_profile.astype(float)
-            numerator = gaussian_filter1d(
-                np.where(finite_profile, values_angular, 0.0),
-                1.0,
-                mode="wrap",
-            )
-            denominator = gaussian_filter1d(support_weights, 1.0, mode="wrap")
-            smoothed = np.divide(
-                numerator,
-                denominator,
-                out=np.full(n_angle_bins, np.nan, dtype=float),
-                where=denominator > 1e-9,
-            )
-        else:  # pragma: no cover - scipy is a declared dependency
-            smoothed = values_angular.copy()
+        noise, noise_method, noise_details = _supported_angular_noise(values_angular, support_mask)
+        smoothed = _smooth_supported_angular_profile(values_angular, support_mask, sigma=1.0)
+        smoothed_matrix[annulus] = smoothed
+        annulus_diag.update(
+            baseline=float(baseline),
+            noise=float(noise),
+            noise_method=str(noise_method),
+            noise_details=dict(noise_details),
+            status="profile_evaluated",
+        )
         peak_input = np.where(np.isfinite(smoothed), smoothed, baseline)
         if find_peaks is None:  # pragma: no cover
             peak_indices = np.asarray([int(np.nanargmax(peak_input))])
@@ -2318,14 +2479,37 @@ def _azimuthal_peak_ridges(
                         peak_prominence_list.append(float(peak_input[int(peak)] - baseline))
             peak_indices = np.asarray(peak_indices_list, dtype=int)
             peak_prominence = np.asarray(peak_prominence_list, dtype=float)
-        support_mask = finite_profile & (coverage[annulus] >= float(min_coverage))
         finite_prominence = peak_prominence[np.isfinite(peak_prominence) & (peak_prominence > 0.0)]
         strongest_prominence = float(np.max(finite_prominence)) if finite_prominence.size else float("nan")
         for peak_position, index in enumerate(peak_indices.tolist()):
             index = int(index)
-            neighbours = support_mask[(index - 1) % n_angle_bins] and support_mask[(index + 1) % n_angle_bins]
+            prominence = float(peak_prominence[peak_position]) if peak_position < len(peak_prominence) else float(peak_input[index] - baseline)
+            height = float(peak_input[index] - baseline)
+            candidate_diag: dict[str, Any] = {
+                "annulus_index": int(annulus),
+                "angular_bin_index": int(index),
+                "chi_deg": float(np.degrees(angle_centres[index])),
+                "q_center": float(q_centres[annulus]),
+                "raw_intensity": float(values_angular[index]) if np.isfinite(values_angular[index]) else float("nan"),
+                "smoothed_intensity": float(smoothed[index]) if np.isfinite(smoothed[index]) else float("nan"),
+                "baseline": float(baseline),
+                "height_above_baseline": float(height),
+                "prominence": float(prominence),
+                "snr": float("nan"),
+                "n_pixels": int(counts[annulus, index]),
+                "coverage": float(coverage[annulus, index]),
+                "accepted": False,
+                "reason": "candidate",
+            }
+            all_candidates.append(candidate_diag)
+            annulus_diag["candidates"].append(candidate_diag)
+            neighbours = bool(
+                support_mask[(index - 1) % n_angle_bins]
+                and support_mask[(index + 1) % n_angle_bins]
+            )
             if not support_mask[index] or not neighbours:
                 rejected_boundary = True
+                candidate_diag["reason"] = "masked_gap_or_boundary"
                 continue
             peak_angle, peak_intensity = _quadratic_peak(
                 angle_centres,
@@ -2333,15 +2517,59 @@ def _azimuthal_peak_ridges(
                 index,
                 period=2.0 * np.pi,
             )
-            prominence = float(peak_prominence[peak_position]) if peak_position < len(peak_prominence) else float(peak_intensity - baseline)
             if (
                 np.isfinite(strongest_prominence)
                 and prominence < float(min_peak_fraction) * strongest_prominence
             ):
+                candidate_diag["reason"] = "below_annulus_prominence_fraction"
                 continue
             snr = float(max(prominence, peak_intensity - baseline) / max(noise, np.finfo(float).eps))
+            candidate_diag["snr"] = float(snr)
             if not np.isfinite(snr) or snr < float(snr_threshold):
+                candidate_diag["reason"] = "below_snr_threshold"
                 continue
+            bin_selected = selected & (q_index == annulus) & (angle_index == index)
+            bin_values = np.asarray(values[bin_selected], dtype=float)
+            bin_values = bin_values[np.isfinite(bin_values)]
+            excess = np.maximum(bin_values - baseline, 0.0)
+            excess_sum = float(np.sum(excess))
+            max_excess_fraction = (
+                float(np.max(excess) / excess_sum)
+                if excess.size and excess_sum > np.finfo(float).eps
+                else float("nan")
+            )
+            n_eff = (
+                float(excess_sum * excess_sum / np.sum(excess * excess))
+                if excess.size and np.sum(excess * excess) > np.finfo(float).eps
+                else float(bin_values.size)
+            )
+            candidate_diag.update(
+                effective_support_pixels=float(n_eff),
+                max_excess_fraction=float(max_excess_fraction),
+            )
+            if int(bin_values.size) < int(min_bin_count):
+                rejected_support = True
+                candidate_diag["reason"] = "insufficient_bin_support"
+                continue
+            # A single hot pixel must not become an angular ridge.  This is a
+            # conservative diagnostic gate only for a bin that is demonstrably
+            # dominated by one positive excess contribution; the raw mean is
+            # retained unchanged in the diagnostics.
+            if (
+                bin_values.size >= 2
+                and np.isfinite(n_eff)
+                and (n_eff < 2.0 or (np.isfinite(max_excess_fraction) and max_excess_fraction > 0.75))
+            ):
+                rejected_support = True
+                candidate_diag["reason"] = "hot_pixel_dominated"
+                continue
+            support_positions = np.flatnonzero(bin_selected)
+            representative_x = representative_y = float("nan")
+            if support_positions.size:
+                xs, ys = pixel_x[support_positions], pixel_y[support_positions]
+                distance = (xs - np.median(xs)) ** 2 + (ys - np.median(ys)) ** 2
+                nearest = int(np.argmin(distance))
+                representative_x, representative_y = float(xs[nearest]), float(ys[nearest])
             fwhm = _periodic_fwhm(angle_centres, smoothed, index, baseline)
             point = RidgePoint(
                 angle=float(peak_angle),
@@ -2373,6 +2601,8 @@ def _azimuthal_peak_ridges(
                 ),
                 method="azimuthal_peak",
                 support=float(annulus_coverage[annulus]),
+                pixel_x=representative_x,
+                pixel_y=representative_y,
                 accepted=True,
                 reason="accepted",
                 q_unit=q_unit,
@@ -2385,11 +2615,30 @@ def _azimuthal_peak_ridges(
                 annulus_q_max=float(q_edges[annulus + 1]),
                 angular_bin_index=index,
                 angular_bin_coverage=float(coverage[annulus, index]),
+                prominence=float(prominence),
+                raw_intensity=float(values_angular[index]),
+                smoothed_intensity=float(smoothed[index]),
+                raw_bin_chi=float(angle_centres[index]),
+                raw_bin_chi_deg=float(np.degrees(angle_centres[index])),
+                refinement="quadratic_on_supported_smoothed_profile",
+                representative_pixel_role="median_of_valid_support_pixels",
+                support_pixel_count=int(bin_values.size),
+                effective_support_pixels=float(n_eff),
+                max_excess_fraction=float(max_excess_fraction),
+                profile_noise=float(noise),
+                profile_noise_method=str(noise_method),
                 area_definition="peak_height_times_angular_fwhm_approximation",
             )
             point_index = len(points)
             points.append(point)
             annulus_indices.setdefault(annulus, []).append(point_index)
+            candidate_diag.update(
+                accepted=True,
+                reason="accepted",
+                point_index=int(point_index),
+                refined_angle=float(peak_angle),
+                refined_angle_deg=float(np.degrees(peak_angle)),
+            )
 
     valid_annulus_fraction, continuity_fraction, continuity_score, continuity_flags = _annotate_azimuthal_tracks(
         points,
@@ -2410,9 +2659,59 @@ def _azimuthal_peak_ridges(
         flags.append("low_peak_support")
     if not points:
         flags.append("no_azimuthal_peak")
+    final_flags = tuple(dict.fromkeys(flags))
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "schema_version": "azimuthal_peak_diagnostics.v1",
+                "q_unit": q_unit,
+                "q_edges": np.asarray(q_edges, dtype=float).copy(),
+                "q_centers": np.asarray(q_centres, dtype=float).copy(),
+                "q_centres": np.asarray(q_centres, dtype=float).copy(),
+                "angle_edges_deg": np.degrees(angle_edges).astype(float, copy=True),
+                "angle_centers_deg": np.degrees(angle_centres).astype(float, copy=True),
+                "angle_centres_deg": np.degrees(angle_centres).astype(float, copy=True),
+                "raw_mean": np.asarray(profile, dtype=float).copy(),
+                "raw_sum": np.asarray(sums, dtype=float).copy(),
+                "counts": np.asarray(counts, dtype=int).copy(),
+                "geometry_counts": np.asarray(candidate_counts, dtype=int).copy(),
+                "candidate_counts": np.asarray(candidate_counts, dtype=int).copy(),
+                "coverage": np.asarray(coverage, dtype=float).copy(),
+                "smoothed": np.asarray(smoothed_matrix, dtype=float).copy(),
+                "annuli": annulus_diagnostics,
+                "per_annulus": annulus_diagnostics,
+                "candidates": all_candidates,
+                "selected_points": [
+                    {
+                        "point_index": int(index),
+                        "annulus_index": int(point.metadata.get("annulus_index", -1)),
+                        "angular_bin_index": int(point.metadata.get("angular_bin_index", -1)),
+                        "q": float(point.q),
+                        "chi_deg": float(np.degrees(point.angle)),
+                        "prominence": float(point.metadata.get("prominence", float("nan"))),
+                    }
+                    for index, point in enumerate(points)
+                ],
+                "settings": {
+                    "n_annuli": int(n_annuli),
+                    "n_angle_bins": int(n_angle_bins),
+                    "snr_threshold": float(snr_threshold),
+                    "min_peak_fraction": float(min_peak_fraction),
+                    "min_coverage": float(min_coverage),
+                    "min_bin_count": int(min_bin_count),
+                    "smoothing_sigma_bins": 1.0,
+                    "noise_definition": "robust_adjacent_difference_or_local_detrended_residual",
+                    "smoothing_definition": "within_contiguous_supported_angular_runs_only",
+                },
+                "flags": final_flags,
+                "valid_annulus_fraction": float(valid_annulus_fraction),
+                "continuity_fraction": float(continuity_fraction),
+                "continuity_score": float(continuity_score),
+            }
+        )
     return points, np.asarray([point.angle for point in points], dtype=float), np.asarray(
         [point.q for point in points], dtype=float
-    ), valid_annulus_fraction, continuity_fraction, continuity_score, tuple(dict.fromkeys(flags))
+    ), valid_annulus_fraction, continuity_fraction, continuity_score, final_flags
 
 
 def measure_radial_ridges(

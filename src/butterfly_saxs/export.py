@@ -486,7 +486,8 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
         )
     ellipse = _value(value, "ellipse_fit", "ellipse", default={})
     evidence = _value(ellipse, "quantitative_parameters", default={})
-    if isinstance(evidence, Mapping) and evidence:
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    if evidence:
         aliases = {"semi_major": "a", "semi_minor": "b", "axes_ratio": "axis_ratio",
                    "ellipse_axis_tilt_deg": "theta_deg", "angle_deg": "theta_deg",
                    "eccentricity": "axis_ratio", "ellipticity": "axis_ratio"}
@@ -515,6 +516,26 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
             row["interval_kind"] = check.get("interval_kind", "")
             if not row.get("unit"):
                 row["unit"] = "dimensionless" if name in ("eccentricity", "ellipticity") else check.get("unit", "")
+    shape_available = all(
+        isinstance(evidence.get(name), Mapping)
+        and evidence[name].get("status") == "available"
+        for name in ("a", "b", "axis_ratio", "theta_deg")
+    )
+    if not shape_available:
+        # These periods are derived from the candidate ellipse.  A raw fit
+        # scalar must not become a published Ln/Lz when quantitative evidence
+        # is missing or any required ellipse dimension is undetermined.
+        for row in rows:
+            if row["parameter"] not in {
+                "L_N", "L_z", "Ln_from_minor_axis_nm", "Lz_from_draw_axis_nm",
+                "L_from_major_axis_nm",
+            }:
+                continue
+            row["candidate_value"] = row["value"]
+            row["value"] = ""
+            row["identifiability_status"] = "undetermined"
+            row["identifiability_reason"] = "ellipse_shape_not_quantitatively_available"
+            row["parameter_source"] = "candidate_only"
     return rows
 
 
@@ -1336,6 +1357,7 @@ class StreamingBatchExporter:
                 "arrays": list(self._array_names),
                 "frame_count": len(self._compact_results),
                 "complete": not self._missing_frames
+                and not self._quality_failed_frames
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled),
                 "artifact_complete": not self._missing_frames
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled),

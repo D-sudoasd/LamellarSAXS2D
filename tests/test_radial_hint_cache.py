@@ -164,7 +164,9 @@ def test_analysis_threads_cache_only_when_resample_qmap_is_unchanged(
         refit(
             image,
             {
-                "qmap": {"q_unit": "A^-1"},
+                # Keep the callback fixture within the public q-map input
+                # contract; only the declared perturbation varies per case.
+                "qmap": _qmap,
                 "mask": None,
                 "qmap_perturbation": perturbation,
             },

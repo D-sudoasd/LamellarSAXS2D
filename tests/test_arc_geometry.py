@@ -85,6 +85,23 @@ def test_arc_fit_is_invariant_to_global_branch_id_swap() -> None:
     assert swapped["branch_swap_applied"] is True
 
 
+def test_sampling_boundary_is_not_assumed_to_be_a_major_axis_tip():
+    parameters = {
+        "cx": {"value": 0., "vary": False}, "cy": {"value": 0., "vary": False},
+        "a": {"value": 1.2}, "axis_ratio": {"value": .08, "min": .005, "max": .35},
+        "theta": {"value": .35, "min": 0., "max": np.pi / 2},
+    }
+    result = fit_arc_ellipses(_arc_points(), parameters=parameters, multistart=1,
+                              observed_tip_constraint=False)
+    assert result["fit"].values["a"] == pytest.approx(1.5, rel=1e-5)
+    assert result["fit"].values["axis_ratio"] == pytest.approx(.1, rel=1e-5)
+    assert result["fit"].values["theta"] == pytest.approx(.35, abs=1e-5)
+    parameters["a"]["max"] = 1.3
+    constrained = fit_arc_ellipses(_arc_points(), parameters=parameters, multistart=1,
+                                  observed_tip_constraint=False)
+    assert constrained["fit"].values["a"] <= 1.3
+
+
 @pytest.mark.parametrize("axis_ratio", (0.005, 0.02))
 def test_free_flat_arc_fit_selects_low_cost_nonconverged_candidate_honestly(axis_ratio: float) -> None:
     points: list[dict[str, object]] = []
