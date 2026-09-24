@@ -40,7 +40,7 @@ def test_workbench_offscreen_smoke(qtbot, tmp_path):
     qtbot.addWidget(window)
     window.set_observed_data(np.ones((12, 12)))
 
-    assert window.windowTitle() == "LamellarSAXS2D · 2D Refinement"
+    assert window.windowTitle() == "WingSAXS · 2D SAXS Butterfly Pattern Analysis"
     assert {"observed", "model", "residual", "overlay"} <= set(window.views.views)
     assert window.parameter_table.model() is window.parameter_model
     assert [window.parameter_model.headerData(i, QtCore.Qt.Orientation.Horizontal) for i in range(8)] == [

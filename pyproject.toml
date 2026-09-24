@@ -56,10 +56,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/D-sudoasd/LamellarSAXS2D"
-Repository = "https://github.com/D-sudoasd/LamellarSAXS2D"
-Issues = "https://github.com/D-sudoasd/LamellarSAXS2D/issues"
-Documentation = "https://github.com/D-sudoasd/LamellarSAXS2D/tree/main/docs"
+Homepage = "https://github.com/D-sudoasd/WingSAXS"
+Repository = "https://github.com/D-sudoasd/WingSAXS"
+Issues = "https://github.com/D-sudoasd/WingSAXS/issues"
+Documentation = "https://github.com/D-sudoasd/WingSAXS/tree/main/docs"
 
 [project.scripts]
 bsaxs = "butterfly_saxs.cli:main"

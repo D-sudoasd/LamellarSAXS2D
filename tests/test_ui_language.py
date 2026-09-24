@@ -185,7 +185,7 @@ def test_default_chinese_switch_and_global_persistence(qtbot, tmp_path) -> None:
     window = MainWindow(engine=object(), auto_preview=False, settings=settings)
     qtbot.addWidget(window)
     assert window.language == "zh_CN"
-    assert window.windowTitle() == "LamellarSAXS2D · 二维精修"
+    assert window.windowTitle() == "WingSAXS · 二维小角散射蝴蝶图样分析工具"
     assert window.preview_button.text() == "预览"
     assert window.parameter_model.headerData(0, QtCore.Qt.Orientation.Horizontal) == "参数"
     assert window.views.observed.title_label.text() == "观测"
@@ -195,7 +195,7 @@ def test_default_chinese_switch_and_global_persistence(qtbot, tmp_path) -> None:
 
     window.set_language("en")
     assert window.language == "en"
-    assert window.windowTitle() == "LamellarSAXS2D · 2D Refinement"
+    assert window.windowTitle() == "WingSAXS · 2D SAXS Butterfly Pattern Analysis"
     assert window.preview_button.text() == "Preview"
     assert window.parameter_model.headerData(0, QtCore.Qt.Orientation.Horizontal) == "Parameter"
     assert window.views.observed.title_label.text() == "Observed"

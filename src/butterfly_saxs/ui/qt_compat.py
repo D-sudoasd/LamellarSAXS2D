@@ -1,4 +1,4 @@
-"""Optional Qt bindings used by the LamellarSAXS2D workbench.
+"""Optional Qt bindings used by the WingSAXS workbench.
 
 The scientific/core modules deliberately do not depend on Qt.  This module is
 the single import boundary for the optional UI stack, so importing
@@ -30,7 +30,7 @@ def require_qt() -> None:
     if not QT_AVAILABLE:
         detail = f": {QT_IMPORT_ERROR}" if QT_IMPORT_ERROR else ""
         raise RuntimeError(
-            "The LamellarSAXS2D workbench requires the optional UI dependencies "
+            "The WingSAXS workbench requires the optional UI dependencies "
             "(PySide6 and pyqtgraph)" + detail
         )
 

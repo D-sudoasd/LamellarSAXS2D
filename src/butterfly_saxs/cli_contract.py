@@ -49,7 +49,7 @@ _SCHEMA_BY_COMMAND = {
 
 def tool_info() -> dict[str, str]:
     return {
-        "name": "LamellarSAXS2D",
+        "name": "WingSAXS",
         "distribution": "butterfly-saxs",
         "import": "butterfly_saxs",
         "version": str(__version__),

@@ -1,12 +1,12 @@
-# LamellarSAXS2D
+# WingSAXS｜二维小角散射蝴蝶图样分析工具
 
-[![CI](https://github.com/D-sudoasd/LamellarSAXS2D/actions/workflows/ci.yml/badge.svg)](https://github.com/D-sudoasd/LamellarSAXS2D/actions/workflows/ci.yml)
+[![CI](https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml/badge.svg)](https://github.com/D-sudoasd/WingSAXS/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/Python-3.11--3.13-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **Identify and parameterize butterfly-pattern 2D SAXS, then review an in-situ series without treating a solver bound as a measured structure.**
 
-LamellarSAXS2D reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), builds physical `q`, `chi`, `qx`, and `qy` from a PONI file through pyFAI, traces observed butterfly arcs, and reports what the image actually supports:
+WingSAXS reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), builds physical `q`, `chi`, `qx`, and `qy` from a PONI file through pyFAI, traces observed butterfly arcs, and reports what the image actually supports:
 
 | A typical frame reports | Only when a radial reflection or interior ellipse is supported |
 | --- | --- |
@@ -42,8 +42,8 @@ Synthetic demonstration (pixel-q): the Wang/Grubb double ellipse drawn on a gene
 Python **3.11–3.13** (3.14+ is outside the support contract). Core analysis does not need Qt; the workbench does.
 
 ```powershell
-git clone https://github.com/D-sudoasd/LamellarSAXS2D.git
-cd LamellarSAXS2D
+git clone https://github.com/D-sudoasd/WingSAXS.git
+cd WingSAXS
 python -m venv .venv-project
 .\.venv-project\Scripts\python.exe -m pip install --upgrade pip
 .\.venv-project\Scripts\python.exe -m pip install `
@@ -65,7 +65,7 @@ Core-only: `python -m pip install -e .` then `bsaxs-doctor` without `--require-u
 
 For Chinese figure text on Debian/Ubuntu, install a CJK font: `sudo apt-get install fonts-noto-cjk`. The renderer selects an installed CJK font; CI installs Noto CJK so missing-glyph checks run on Linux as well as Windows.
 
-On Windows, after the doctor is green, double-click `启动_LamellarSAXS2D.cmd` or run `.\启动_LamellarSAXS2D.cmd --check`. The launcher uses `.venv-project` / `.venv` / `venv` first and writes start-up failures to a per-user `LamellarSAXS2D/launcher.log`. Details: [first-run guide](docs/first_run_zh.md).
+On Windows, after the doctor is green, double-click `启动_WingSAXS.cmd` or run `.\启动_WingSAXS.cmd --check`. The launcher uses `.venv-project` / `.venv` / `venv` first and writes start-up failures to a per-user `WingSAXS/launcher.log`. Details: [first-run guide](docs/first_run_zh.md).
 
 ## Quick start
 
@@ -104,7 +104,7 @@ bsaxs preflight data/package --manifest manifest.csv \
 
 For an unattended package run, use `bsaxs batch "data/package/images/*.edf" --unattended data/package --manifest data/package/manifest.csv --poni data/package/geometry.poni --mask data/package/mask.npy -o results/unattended_001`. This performs preflight before fitting, writes a checkpoint and streams batch evidence. A red preflight blocks fitting; warnings or failed frames return a nonzero exit status. Keep the output outside the raw package and use `--resume` with the same inputs and settings after interruption.
 
-`bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_LamellarSAXS2D.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
+`bsaxs analyze ... --full2d` is the optional empirical intensity fit. `bsaxs-gui` is the crash-visible desktop entry (same as `启动_WingSAXS.cmd`); `bsaxs gui` remains a supported CLI alias that opens the workbench.
 
 Agents (and any non-interactive operator) should start with `bsaxs describe` or a bare `bsaxs`. That prints a JSON catalog of commands, exit codes, and scientific invariants. Environment checks: `bsaxs doctor --json` (same as `bsaxs-doctor`). Failed commands emit a JSON error envelope on stdout and a human `错误：` line on stderr. See [AGENTS.md](AGENTS.md).
 
@@ -112,7 +112,7 @@ Agents (and any non-interactive operator) should start with `bsaxs describe` or 
 
 | Shown to people | Stable machine name |
 | --- | --- |
-| LamellarSAXS2D | PyPI / wheel: `butterfly-saxs` |
+| WingSAXS | PyPI / wheel: `butterfly-saxs` |
 | | Import: `butterfly_saxs` |
 | | CLI: `bsaxs`, `bsaxs-doctor`, `bsaxs-gui` |
 
@@ -140,7 +140,7 @@ The double ellipse is an **empirical reciprocal-space measurement**. The current
 
 ## 中文说明
 
-LamellarSAXS2D 面向取向层片的各向异性二维 SAXS 蝴蝶纹：用 PONI（pyFAI）得到物理 `q/chi/qx/qy`，提取固定 q 环的 `I(χ)` 花瓣轨迹，并只发表图像真正支持的量。
+WingSAXS 面向取向层片的各向异性二维 SAXS 蝴蝶纹：用 PONI（pyFAI）得到物理 `q/chi/qx/qy`，提取固定 q 环的 `I(χ)` 花瓣轨迹，并只发表图像真正支持的量。
 
 只有在径向反射峰有明确支持、单位有效且级次解释另有依据时，才把 `q*` 换算为一阶环周期 **L = 2π/q***。annular 的 `q_annulus` 只是固定 q 环采样坐标。只有内凹椭圆真正成立时，才显示表观 `a`、`b/a`、`θ`，以及未发表的 **Ln / Lz / 长轴 L** 候选。贴在 `flat_ellipse` 上下界、或长轴超出观测支持的解，按 **仅环/候选限制** 处理，不会把求解器的倾角或环 L 写进 Ln 列。`success=True` 不是科学验收；像素 q 不能冒充物理周期；缺失象限不会被镜像补齐。
 
@@ -149,15 +149,15 @@ LamellarSAXS2D 面向取向层片的各向异性二维 SAXS 蝴蝶纹：用 PONI
 支持 Python 3.11–3.13。Windows：
 
 ```powershell
-git clone https://github.com/D-sudoasd/LamellarSAXS2D.git
-cd LamellarSAXS2D
+git clone https://github.com/D-sudoasd/WingSAXS.git
+cd WingSAXS
 py -3.13 -m venv .venv-project
 .\.venv-project\Scripts\python.exe -m pip install --upgrade pip
 .\.venv-project\Scripts\python.exe -m pip install `
   -c constraints\validation-py311-313.txt -e ".[all]"
 .\.venv-project\Scripts\bsaxs-doctor.exe --require-ui
-.\启动_LamellarSAXS2D.cmd --check
-.\启动_LamellarSAXS2D.cmd
+.\启动_WingSAXS.cmd --check
+.\启动_WingSAXS.cmd
 ```
 
 蝴蝶页建议顺序：**识别 → 评估**（曲率模式下识别步骤显示为“识别弧”）。详见[首次启动](docs/first_run_zh.md)。
@@ -189,7 +189,7 @@ bsaxs-gui data/frame_0001.edf --poni geometry/detector.poni
 
 `--full2d` 才是可选的整幅经验强度精修，与蝴蝶几何测量不是同一条路径。批处理表用「警告 · 仅环 / 椭圆」区分发表状态；环 L 与 Ln 候选分列。
 
-公开展示名是 `LamellarSAXS2D`；安装包仍为 `butterfly-saxs`，导入仍为 `butterfly_saxs`，主命令仍为 `bsaxs`。
+公开展示名是 `WingSAXS`；安装包仍为 `butterfly-saxs`，导入仍为 `butterfly_saxs`，主命令仍为 `bsaxs`。
 
 科学量、单位与不可扩大解释的边界见[科学量与解释边界](docs/scientific_basis_zh.md)；操作与导出见[用户指南](docs/user_guide_zh.md)。
 

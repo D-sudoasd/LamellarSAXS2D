@@ -1,4 +1,4 @@
-# LamellarSAXS2D agent notes
+# WingSAXS agent notes
 
 This file is the machine/operator contract for coding agents. Human scientific
 scope remains in `docs/scientific_basis_zh.md`. Do not commit `CHANGELOG.md` or
@@ -6,7 +6,7 @@ scope remains in `docs/scientific_basis_zh.md`. Do not commit `CHANGELOG.md` or
 
 ## What this software is
 
-LamellarSAXS2D (`butterfly-saxs`, import `butterfly_saxs`, CLI `bsaxs`)
+WingSAXS (`butterfly-saxs`, import `butterfly_saxs`, CLI `bsaxs`)
 identifies and parameterizes butterfly-pattern 2D SAXS. Typical experimental
 frames support a **first-order ring** (`q*` and ring L = `2π/q*`). Apparent
 ellipse `a`, `b/a`, `θ`, and unpublished Ln/Lz/major-axis candidates exist only
@@ -30,7 +30,7 @@ bsaxs doctor --json
 If `bsaxs` cannot import, start with `bsaxs-doctor --json` (stdlib-only). Core
 analysis does not need Qt; the workbench does (`--require-ui`).
 
-Windows desktop entry: `启动_LamellarSAXS2D.cmd` (optional `--check`).
+Windows desktop entry: `启动_WingSAXS.cmd` (optional `--check`); the old filename remains an alias.
 
 ## Discover commands
 

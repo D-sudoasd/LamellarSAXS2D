@@ -1,4 +1,4 @@
-# LamellarSAXS2D 首次启动与标准工作流
+# WingSAXS 首次启动与标准工作流
 
 本文用于解决“安装后如何确认环境可用、双击为何无反应、进入界面后下一步做什么”三个常见问题。科学模型、参数定义和解释边界仍以[操作指南](user_guide_zh.md)与[科学量定义](scientific_basis_zh.md)为准。
 
@@ -39,26 +39,26 @@ bsaxs doctor --json
 
 ## 3. Windows 启动
 
-双击 `启动_LamellarSAXS2D.cmd`，或在终端运行：
+双击 `启动_WingSAXS.cmd`，或在终端运行：
 
 ```powershell
-.\启动_LamellarSAXS2D.cmd
+.\启动_WingSAXS.cmd
 ```
 
 可把图像路径和参数继续传给 GUI：
 
 ```powershell
-.\启动_LamellarSAXS2D.cmd data\frame_0001.cbf `
+.\启动_WingSAXS.cmd data\frame_0001.cbf `
   --poni geometry\detector.poni
 ```
 
 仅检查启动链而不打开窗口：
 
 ```powershell
-.\启动_LamellarSAXS2D.cmd --check
+.\启动_WingSAXS.cmd --check
 ```
 
-启动器不会自动修改环境。若检查失败，它会显示可复现的安装命令；若 `pythonw.exe` 启动阶段发生异常，完整 traceback 会写入用户目录下的 `LamellarSAXS2D/launcher.log`，同时显示日志位置，避免“双击后无反应”。
+启动器不会自动修改环境。若检查失败，它会显示可复现的安装命令；若 `pythonw.exe` 启动阶段发生异常，完整 traceback 会写入用户目录下的 `WingSAXS/launcher.log`，同时显示日志位置，避免“双击后无反应”。
 
 ## 4. 界面中的推荐顺序
 

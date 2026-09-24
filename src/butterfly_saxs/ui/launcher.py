@@ -23,7 +23,7 @@ def default_log_path() -> Path:
         root = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     else:
         root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return root / "LamellarSAXS2D" / "launcher.log"
+    return root / "WingSAXS" / "launcher.log"
 
 
 def _append_failure(
@@ -90,7 +90,7 @@ def run(
             location = f"unavailable ({type(log_error).__name__}: {log_error})"
         show = presenter or _present_failure
         show(
-            "LamellarSAXS2D start-up failed",
+            "WingSAXS start-up failed",
             (
                 "The graphical workbench could not start.\n"
                 "图形界面启动失败。\n\n"

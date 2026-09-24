@@ -1,4 +1,4 @@
-"""Optional LamellarSAXS2D Qt workbench.
+"""Optional WingSAXS Qt workbench.
 
 No Qt module is imported until a UI symbol is requested.  This keeps
 ``import butterfly_saxs`` and core-only scripts independent of PySide6.

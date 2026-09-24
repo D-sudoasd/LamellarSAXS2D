@@ -1,4 +1,4 @@
-"""Command line entry points for the shared LamellarSAXS2D pipeline."""
+"""Command line entry points for the shared WingSAXS pipeline."""
 
 from __future__ import annotations
 
@@ -312,7 +312,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bsaxs",
         description=(
-            "LamellarSAXS2D：蝴蝶状二维 SAXS 花样的定量测量与椭圆精修。"
+            "WingSAXS：蝴蝶状二维 SAXS 花样的定量测量与椭圆精修。"
             "无子命令时打印 agent 清单（bsaxs describe）。"
         ),
     )

@@ -251,7 +251,7 @@ def _repair_command(cwd: Path | None = None) -> str:
             )
         return f'"{sys.executable}" -m pip install -e ".[all]"'
     return (
-        "Run from the LamellarSAXS2D project directory, then install "
+        "Run from the WingSAXS project directory, then install "
         'with: python -m pip install -e ".[all]"'
     )
 
@@ -352,7 +352,7 @@ def collect_diagnostics(
         "schema_version": 1,
         "ready": not required_failures,
         "require_ui": bool(require_ui),
-        "application": "LamellarSAXS2D",
+        "application": "WingSAXS",
         "distribution": "butterfly-saxs",
         "version": str(__version__),
         "python": {
@@ -380,7 +380,7 @@ def collect_diagnostics(
 def _format_text(report: dict[str, Any]) -> str:
     status = "READY" if report["ready"] else "NOT READY"
     lines = [
-        "LamellarSAXS2D environment diagnostics / 环境诊断",
+        "WingSAXS environment diagnostics / 环境诊断",
         f"Status / 状态: {status}",
         f"Python support: {report['python']['supported_range']}",
         "",
@@ -412,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bsaxs-doctor",
         description=(
-            "Check the supported Python version and LamellarSAXS2D dependencies "
+            "Check the supported Python version and WingSAXS dependencies "
             "without opening the GUI."
         ),
     )
