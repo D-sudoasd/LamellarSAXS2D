@@ -209,6 +209,12 @@ def trace_butterfly_annuli(image, qmap, q_window, *, mask=None, reference_axis_d
             "q_min": row["q_min"], "q_max": row["q_max"], "q_unit": unit, "reason": row["reason"],
         }
     support = freeze_observed_support(points, arcs, summary_only=True, cancel_event=cancel_event)
+    outer_sides = sorted({
+        f"{point['branch_id']}:{point['side']}"
+        for point in points
+        if point["accepted"] and point["annulus_index"] == n_annuli - 1
+        and point["branch_id"] in (0, 1) and point["side"] in ("upper", "lower")
+    })
     settings = {"requested_radial_bins": requested, "effective_radial_bins": n_annuli,
                 "requested_angle_bins": requested_angles, "angle_bins": angle_bins,
                 "q_bin_width": dq, "angle_bin_width_deg": angle_step,
@@ -216,6 +222,7 @@ def trace_butterfly_annuli(image, qmap, q_window, *, mask=None, reference_axis_d
                 "maximum_track_angle_jump_deg": 2.5 * angle_step,
                 "q_step": step, "q_step_source": step_source, "q_step_details": step_details,
                 **accumulator.get("settings", {})}
+    explicit_center = any(key in options for key in ("center_q", "center_hint", "center_qx", "center_qy"))
     return {
         "method_version": METHOD_VERSION, "q_unit": unit,
         "branch_pairing": {"reference_axis_deg": reference_axis_deg,
@@ -227,8 +234,13 @@ def trace_butterfly_annuli(image, qmap, q_window, *, mask=None, reference_axis_d
                           "settings": settings, "annuli": annuli},
         "diagnostics": {"method": "fixed_q_annulus_angular_peak_trajectory", "q_window": list(window),
                         "reference_axis_deg": reference_axis_deg, "n_annuli": n_annuli,
+                        "center_q": ([float(topology["center_qx"]), float(topology["center_qy"])]
+                                     if explicit_center else None),
+                        "center_q_source": "explicit_option" if explicit_center else "not_supplied",
                         "n_points": len(points), "n_accepted_points": sum(p["accepted"] for p in points),
                         "n_arcs": len(arcs), "n_raw_candidates": sum(len(r["candidates"]) for r in annuli),
+                        "outer_window_accepted_sides": outer_sides,
+                        "outer_window_truncated": len(outer_sides) >= 2,
                         "observed_support": support, "applied_edits": applied, "seed_actions": seed_records,
                         "first_order_q_hint": {"selection_status": "not_used", "q_star": None,
                                                "reason": "annuli_are_sampling_coordinates_not_radial_peaks"},

@@ -260,16 +260,37 @@ def _stash_unpublished_periods(
 
 
 def _withhold_unpublished_shape_parameters(geometry_parameters: dict[str, Any]) -> None:
-    """A cap, floor, or runaway major axis is not a measured ellipse."""
+    """Keep ring-only and unidentified ellipse shapes out of public geometry."""
 
     geometry_parameters["a"] = None
     geometry_parameters["b"] = None
     geometry_parameters["axis_ratio"] = None
     geometry_parameters["theta_deg"] = None
-    geometry_parameters.pop("theta", None)
-    geometry_parameters.pop("angle_deg", None)
-    geometry_parameters.pop("ellipticity", None)
-    geometry_parameters.pop("eccentricity", None)
+    for alias in (
+        "theta", "angle_deg", "ellipse_axis_tilt_deg", "semi_major",
+        "semi_minor", "axes_ratio", "ellipticity", "eccentricity",
+    ):
+        geometry_parameters.pop(alias, None)
+
+
+def _ring_only_butterfly_shape(ellipse: Any, candidate: Any, butterfly: Any) -> bool:
+    """Use the shared publication rule at both service result boundaries."""
+
+    ellipse = ellipse if isinstance(ellipse, Mapping) else {}
+    candidate = candidate if isinstance(candidate, Mapping) else {}
+    butterfly = butterfly if isinstance(butterfly, Mapping) else {}
+    quality = butterfly.get("quality")
+    quality = quality if isinstance(quality, Mapping) else {}
+    flags = [str(flag) for source in (ellipse, candidate, quality)
+             for flag in (source.get("flags") or ()) if flag]
+    for source in (ellipse, candidate):
+        bounds = source.get("bound_flags")
+        if isinstance(bounds, Mapping) and bounds.get("axis_ratio"):
+            flags.append("axis_ratio_at_bound")
+    ratio = candidate.get("axis_ratio")
+    if ratio is None:
+        ratio = ellipse.get("axis_ratio")
+    return classify_ellipse_publication(axis_ratio=ratio, flags=flags) == "ring"
 
 
 def _ellipse_kind_for_record(result: Mapping[str, Any] | None) -> str:
@@ -1949,17 +1970,7 @@ class ButterflyAnalysisService:
                 ):
                     if geometry_parameters.get(name) is None and source.get(name) is not None:
                         geometry_parameters[name] = source[name]
-            bound_flags = ellipse.get("bound_flags") if isinstance(ellipse, Mapping) else {}
-            ellipse_flags = {
-                str(item)
-                for item in ((ellipse.get("flags") if isinstance(ellipse, Mapping) else None) or ())
-                if item
-            }
-            withhold_shape = bool(
-                (isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"))
-                or "major_axis_exceeds_observed_extent" in ellipse_flags
-                or "axis_ratio_collapsed_to_line" in ellipse_flags
-            )
+            withhold_shape = _ring_only_butterfly_shape(ellipse, candidate, butterfly)
             _stash_unpublished_periods(
                 geometry_parameters,
                 butterfly=butterfly,
@@ -2082,20 +2093,7 @@ class ButterflyAnalysisService:
             ):
                 if geometry_parameters.get(name) is None and source.get(name) is not None:
                     geometry_parameters[name] = source[name]
-        bound_flags = ellipse.get("bound_flags") if isinstance(ellipse, Mapping) else {}
-        if isinstance(candidate, Mapping) and candidate.get("bound_flags"):
-            bound_flags = candidate.get("bound_flags")
-        quality = butterfly.get("quality") if isinstance(butterfly, Mapping) else {}
-        quality_flags = {
-            str(item)
-            for item in ((quality.get("flags") if isinstance(quality, Mapping) else None) or ())
-            if item
-        }
-        withhold_shape = bool(
-            (isinstance(bound_flags, Mapping) and bound_flags.get("axis_ratio"))
-            or "major_axis_exceeds_observed_extent" in quality_flags
-            or "axis_ratio_collapsed_to_line" in quality_flags
-        )
+        withhold_shape = _ring_only_butterfly_shape(ellipse, candidate, butterfly)
         _stash_unpublished_periods(
             geometry_parameters,
             butterfly=butterfly,

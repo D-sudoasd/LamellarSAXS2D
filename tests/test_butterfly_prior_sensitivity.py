@@ -28,6 +28,69 @@ def _fit_payload():
     }
 
 
+@pytest.mark.parametrize(
+    ("trace_method", "tip_constraint"),
+    [("annular_peak", False), ("curvature", True)],
+)
+def test_arc_holdout_uses_same_tip_prior_as_main_fit(
+    monkeypatch, trace_method, tip_constraint,
+) -> None:
+    from butterfly_saxs import arc_geometry
+
+    image, qmap, _, _ = _sensitivity_inputs()
+    points = [
+        {"arc_id": arc_id, "accepted": True, "branch_id": arc_id,
+         "side": "upper", "point_id": f"{arc_id}-{index}"}
+        for arc_id in (0, 1) for index in range(6)
+    ]
+    seen = []
+
+    monkeypatch.setattr(butterfly, "_q_step", lambda _qmap: None)
+    monkeypatch.setattr(
+        butterfly, "analyze_butterfly",
+        lambda *args, **kwargs: {"candidate_fit": _fit_payload()},
+    )
+
+    def fake_fit(*args, **kwargs):
+        seen.append(kwargs["observed_tip_constraint"])
+        return {"fit": SimpleNamespace(success=False)}
+
+    monkeypatch.setattr(arc_geometry, "fit_arc_ellipses", fake_fit)
+    butterfly._sensitivity(
+        image, qmap, [0.0, 1.0], mask=None,
+        options={"trace_method": trace_method, "smoothing_scales": [1.0]},
+        parameters=None, reference=0.0, multistart=1, cancel_event=None,
+        trace={"points": points},
+    )
+    assert seen == [tip_constraint, tip_constraint]
+
+
+def test_annular_sensitivity_bins_remain_within_valid_recipe_limits(monkeypatch) -> None:
+    image, qmap, trace, _ = _sensitivity_inputs()
+    monkeypatch.setattr(butterfly, "_q_step", lambda _qmap: None)
+    variants = []
+
+    def fake_analyze(*args, **kwargs):
+        variants.append(kwargs["options"])
+        return {"candidate_fit": _fit_payload()}
+
+    monkeypatch.setattr(butterfly, "analyze_butterfly", fake_analyze)
+    butterfly._sensitivity(
+        image, qmap, [0.0, 1.0], mask=None,
+        options={"trace_method": "annular_peak", "annular_radial_bins": 192,
+                 "annular_angle_bins": 720},
+        parameters=None, reference=0.0, multistart=1, cancel_event=None,
+        trace=trace,
+    )
+    assert any(
+        variant.get("annular_radial_bins") == 192
+        and variant.get("annular_angle_bins") == 720
+        for variant in variants
+    )
+    assert all(variant.get("annular_radial_bins", 192) <= 192 for variant in variants)
+    assert all(variant.get("annular_angle_bins", 720) <= 720 for variant in variants)
+
+
 def test_explicit_geometry_bounds_create_real_contract_expand_refits(monkeypatch) -> None:
     image, qmap, trace, options = _sensitivity_inputs()
     parameters = {

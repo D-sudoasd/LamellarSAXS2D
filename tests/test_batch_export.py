@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from butterfly_saxs.batch import FrameFitResult, FrameRef, build_frame_refs, run_batch
+from butterfly_saxs.batch import (
+    FrameFitResult, FrameRef, _quality_warning_reason, build_frame_refs, run_batch,
+)
 from butterfly_saxs.export import _contains_omitted_array, _parameters, export_batch
 
 
@@ -630,6 +632,7 @@ def test_frame_summary_exports_arc_quality_and_radial_period(tmp_path: Path) -> 
     with outputs["frame_summary"].open(newline="", encoding="utf-8") as handle:
         row = next(csv.DictReader(handle))
     assert row["quality_status"] == "WARN"
+    assert _quality_warning_reason(frame.result) == "quality_status=WARN"
     assert row["arc_sides"] == "4/4"
     assert float(row["q_star_from_arcs"]) == pytest.approx(0.099)
     assert float(row["L_from_observed_radius_nm"]) == pytest.approx(63.2)

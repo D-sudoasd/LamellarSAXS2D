@@ -519,6 +519,8 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
             "axis_ratio_at_bound",
             "axis_ratio_collapsed_to_line",
             "major_axis_exceeds_observed_extent",
+            "annular_outer_window_truncated",
+            "near_circular_ellipse_axis_unidentifiable",
         )
     )
     if unpublished_shape:
@@ -6502,6 +6504,8 @@ if QT_AVAILABLE:
                     "axis_ratio_at_bound",
                     "axis_ratio_collapsed_to_line",
                     "major_axis_exceeds_observed_extent",
+                    "annular_outer_window_truncated",
+                    "near_circular_ellipse_axis_unidentifiable",
                 }
                 & {str(item) for item in (*ellipse_flags, *p4_flags)}
             )

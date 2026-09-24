@@ -1332,6 +1332,24 @@ def _quality_failure_reason(result: Any) -> str | None:
     return None
 
 
+def _quality_warning_reason(result: Any) -> str | None:
+    """Report a completed WARN without reclassifying its frame as failed."""
+
+    for name, value in (
+        ("quality_status", _named_value(result, "quality_status")),
+        ("quality.status", _named_value(_named_value(result, "quality"), "status")),
+    ):
+        if isinstance(value, str) and value.strip().casefold() == "warn":
+            return f"{name}=WARN"
+    butterfly = _butterfly_payload(result)
+    quality = _named_value(butterfly, "quality")
+    for name in ("status", "engineering_status"):
+        value = _named_value(quality, name)
+        if isinstance(value, str) and value.strip().casefold() == "warn":
+            return f"butterfly.quality.{name}=WARN"
+    return None
+
+
 def _warm_start_seed(result: Any) -> Any:
     """Extract the parameter state expected by an analyzer when available."""
 

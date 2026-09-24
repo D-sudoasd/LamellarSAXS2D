@@ -37,6 +37,8 @@ def test_annuli_trace_four_extended_petals_instead_of_radial_peak_positions():
         assert "q_star" not in point
     assert np.ptp([p["q_annulus"] for p in accepted]) > .45
     assert all(profile["profile_axis"] == "azimuthal" for profile in result["profiles"].values())
+    assert result["diagnostics"]["outer_window_truncated"] is True
+    assert len(result["diagnostics"]["outer_window_accepted_sides"]) >= 2
 
 
 def test_missing_lobe_and_masked_ring_are_not_synthesized_or_bridged():
@@ -55,6 +57,16 @@ def test_missing_lobe_and_masked_ring_are_not_synthesized_or_bridged():
         assert not mask[int(point["pixel_y"]), int(point["pixel_x"])]
 
 
+def test_explicit_annular_topology_center_is_recorded_without_claiming_verification():
+    image, qmap, _ = _curved_petals()
+    result = trace_butterfly_annuli(
+        image, qmap, (.25, .75),
+        options={"annular_radial_bins": 20, "center_qx": 0.01, "center_qy": -0.02},
+    )
+    assert result["diagnostics"]["center_q"] == [0.01, -0.02]
+    assert result["diagnostics"]["center_q_source"] == "explicit_option"
+
+
 def test_annular_recipe_dispatch_and_sampling_coordinates_do_not_become_periods():
     image, qmap, _ = _curved_petals()
     result = analyze_butterfly(image, qmap, (.25, .75), options={
@@ -66,6 +78,12 @@ def test_annular_recipe_dispatch_and_sampling_coordinates_do_not_become_periods(
     assert result["candidate_fit"]["L_from_observed_radius_nm"] is None
     assert result["candidate_fit"]["q_star_source"] == "unavailable_prescribed_annuli"
     assert result["quality"]["scientific_status"] == "NOT_ACCEPTED"
+    assert "annular_outer_window_truncated" in result["quality"]["flags"]
+    assert result["candidate_fit"]["axis_identifiability"]["major_axis_status"] == "not_identified"
+    if result["candidate_fit"]["success"]:
+        symmetry = result["candidate_fit"]["symmetry"]
+        assert symmetry["q_difference_independent"] is False
+        assert "same-annulus sampling" in symmetry["central_symmetry"]["q_difference_note"]
     assert "annular_peaks" in result and "sector_peaks" not in result
     with pytest.raises(ValueError, match="annular_radial_bins"):
         analyze_butterfly(image, qmap, (.25, .75), options={"trace_method":"annular_peak", "annular_radial_bins": True})

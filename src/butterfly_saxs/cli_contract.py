@@ -185,7 +185,7 @@ def agent_guidance(
         next_steps.append("Do not pass --full2d unless an empirical whole-pixel intensity model is explicitly requested.")
     elif command == "analyze":
         if quality_gate_reason:
-            next_steps.append(f"Quality gate failed ({quality_gate_reason}); keep the JSON evidence, do not publish ellipse shape.")
+            next_steps.append(f"Quality gate reported ({quality_gate_reason}); keep the JSON evidence, do not publish ellipse shape.")
         if publication == "ring":
             next_steps.append("Publish first-order ring L only; leave Ln/Lz/major-axis unpublished.")
         if pixel_q:

@@ -286,6 +286,8 @@ def test_fit_trace_uses_canonical_envelope_and_preserves_arc_mapping(monkeypatch
     assert result["branch_label_mapping"]["fit_branch_to_observed"] == {"0": 1, "1": 0}
     assert result["arc_diagnostics"] == arc_diagnostics
     assert result["point_diagnostics"] == point_diagnostics
+    assert result["symmetry"]["symmetry_status"] == "FAIL"
+    assert result["symmetry"]["flags"] == ["no_observed_symmetry_points"]
 
 
 def test_failed_arc_fit_keeps_observed_diagnostics(monkeypatch) -> None:

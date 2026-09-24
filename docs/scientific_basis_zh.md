@@ -26,6 +26,8 @@
 - `apparent_geometry_only`、`nonunique_inverse_problem`：结果是观测图样的表观几何，单个二维图样不能唯一决定真实结构。
 - `ridge_method = "azimuthal_peak"` 的 `q_star` 是 q annulus 的代表坐标，不能当作径向峰或直接换算层片周期；lobe 周围独立径向 profile 才提供 radial `q_star`、FWHM、面积和 SNR。
 - `flat_ellipse` 中的轴比、a/b、angle、fixed-center、fixed-a 或 fixed-axis-ratio 是显式的经验拟合约束（先验）；达到边界或只有短弧支持时，结果必须同时阅读 `bound_*`、`condition`、`short_arc` 与 `major_axis_extrapolated`。
+- `near_circular_ellipse_axis_unidentifiable` 表示拟合轴比达到暂定的 0.95 近圆阈值，椭圆轴方向不可辨识；数值收敛不把各向同性环升级成蝴蝶双椭圆。
+- `annular_outer_window_truncated` 表示至少两个独立侧边的连续花瓣仍到达分析 q 窗口最外环；窗口边界不是长轴尖端，椭圆几何只作候选。
 - `empirical_model_only`：`full2d` 使用经验强度模型。
 - `uncalibrated_pixel_q`：未提供 PONI 且未显式提供 `q_scale` 时，坐标是 `pixel-q`，不是物理单位。
 - `spacing_unavailable_unknown_q_unit`、`spacing_unavailable_nonzero_center`、`spacing_requires_origin_centered_ellipse_assumption`：周期换算缺少物理 q 单位或不满足原点中心假设。

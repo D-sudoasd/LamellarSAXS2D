@@ -98,6 +98,16 @@ def test_summary_ring_only_and_poor_match_reasons_are_visible(qtbot) -> None:
     assert "axis_ratio_at_bound" in page.quality_summary.state.reasons
     assert "#fff5d6" in page.quality_summary.styleSheet()
 
+    near_circle = _result(flags=["near_circular_ellipse_axis_unidentifiable"])
+    near_circle["candidate_fit"]["axis_ratio"] = 0.98
+    page.set_result(near_circle)
+    assert page.quality_summary.state.status_key == "ring_only"
+    assert "近圆形" in page.quality_summary.reason_label.text()
+
+    page.set_result(_result(flags=["annular_outer_window_truncated"]))
+    assert page.quality_summary.state.status_key == "ring_only"
+    assert "窗口边界" in page.quality_summary.reason_label.text()
+
     page.set_result(
         _result(flags=["analysis_choice_sensitivity_unassessed", "insufficient_occupied_sides", "poor_match"])
     )
