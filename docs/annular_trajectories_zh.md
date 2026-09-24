@@ -43,6 +43,11 @@ I_raw(χₗ | qₖ) = sum(Iₚ) / count(Iₚ)
 
 分析 q 窗口的外边界是采样范围，不是真实长轴尖端。annular 路径已禁用共享的 `observed_tip_constraint`，避免把 q 窗口边界塞进长轴估计；用户明确给出的参数上下界仍然保留。若 q 支持不足以辨识很长的 `a`，结果应标记为不可辨识、ring-only 或候选限制状态，不强报长轴、`Ln` 或 `L`。
 
+若至少两个独立侧边的已接受轨迹仍延伸到最外侧 q 环，`diagnostics.outer_window_truncated` 会记录这一事实，`quality.flags` 和候选拟合标记 `annular_outer_window_truncated`。此时分析窗口没有包住花瓣外端，长轴状态为 `not_identified`，椭圆参数只保留为未发表候选。逐弧留出检验使用与主拟合相同的无端点先验，不能在交叉检查时把窗口边界重新当成观测尖端。
+
+候选拟合的 `symmetry` 还记录四象限计数、两对相对侧边的配对数和中心对称偏差。由于相对点可能来自同一个预设 q 环，`q_difference_independent=false`；径向差值不能单独作为独立的对称性证据。
+对称性偏差采用候选拟合中心计算，并以 `center_source` 记录来源；数值中心存在不等于中心经过独立实验验证，因此 `center_verified=false`。若用户显式指定拓扑中心，轨迹诊断另记 `center_q_source=explicit_option`，也不自动提升为已验证。
+
 ## GUI、CLI 与旧项目
 
 新建 GUI 会话的识别方式是 `annular_peak`，控制栏默认显示 q 环数量 40 和方位角分箱 72。历史项目配方缺少 `trace_method` 时，继续使用历史 `curvature` 语义；历史 `ridge_method=butterfly_curvature` 的 family、象限和分支标记仍保留。需要切换到 annular 时应明确选择方法并重新识别。

@@ -234,6 +234,8 @@ _REASON_TEXT: dict[str, tuple[str, str]] = {
     "axis_ratio_at_bound": ("轴比触及边界，按仅一阶环处理", "axis ratio at bound; ring only"),
     "axis_ratio_collapsed_to_line": ("轴比塌缩，椭圆不可分辨", "axis ratio collapsed; ellipse unresolved"),
     "major_axis_exceeds_observed_extent": ("长轴超出观测范围", "major axis exceeds observed extent"),
+    "annular_outer_window_truncated": ("花瓣延伸到分析 q 窗口边界，长轴端点未观测到", "petals reach the q-window boundary; major-axis tip unobserved"),
+    "near_circular_ellipse_axis_unidentifiable": ("近圆形图样的椭圆轴方向不可辨识", "near-circular pattern has no identifiable ellipse direction"),
     "insufficient_occupied_sides": ("有效侧边不足", "insufficient occupied sides"),
     "insufficient_independent_side_support": ("独立侧边支持不足", "insufficient independent side support"),
     "solver_or_arc_support_unavailable": ("求解器或弧线支持不可用", "solver or arc support unavailable"),

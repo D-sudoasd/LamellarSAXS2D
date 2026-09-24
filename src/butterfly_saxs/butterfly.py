@@ -15,7 +15,9 @@ from typing import Any
 import numpy as np
 
 from .butterfly_settings import METHOD_VERSION, normalize_butterfly_settings
-from .butterfly_quality import PARAMETERS, evaluate_arc_evidence
+from .butterfly_quality import (
+    NEAR_CIRCULAR_AXIS_RATIO_MIN, PARAMETERS, evaluate_arc_evidence,
+)
 from .cancellation import raise_if_cancelled
 from .public_ellipse import canonical_ellipse_payload, observed_arc_radius_period
 from .ridge_inputs import canonical_inputs
@@ -152,6 +154,35 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
         qmap={"q_unit": unit},
         config={"analysis": {"draw_axis_deg": float(reference) + 90.0}},
     )
+    from .observables import _symmetry_diagnostics
+
+    reference_center = _trace_reference_center(trace)
+    candidate_center = (payload.get("center_qx"), payload.get("center_qy"))
+    if all(value is not None and np.isfinite(value) for value in candidate_center):
+        symmetry_center = tuple(float(value) for value in candidate_center)
+        center_source = "candidate_geometry"
+    else:
+        symmetry_center = reference_center if reference_center is not None else (0.0, 0.0)
+        center_source = "trace_option" if reference_center is not None else "q_origin_default"
+    symmetry_points, symmetry_labels = [], []
+    for point in supported:
+        try:
+            qx, qy = float(point["qx"]), float(point["qy"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if np.isfinite(qx) and np.isfinite(qy):
+            symmetry_points.append((qx, qy))
+            symmetry_labels.append(point["branch_id"])
+    payload["symmetry"] = _symmetry_diagnostics(
+        np.asarray(symmetry_points, dtype=float).reshape(-1, 2),
+        np.asarray(symmetry_labels, dtype=float),
+        center=symmetry_center,
+        reference_axis_deg=reference,
+        unassigned_count=len(supported) - len(symmetry_points),
+        center_verified=False,
+        azimuthal=trace.get("method_version", "").startswith("butterfly-annular-"),
+    )
+    payload["symmetry"]["center_source"] = center_source
     theta_deg = payload.get("theta_deg")
     try:
         theta_deg = float(theta_deg)
@@ -199,6 +230,9 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
     extra_flags = list(radius_flags)
     if bound_flags.get("axis_ratio"):
         extra_flags.append("axis_ratio_at_bound")
+    ratio = payload.get("axis_ratio")
+    if ratio is not None and np.isfinite(ratio) and ratio >= NEAR_CIRCULAR_AXIS_RATIO_MIN:
+        extra_flags.append("near_circular_ellipse_axis_unidentifiable")
     payload["q_star_from_arcs"] = q_star
     payload["L_from_observed_radius_nm"] = radius_period
     payload["q_star_source"] = (
@@ -689,8 +723,8 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
                          ("q_expand", [max(0., window[0] - qstep), window[1] + qstep], {})])
     if options.get("trace_method") == "annular_peak":
         variants.extend((f"annular_bins_{factor}", window,
-                         {"annular_radial_bins": max(4, round(options.get("annular_radial_bins", 40) * factor)),
-                          "annular_angle_bins": max(16, round(options.get("annular_angle_bins", 72) * factor))})
+                         {"annular_radial_bins": min(192, max(4, round(options.get("annular_radial_bins", 40) * factor))),
+                          "annular_angle_bins": min(720, max(16, round(options.get("annular_angle_bins", 72) * factor)))})
                         for factor in (.75, 1.25))
     else:
         scales = options.get("smoothing_scales", options.get("scales_px", [1.2, 2.2, 3.6]))
@@ -803,6 +837,7 @@ def _sensitivity(image, qmap, window, *, mask, options, parameters, reference,
                 max_nfev=options.get("max_nfev", 800),
                 cancel_event=cancel_event,
                 reference_center=reference_center,
+                observed_tip_constraint=options.get("trace_method") != "annular_peak",
             )
             trial = trial_bundle.get("fit")
         except ValueError as exc:
@@ -1064,8 +1099,10 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
             trace, q_unit, settings.get("edits", [])
         )
     if settings["trace_method"] == "annular_peak":
+        outer_truncated = bool(trace.get("diagnostics", {}).get("outer_window_truncated"))
         candidate["flags"] = list(dict.fromkeys([
             *(candidate.get("flags") or ()), "prescribed_q_not_radial_peak", "angular_scan_not_normal_ridge",
+            *(["annular_outer_window_truncated"] if outer_truncated else []),
         ]))
         evidence["quality"]["measurement_definition"] = "azimuthal maxima on successive prescribed q annuli"
         candidate["major_axis_prior"] = {
@@ -1078,9 +1115,10 @@ def analyze_butterfly(image, qmap, q_window, *, mask=None, options=None,
         major = candidate.get("a")
         extrapolated = bool(major is not None and extent > 0 and major > 3 * extent)
         candidate["axis_identifiability"] = {
-            "major_axis_status": "not_identified" if extrapolated else "requires_sensitivity_review",
+            "major_axis_status": "not_identified" if extrapolated or outer_truncated else "requires_sensitivity_review",
             "observed_radius_max_q": extent or None,
             "a_over_observed_radius_max": float(major / extent) if major is not None and extent else None,
+            "outer_window_accepted_sides": trace.get("diagnostics", {}).get("outer_window_accepted_sides", []),
             "sampling_scale_is_not_measurement_uncertainty": True,
             "optimizer_weighting": "inverse angular-bin sampling scale; not detector-error weighting",
         }

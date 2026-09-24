@@ -82,6 +82,73 @@ def test_ellipse_publication_classifies_ring_vs_interior_fit() -> None:
         quality_status="WARN",
         axis_ratio=0.30,
     )
+    assert classify_ellipse_publication(quality_status="WARN", axis_ratio=0.98) == "ring"
+
+
+def test_isotropic_ring_cannot_become_double_ellipse_with_standard_preset() -> None:
+    from butterfly_saxs.pipeline import analyze_frame
+    from butterfly_saxs.service import ButterflyAnalysisService
+
+    axis = np.linspace(-0.4, 0.4, 48)
+    qx, qy = np.meshgrid(axis, axis)
+    q = np.hypot(qx, qy)
+    image = 2.0 + 20.0 * np.exp(-0.5 * ((q - 0.22) / 0.025) ** 2)
+    result = analyze_frame(
+        image,
+        qmap={"qx": qx, "qy": qy, "q": q, "q_unit": "nm^-1"},
+        config={"analysis": {
+            "ridge_method": "butterfly_curvature", "q_window": [0.05, 0.38],
+            "ellipse_preset": "standard", "ellipse_multistart": 1,
+            "butterfly": {"stage": "evaluate", "resamples": 0, "sensitivity": False},
+        }},
+        full2d=False,
+    )
+    butterfly = result.butterfly
+    assert butterfly is not None
+    ratio = butterfly["candidate_fit"]["axis_ratio"]
+    assert ratio is not None and ratio >= 0.95
+    assert "near_circular_ellipse_axis_unidentifiable" in butterfly["quality"]["flags"]
+    assert butterfly["warm_start_eligible"] is False
+    assert classify_ellipse_publication(
+        quality_status=butterfly["quality"]["status"],
+        axis_ratio=ratio,
+        flags=butterfly["candidate_fit"]["flags"],
+    ) == "ring"
+    service = ButterflyAnalysisService(analysis_settings={
+        "ridge_method": "butterfly_curvature", "q_window": [0.05, 0.38],
+        "ellipse_preset": "standard", "ellipse_multistart": 1,
+        "butterfly": {"stage": "evaluate", "resamples": 0, "sensitivity": False},
+    })
+    state = service.set_observed(image, qmap={"qx": qx, "qy": qy, "q": q, "q_unit": "nm^-1"})
+    measured = service.measure_geometry(payload=state)
+    geometry = measured["geometry_parameters"]
+    assert all(geometry.get(name) is None for name in ("a", "b", "axis_ratio", "theta_deg"))
+    assert measured["butterfly"]["candidate_fit"]["axis_ratio"] >= 0.95
+
+
+@pytest.mark.parametrize("flag", [
+    "near_circular_ellipse_axis_unidentifiable",
+    "annular_outer_window_truncated",
+])
+def test_service_preview_withholds_new_ring_only_shapes(monkeypatch, flag) -> None:
+    from butterfly_saxs.service import ButterflyAnalysisService
+
+    service = ButterflyAnalysisService()
+    candidate = {"a": 1.0, "b": 0.3, "axis_ratio": 0.3, "theta_deg": 12.0,
+                 "flags": [flag]}
+    monkeypatch.setattr(service, "preview", lambda **kwargs: {
+        "ellipse_fit": {"parameters": {**candidate, "semi_major": 1.0,
+                                       "semi_minor": 0.3, "axes_ratio": 0.3,
+                                       "ellipse_axis_tilt_deg": 12.0}, "success": True},
+        "butterfly": {"candidate_fit": candidate, "quality": {"status": "WARN", "flags": [flag]}},
+        "parameters": {},
+    })
+    result = service.measure_geometry()
+    assert all(result["geometry_parameters"].get(name) is None
+               for name in ("a", "b", "axis_ratio", "theta_deg"))
+    assert all(name not in result["geometry_parameters"] for name in
+               ("semi_major", "semi_minor", "axes_ratio", "ellipse_axis_tilt_deg"))
+    assert result["butterfly"]["candidate_fit"]["a"] == 1.0
 
 
 def test_two_occupied_sides_are_an_engineering_fail() -> None:
@@ -400,6 +467,15 @@ def test_service_and_pipeline_share_actual_butterfly_measurement(tmp_path):
     assert rows["a"]["identifiability_status"] == "undetermined"
     assert set(cli_result.butterfly["ellipse_local"]) == {"0", "1"}
     assert any(profile.get("residual") for profile in cli_result.butterfly["profiles"].values())
+    symmetry = cli_result.ellipse_fit["symmetry"]
+    assert symmetry["policy"] == "strict_butterfly_quadrant_pairing"
+    assert set(symmetry["quadrant_counts"]) == {"QI", "QII", "QIII", "QIV"}
+    assert set(symmetry["paired_support"]) == {"0", "1"}
+    assert symmetry["central_symmetry"]["matched_pair_count"] <= len(pipeline_points) // 2
+    assert symmetry["center_verified"] is False
+    assert symmetry["center_source"] == "candidate_geometry"
+    assert symmetry["center_qx"] == pytest.approx(cli_result.ellipse_fit["center_qx"])
+    assert symmetry["center_qy"] == pytest.approx(cli_result.ellipse_fit["center_qy"])
 
 
 def test_public_extract_ridges_routes_new_method_without_fitting():

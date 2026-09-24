@@ -15,6 +15,9 @@ from .butterfly_ridge import FIRST_ORDER_FAMILY_SPAN
 # A first-order Wang ellipse can extend past q*, but a major axis more than
 # twice q* is fitting a larger-q continuum, not the Bragg ellipse.
 MAJOR_AXIS_TO_QSTAR_MAX = 2.0
+# A nearly circular candidate has no identifiable ellipse direction. This is
+# a provisional geometry screen, not a statistical test of isotropy.
+NEAR_CIRCULAR_AXIS_RATIO_MIN = 0.95
 
 
 PARAMETERS = ("a", "b", "axis_ratio", "theta_deg")
@@ -50,11 +53,15 @@ def classify_ellipse_publication(
             "axis_ratio_at_bound",
             "axis_ratio_collapsed_to_line",
             "major_axis_exceeds_observed_extent",
+            "annular_outer_window_truncated",
+            "near_circular_ellipse_axis_unidentifiable",
         )
     ):
         return "ring"
     ratio = _finite(axis_ratio)
     if ratio is not None:
+        if ratio >= NEAR_CIRCULAR_AXIS_RATIO_MIN:
+            return "ring"
         return "ellipse"
     return "undetermined"
 
@@ -154,6 +161,8 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     if any(count < 3 for count in groups.values()):
         common.append("insufficient_independent_side_support")
     ratio = _finite(candidate.get("axis_ratio"))
+    if ratio is not None and ratio >= NEAR_CIRCULAR_AXIS_RATIO_MIN:
+        common.append("near_circular_ellipse_axis_unidentifiable")
     bound_flags = candidate.get("bound_flags", {}) or {}
     flag_names = {str(item) for item in (candidate.get("flags") or ())}
     line_collapsed = (
@@ -178,6 +187,8 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
         first_order = diagnostics.get("first_order_q_hint")
         if isinstance(first_order, Mapping):
             hint = _finite(first_order.get("q_star"))
+        if diagnostics.get("outer_window_truncated"):
+            common.append("annular_outer_window_truncated")
     if hint is not None and hint > 0.0:
         family = [radius for radius in qs if radius <= FIRST_ORDER_FAMILY_SPAN * hint]
         if family:

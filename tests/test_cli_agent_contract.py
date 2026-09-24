@@ -116,6 +116,29 @@ def test_analyze_annotation_keeps_payload_and_denies_acceptance(
     assert report["agent"]["pixel_q"] is True
 
 
+def test_analyze_warn_exits_one_without_discarding_measurement(monkeypatch, capsys) -> None:
+    import butterfly_saxs.cli as cli_module
+
+    class Result:
+        def to_mapping(self):
+            return {
+                "butterfly": {
+                    "settings": {"stage": "evaluate"},
+                    "candidate_fit": {"success": True, "status": "ok"},
+                    "quality": {"status": "WARN", "scientific_status": "NOT_ACCEPTED"},
+                    "points": [{"accepted": True}],
+                },
+                "ellipse_fit": {"success": True, "status": "ok"},
+            }
+
+    monkeypatch.setattr(cli_module, "analyze_frame", lambda *args, **kwargs: Result())
+    assert main(["analyze", "frame.npy"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["butterfly"]["candidate_fit"]["success"] is True
+    assert report["agent"]["quality_gate_reason"] == "butterfly.quality.status=WARN"
+    assert report["agent"]["exit_code"] == 1
+
+
 def test_pipeline_error_is_stdlib_importable() -> None:
     assert issubclass(PipelineError, RuntimeError)
     assert PipelineError("x").args == ("x",)

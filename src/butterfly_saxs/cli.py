@@ -639,9 +639,9 @@ def _handle_analyze(args: argparse.Namespace) -> int:
             analysis_paths = export_result(result, args.output, force=args.force)
             result.output_paths.extend(str(path) for path in analysis_paths)
     report = result.to_mapping()
-    from .batch import _quality_failure_reason
+    from .batch import _quality_failure_reason, _quality_warning_reason
 
-    quality_reason = _quality_failure_reason(report)
+    quality_reason = _quality_failure_reason(report) or _quality_warning_reason(report)
     exit_code = 1 if quality_reason is not None else 0
     report = annotate_report(
         report,
@@ -1080,9 +1080,15 @@ def _handle_batch(args: argparse.Namespace) -> int:
         report["unattended"] = True
         report["preflight"] = preflight_summary
         report["outputs"]["preflight"] = str(output_dir / "preflight" / "preflight.json")
-    exit_code = 1 if (run.failures or run.cancelled or
+    from .batch import _quality_warning_reason
+
+    warning_reason = next((reason for frame in run.frame_results
+                           if frame.result is not None
+                           if (reason := _quality_warning_reason(frame.result)) is not None), None)
+    exit_code = 1 if (run.failures or run.cancelled or warning_reason or
                       (preflight_summary is not None and preflight_summary["status_color"] != "green")) else 0
-    report = annotate_report(report, command="batch", exit_code=exit_code)
+    report = annotate_report(report, command="batch", exit_code=exit_code,
+                             quality_gate_reason=warning_reason)
     _print_json(report)
     # Partial exports remain available for inspection, while automation gets
     # an honest non-zero status when any frame failed its load/fit quality gate.
