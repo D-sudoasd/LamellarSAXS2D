@@ -585,18 +585,20 @@ def _plot_annular_overlays(
         for point in points:
             if point.get("qx") is None or point.get("qy") is None:
                 continue
-            trajectory_id = str(point.get("trajectory_id", "unassigned"))
+            trajectory_id = str(point.get("trajectory_id"))
             grouped.setdefault(trajectory_id, []).append(point)
         for trajectory_id, group in grouped.items():
             qx = [float(point["qx"]) for point in group]
             qy = [float(point["qy"]) for point in group]
             is_accepted = all(bool(point.get("accepted")) for point in group)
+            connected = is_accepted and trajectory_id != "None"
             ax.plot(
                 qx,
                 qy,
                 marker="o",
                 markersize=2.6,
                 linewidth=0.8,
+                linestyle="-" if connected else "None",
                 alpha=0.9,
                 label=trajectory_id if is_accepted else None,
                 fillstyle="full" if is_accepted else "none",
@@ -607,6 +609,8 @@ def _plot_annular_overlays(
             ax.plot(q0 * np.cos(theta), q0 * np.sin(theta), "w--", linewidth=0.7,
                     alpha=0.85, label="structural q₀")
         ax.set_aspect("equal")
+        ax.set_xlim(-0.85, 0.85)
+        ax.set_ylim(-0.85, 0.85)
         ax.set_xlabel("qₓ (nm⁻¹)")
         ax.set_ylabel("qᵧ (nm⁻¹)")
         ax.set_title(
@@ -692,6 +696,8 @@ def _plot_intensity_sheet(path: Path, frames: tuple[dict[str, object], ...]) -> 
         ax.set_xlabel("qₓ (nm⁻¹)")
         ax.set_ylabel("qᵧ (nm⁻¹)")
         ax.set_aspect("equal")
+        ax.set_xlim(-0.85, 0.85)
+        ax.set_ylim(-0.85, 0.85)
     for ax in axes_array.flat[len(frames) :]:
         ax.remove()
     if image is not None:
