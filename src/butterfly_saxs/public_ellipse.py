@@ -79,7 +79,7 @@ def _field(value: Any, *names: str, default: Any = None) -> Any:
 def _finite(value: Any, default: float = float("nan")) -> float:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
     return number if math.isfinite(number) else default
 
@@ -122,52 +122,68 @@ def _origin_centered_periods(
     return ln, lz, l_major, ("spacing_requires_origin_centered_ellipse_assumption",)
 
 
+def _observed_arc_radii(points: Any) -> list[float]:
+    rows = points if isinstance(points, (list, tuple)) else ()
+    radii: list[float] = []
+    for point in rows:
+        if not isinstance(point, Mapping):
+            continue
+        qx = _finite(point.get("qx"))
+        qy = _finite(point.get("qy"))
+        if not (math.isfinite(qx) and math.isfinite(qy)):
+            continue
+        radius = math.hypot(qx, qy)
+        if math.isfinite(radius) and radius > 0.0:
+            radii.append(radius)
+    radii.sort()
+    return radii
+
+
+def observed_arc_q_median(points: Any) -> float:
+    """Median radius of the supplied observed q-space points, in their q unit."""
+
+    radii = _observed_arc_radii(points)
+    if not radii:
+        return float("nan")
+    mid = len(radii) // 2
+    if len(radii) % 2:
+        return radii[mid]
+    return 0.5 * (radii[mid - 1] + radii[mid])
+
+
 def observed_arc_radius_period(
     points: Any,
     q_unit: Any,
     first_order_q: Any = None,
+    *,
+    first_order_selection_status: Any = None,
 ) -> tuple[float, float, tuple[str, ...]]:
-    """Apparent Bragg period of the first-order ring.
+    """Return a selected radial peak or an observed arc-radius candidate.
 
     When a two-ellipse fit pins ``b/a`` on a bound, ``2π/b`` is not a usable
-    lamellar period.  The I(q)* hint is the azimuthally averaged first-order
-    peak; the median |q| of accepted arcs is kept only when that hint is
-    missing.  Curvature tips sit outside I(q)* and must not walk the published
-    period.
+    lamellar period.  A radial hint is preferred only when its selection
+    status is ``selected`` (or omitted by a legacy direct caller).  An
+    ambiguous or unavailable hint falls back to the observed arc-radius
+    median, which is a q-space observation and does not assign a Bragg order.
     """
 
-    radii: list[float] = []
-    if isinstance(points, (list, tuple)):
-        rows = points
-    else:
-        rows = ()
-    for point in rows:
-        if not isinstance(point, Mapping):
-            continue
-        try:
-            radius = math.hypot(float(point["qx"]), float(point["qy"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if math.isfinite(radius) and radius > 0.0:
-            radii.append(radius)
-    radii.sort()
-    mid = len(radii) // 2
-    arc_q = (
-        radii[mid]
-        if len(radii) % 2 == 1
-        else (0.5 * (radii[mid - 1] + radii[mid]) if len(radii) >= 2 else float("nan"))
-    )
+    radii = _observed_arc_radii(points)
+    arc_q = observed_arc_q_median(points)
     if len(radii) < 5:
         arc_q = float("nan")
     try:
         hint = float(first_order_q) if first_order_q is not None else float("nan")
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         hint = float("nan")
+    if first_order_selection_status is not None:
+        status = str(first_order_selection_status).strip().lower()
+        if status != "selected":
+            hint = float("nan")
     scale = _q_to_nm_inverse_scale(q_unit)
     if math.isfinite(hint) and hint > 0.0:
         flags = ["spacing_from_first_order_iq"]
         if math.isfinite(arc_q) and arc_q > 1.8 * hint:
-            flags.append("arc_radius_on_secondary_population")
+            flags.append("radial_peak_arc_radius_mismatch")
         elif not math.isfinite(arc_q):
             flags.append("spacing_iq_without_dense_arc_radius")
         if scale is None:

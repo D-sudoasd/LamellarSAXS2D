@@ -151,6 +151,32 @@ def test_summary_ring_only_and_poor_match_reasons_are_visible(qtbot) -> None:
     page.close()
 
 
+def test_ambiguous_first_order_peak_reason_is_translated(qtbot) -> None:
+    page = _page(qtbot)
+    page.set_analysis_settings({"stage": "evaluate", "resamples": 32})
+    page.set_result(_result(flags=["first_order_q_hint_ambiguous"]))
+    assert "首阶峰选择存在歧义" in page.quality_summary.reason_label.text()
+
+    page.set_language("en")
+    assert "first-order peak selection is ambiguous" in page.quality_summary.reason_label.text()
+    page.close()
+
+
+def test_mixed_radial_populations_flag_explains_retained_groups(qtbot) -> None:
+    page = _page(qtbot)
+    page.set_analysis_settings({"stage": "evaluate", "resamples": 32})
+    page.set_result(_result(flags=["mixed_radial_populations"]))
+
+    assert "mixed_radial_populations" in page.quality_summary.state.reasons
+    assert "检测到分离的径向轨迹群，当前保留各群" in page.quality_summary.reason_label.text()
+    assert "选择目标 q 范围后比较拟合" in page.quality_summary.reason_label.text()
+
+    page.set_language("en")
+    assert "Separated radial trajectory groups were detected and retained" in page.quality_summary.reason_label.text()
+    assert "Select a target q range in the plot and compare the fits" in page.quality_summary.reason_label.text()
+    page.close()
+
+
 def test_pixel_q_never_displays_physical_ring_period(qtbot) -> None:
     page = _page(qtbot)
     page.set_analysis_settings({"stage": "evaluate", "resamples": 0})

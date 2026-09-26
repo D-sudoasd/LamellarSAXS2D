@@ -24,7 +24,7 @@ def _point(point_id: str, branch: int, side: str, radius: float, arc_id: int) ->
     }
 
 
-def _run_fit_trace(monkeypatch, *, first_order_q_hint=None):
+def _run_fit_trace(monkeypatch, *, first_order_q_hint=None, method_version=None):
     fitted = [
         _point("fit-0", 0, "upper", 1.00, 0),
         _point("fit-1", 0, "upper", 1.01, 0),
@@ -39,12 +39,26 @@ def _run_fit_trace(monkeypatch, *, first_order_q_hint=None):
     invalid = _point("invalid-coordinate", 1, "upper", 0.5, 4)
     invalid["qx"] = float("nan")
     trace_points = [*fitted, *unassigned, invalid]
+    if isinstance(first_order_q_hint, dict):
+        first_order_diagnostic = first_order_q_hint
+    elif first_order_q_hint is None:
+        first_order_diagnostic = {
+            "q_star": None,
+            "selection_status": "no_hint",
+            "reason": "no_supported_local_peak",
+        }
+    else:
+        first_order_diagnostic = {
+            "q_star": first_order_q_hint,
+            "selection_status": "selected",
+            "reason": "ok",
+        }
     trace = {
         "points": trace_points,
-        "diagnostics": {
-            "first_order_q_hint": {"q_star": first_order_q_hint},
-        },
+        "diagnostics": {"first_order_q_hint": first_order_diagnostic},
     }
+    if method_version is not None:
+        trace["method_version"] = method_version
     captured = {}
 
     def fake_fit(points, **_kwargs):
@@ -91,11 +105,32 @@ def _run_fit_trace(monkeypatch, *, first_order_q_hint=None):
 
 
 @pytest.mark.parametrize(
-    ("hint", "expected_q", "expected_source"),
-    [(None, 1.0, "observed_arc_radius"), (2.0, 2.0, "first_order_iq")],
+    ("hint", "expected_q", "expected_source", "expected_status"),
+    [
+        (None, 1.0, "observed_arc_radius_not_order_assigned", "no_hint"),
+        (2.0, 2.0, "first_order_iq", "selected"),
+        (
+            {"q_star": 2.0, "selection_status": "ambiguous", "reason": "ambiguous_lower_q_peak_family"},
+            1.0,
+            "observed_arc_radius_not_order_assigned",
+            "ambiguous",
+        ),
+        (
+            {"q_star": 2.0, "selection_status": "no_hint", "reason": "no_significant_peak"},
+            1.0,
+            "observed_arc_radius_not_order_assigned",
+            "no_hint",
+        ),
+        (
+            {"q_star": 2.0, "selection_status": None, "reason": "missing_selection_status"},
+            1.0,
+            "observed_arc_radius_not_order_assigned",
+            "not_available",
+        ),
+    ],
 )
 def test_fit_summaries_use_only_solver_used_points_and_keep_ring_hint(
-    monkeypatch, hint, expected_q, expected_source
+    monkeypatch, hint, expected_q, expected_source, expected_status
 ):
     result, captured, trace_points = _run_fit_trace(
         monkeypatch, first_order_q_hint=hint
@@ -111,6 +146,51 @@ def test_fit_summaries_use_only_solver_used_points_and_keep_ring_hint(
     assert result["q_star_from_arcs"] == pytest.approx(expected_q)
     assert result["L_from_observed_radius_nm"] == pytest.approx(2.0 * math.pi / expected_q)
     assert result["q_star_source"] == expected_source
+    assert result["q_unit"] == "nm^-1"
+    assert result["observed_arc_q_median"] == pytest.approx(1.0)
+    expected_hint = hint.get("q_star") if isinstance(hint, dict) else hint
+    assert result["radial_hint_q"] == expected_hint
+    assert result["radial_hint_selection_status"] == expected_status
+    assert result["radial_hint_reason"] == (
+        hint.get("reason") if isinstance(hint, dict)
+        else "no_supported_local_peak" if hint is None else "ok"
+    )
+    comparison = result["radial_arc_comparison"]
+    assert comparison["q_unit"] == "nm^-1"
+    assert comparison["observed_arc_q_median"] == pytest.approx(1.0)
+    assert comparison["radial_hint_q"] == expected_hint
+    if expected_hint is not None:
+        assert comparison["radial_hint_to_observed_arc_ratio"] == pytest.approx(expected_hint)
+        assert comparison["signed_relative_difference"] == pytest.approx(expected_hint - 1.0)
+    else:
+        assert comparison["radial_hint_to_observed_arc_ratio"] is None
+        assert comparison["signed_relative_difference"] is None
+    assert "observed_arc_q_median" in result["parameters"]
+    assert "radial_hint_q" in result["parameters"]
+    assert "radial_arc_comparison" not in result["parameters"]
+
+
+def test_annular_point_radii_are_labeled_as_prescribed_coordinates(monkeypatch):
+    result, _captured, _trace_points = _run_fit_trace(
+        monkeypatch,
+        first_order_q_hint={
+            "q_star": None,
+            "selection_status": "not_used",
+            "reason": "prescribed_annuli",
+        },
+        method_version="butterfly-annular-test",
+    )
+
+    assert result["q_star_from_arcs"] is None
+    assert result["L_from_observed_radius_nm"] is None
+    assert result["q_star_source"] == "unavailable_prescribed_annuli"
+    assert result["observed_arc_q_median"] == pytest.approx(1.0)
+    assert result["observed_arc_q_source"] == "prescribed_annulus_coordinates"
+    assert result["radial_arc_comparison"]["status"] == "prescribed_annulus_coordinates"
+    assert (
+        result["radial_arc_comparison"]["observed_arc_q_source"]
+        == "prescribed_annulus_coordinates"
+    )
 
 
 def test_negative_ids_and_nonfinite_coordinates_do_not_pass_initial_fit_screen(monkeypatch):

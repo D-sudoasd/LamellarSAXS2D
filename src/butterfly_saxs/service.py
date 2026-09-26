@@ -299,6 +299,32 @@ def _candidate_geometry_parameters(ellipse: Any, candidate: Any) -> dict[str, fl
     return values
 
 
+def _copy_candidate_radial_comparison(
+    geometry_parameters: dict[str, Any], candidate: Any
+) -> Any:
+    """Copy scalar radial-vs-arc details and return their q unit."""
+
+    if not isinstance(candidate, Mapping):
+        return None
+    parameters = candidate.get("parameters")
+    for name in ("observed_arc_q_median", "radial_hint_q"):
+        if isinstance(parameters, Mapping) and name in parameters:
+            geometry_parameters[name] = deepcopy(parameters[name])
+        elif name in candidate:
+            geometry_parameters[name] = deepcopy(candidate[name])
+    for name in (
+        "radial_hint_selection_status",
+        "radial_hint_reason",
+        "observed_arc_q_source",
+    ):
+        if name in candidate:
+            geometry_parameters[name] = deepcopy(candidate[name])
+    comparison = candidate.get("radial_arc_comparison")
+    if isinstance(comparison, Mapping) and "q_unit" in comparison:
+        return comparison["q_unit"]
+    return candidate.get("q_unit")
+
+
 def _ring_only_butterfly_shape(ellipse: Any, candidate: Any, butterfly: Any) -> bool:
     """Use the shared publication rule at both service result boundaries."""
 
@@ -1996,6 +2022,9 @@ class ButterflyAnalysisService:
                 ):
                     if geometry_parameters.get(name) is None and source.get(name) is not None:
                         geometry_parameters[name] = source[name]
+            candidate_radial_q_unit = _copy_candidate_radial_comparison(
+                geometry_parameters, candidate
+            )
             withhold_shape = _ring_only_butterfly_shape(ellipse, candidate, butterfly)
             _stash_unpublished_periods(
                 geometry_parameters,
@@ -2015,6 +2044,8 @@ class ButterflyAnalysisService:
             except (TypeError, ValueError):
                 geometry_ndata = 0
             geometry_q_unit = str(ellipse.get("q_unit", "unknown") or "unknown")
+            if geometry_q_unit == "unknown" and candidate_radial_q_unit not in (None, ""):
+                geometry_q_unit = str(candidate_radial_q_unit)
             result["intensity_parameters"] = deepcopy(result.get("parameters", {}))
             result["geometry_parameters"] = geometry_parameters
             result["candidate_geometry_parameters"] = _candidate_geometry_parameters(ellipse, candidate)
@@ -2120,6 +2151,9 @@ class ButterflyAnalysisService:
             ):
                 if geometry_parameters.get(name) is None and source.get(name) is not None:
                     geometry_parameters[name] = source[name]
+        candidate_radial_q_unit = _copy_candidate_radial_comparison(
+            geometry_parameters, candidate
+        )
         withhold_shape = _ring_only_butterfly_shape(ellipse, candidate, butterfly)
         _stash_unpublished_periods(
             geometry_parameters,
@@ -2145,6 +2179,8 @@ class ButterflyAnalysisService:
         except (TypeError, ValueError):
             geometry_ndata = 0
         geometry_q_unit = str(ellipse.get("q_unit", "unknown") or "unknown")
+        if geometry_q_unit == "unknown" and candidate_radial_q_unit not in (None, ""):
+            geometry_q_unit = str(candidate_radial_q_unit)
         # Preview's intensity model is intentionally discarded for this
         # action.  Its residual would otherwise be a misleading RMSE for a
         # geometry-only measurement.
@@ -2167,6 +2203,8 @@ class ButterflyAnalysisService:
             "Lz_candidate_from_draw_axis_nm": "nm",
             "L_candidate_from_major_axis_nm": "nm",
             "q_star_from_arcs": geometry_q_unit,
+            "observed_arc_q_median": geometry_q_unit,
+            "radial_hint_q": geometry_q_unit,
             "L_from_observed_radius_nm": "nm",
             "q_star_source": "",
             "ellipticity": "1",
@@ -2639,6 +2677,40 @@ class ButterflyAnalysisService:
                     "q_star_from_arcs": _read(
                         _read(result, ("geometry_parameters",), {}),
                         ("q_star_from_arcs",),
+                        None,
+                    ),
+                    "observed_arc_q_median": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("observed_arc_q_median",),
+                        None,
+                    ),
+                    "radial_hint_q": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("radial_hint_q",),
+                        None,
+                    ),
+                    "radial_hint_selection_status": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("radial_hint_selection_status",),
+                        None,
+                    ),
+                    "radial_hint_reason": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("radial_hint_reason",),
+                        None,
+                    ),
+                    "observed_arc_q_source": _read(
+                        _read(result, ("geometry_parameters",), {}),
+                        ("observed_arc_q_source",),
+                        None,
+                    ),
+                    "radial_arc_comparison": _read(
+                        _read(
+                            _read(result, ("butterfly",), {}),
+                            ("candidate_fit",),
+                            {},
+                        ),
+                        ("radial_arc_comparison",),
                         None,
                     ),
                     "L_from_observed_radius_nm": _read(

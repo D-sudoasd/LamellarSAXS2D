@@ -137,3 +137,151 @@ def test_butterfly_analysis_keeps_standard_geometry_data_driven() -> None:
     )
     assert explicit["ellipse_preset"] == "flat_ellipse"
     assert explicit["ellipse"]["axis_ratio_max"] == pytest.approx(0.35)
+
+
+def test_standard_solver_controls_survive_validation_and_reach_real_pipeline(
+    tmp_path, monkeypatch
+) -> None:
+    from butterfly_saxs import observables as observable_module
+
+    image, qx, qy = _ellipse_pattern()
+    path = tmp_path / "solver_controls.npz"
+    np.savez_compressed(path, image=image, qx=qx, qy=qy, q_unit=np.asarray("nm^-1"))
+
+    settings = validate_analysis_settings(
+        {
+            "q_window": [0.08, 0.95],
+            "ridge_method": "radial_peak",
+            "n_ridge_angles": 144,
+            "n_radial_bins": 256,
+            "n_angular_bins": 180,
+            "ellipse": {
+                "preset": "standard",
+                "multistart": 2,
+                "residual": "geometric",
+            },
+            "butterfly": {"sensitivity": False, "resamples": 0},
+        }
+    )
+    assert settings["ellipse_multistart"] == 2
+    assert settings["ellipse_residual"] == "geometric"
+    assert settings["ellipse"]["multistart"] == 2
+    assert settings["ellipse"]["residual"] == "geometric"
+    assert ellipse_parameter_specs(
+        {"ellipse": settings["ellipse"]}, q_window=(0.08, 0.95)
+    ) is None
+
+    actual_measure = observable_module.measure_observables
+    received = {}
+
+    def observe_real_solver(*args, **kwargs):
+        received.update(
+            ellipse_multistart=kwargs["ellipse_multistart"],
+            ellipse_residual=kwargs["ellipse_residual"],
+            ellipse_parameters=kwargs["ellipse_parameters"],
+        )
+        return actual_measure(*args, **kwargs)
+
+    monkeypatch.setattr(observable_module, "measure_observables", observe_real_solver)
+    result = analyze_frame(path, config=settings, full2d=False)
+
+    assert received["ellipse_multistart"] == 2
+    assert received["ellipse_residual"] == "geometric"
+    assert received["ellipse_parameters"] is None
+    assert result.ellipse_fit["multistart_count"] == 2
+    assert result.analysis["ellipse_multistart"] == 2
+    assert result.analysis["ellipse_residual"] == "geometric"
+    assert "ellipse_constraints_active" not in result.ellipse_fit["flags"]
+
+
+@pytest.mark.parametrize(
+    ("ellipse", "root_controls", "expected_multistart", "expected_residual"),
+    [
+        (
+            {"preset": "standard", "multistart": 2, "residual": "distance"},
+            {},
+            2,
+            "geometric",
+        ),
+        (
+            {"preset": "standard", "multistart": 2, "residual": "geometric"},
+            {"ellipse_multistart": 5, "ellipse_residual": "sampson"},
+            2,
+            "geometric",
+        ),
+        (
+            {"preset": "standard"},
+            {"ellipse_multistart": 3, "ellipse_residual": "geometric"},
+            3,
+            "geometric",
+        ),
+    ],
+)
+def test_standard_solver_control_roundtrip_keeps_geometry_unconstrained(
+    ellipse, root_controls, expected_multistart, expected_residual
+) -> None:
+    settings = validate_analysis_settings(
+        {
+            **root_controls,
+            "ellipse": ellipse,
+            "butterfly": {"sensitivity": False, "resamples": 0},
+        }
+    )
+
+    assert settings["ellipse_multistart"] == expected_multistart
+    assert settings["ellipse"]["multistart"] == expected_multistart
+    assert settings["ellipse_residual"] == expected_residual
+    assert settings["ellipse"]["residual"] == expected_residual
+    assert ellipse_parameter_specs(
+        {"ellipse": settings["ellipse"]}, q_window=(0.08, 0.95)
+    ) is None
+
+
+def test_standard_nested_multistart_reaches_actual_butterfly_arc_solver(
+    monkeypatch,
+) -> None:
+    from butterfly_saxs import butterfly as butterfly_module
+    from butterfly_saxs.benchmark_arcs import generate_arc_case
+
+    case = generate_arc_case("ellipse_ratio_400", seed=123, shape=(64, 64))
+    settings = validate_analysis_settings(
+        {
+            "ridge_method": "butterfly_curvature",
+            "q_window": [0.05, 1.1],
+            "n_ridge_angles": 72,
+            "n_radial_bins": 128,
+            "n_angular_bins": 96,
+            "ellipse": {
+                "preset": "standard",
+                "multistart": 2,
+                "residual": "geometric",
+            },
+            "butterfly": {
+                "stage": "evaluate",
+                "resamples": 0,
+                "sensitivity": False,
+            },
+        }
+    )
+    actual_analyze_butterfly = butterfly_module.analyze_butterfly
+    received = {}
+
+    def fit_real_arcs(*args, **kwargs):
+        received.update(
+            multistart=kwargs["multistart"],
+            parameters=kwargs["parameters"],
+        )
+        return actual_analyze_butterfly(*args, **kwargs)
+
+    monkeypatch.setattr(butterfly_module, "analyze_butterfly", fit_real_arcs)
+    result = analyze_frame(
+        case["image"],
+        qmap=case["qmap"],
+        mask=case["mask"],
+        config=settings,
+        full2d=False,
+    )
+
+    assert received == {"multistart": 2, "parameters": None}
+    assert result.butterfly is not None
+    assert result.butterfly["candidate_fit"]["multistart_count"] == 2

@@ -23,7 +23,13 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Callable
 
-from .i18n import DEFAULT_LANGUAGE, LANGUAGE_SETTING_KEY, translate, validate_language
+from .i18n import (
+    DEFAULT_LANGUAGE,
+    LANGUAGE_SETTING_KEY,
+    translate,
+    translate_q_star_source,
+    validate_language,
+)
 from .models import ParameterRow, ParameterTableModel
 from .project_document import ProjectDocumentController
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
@@ -6914,7 +6920,13 @@ if QT_AVAILABLE:
                 ),
                 ("ellipse.l_radial", _read(ellipse, ("L_from_observed_radius_nm",), None)),
                 ("ellipse.q_star", _read(ellipse, ("q_star_from_arcs",), None)),
-                ("ellipse.q_star_source", _read(ellipse, ("q_star_source",), None)),
+                (
+                    "ellipse.q_star_source",
+                    translate_q_star_source(
+                        self._language,
+                        _read(ellipse, ("q_star_source",), None),
+                    ),
+                ),
                 ("ellipse.rmse", _read(ellipse, ("rmse", "residual_rms"), None)),
                 ("ellipse.rss", _read(ellipse, ("rss",), None)),
                 ("ellipse.n_points", _read(ellipse, ("n_points", "n_data"), None)),

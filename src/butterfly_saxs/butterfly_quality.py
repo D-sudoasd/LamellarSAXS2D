@@ -10,11 +10,6 @@ from collections.abc import Mapping, Sequence
 import math
 import numpy as np
 
-from .butterfly_ridge import FIRST_ORDER_FAMILY_SPAN
-
-# A first-order Wang ellipse can extend past q*, but a major axis more than
-# twice q* is fitting a larger-q continuum, not the Bragg ellipse.
-MAJOR_AXIS_TO_QSTAR_MAX = 2.0
 # A nearly circular candidate has no identifiable ellipse direction. This is
 # a provisional geometry screen, not a statistical test of isotropy.
 NEAR_CIRCULAR_AXIS_RATIO_MIN = 0.95
@@ -155,7 +150,7 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     candidate = candidate if isinstance(candidate, Mapping) else {}
     fit_points = candidate.get("point_diagnostics")
     used_ids = None
-    if isinstance(fit_points, (list, tuple)) and fit_points:
+    if isinstance(fit_points, (list, tuple)):
         used_ids = {str(p.get("point_id", index)) for index, p in enumerate(fit_points)
                     if isinstance(p, Mapping) and p.get("used") is True}
     points = [p for index, p in enumerate(trace.get("points", []))
@@ -196,39 +191,55 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     )
     if line_collapsed:
         common.append("axis_ratio_collapsed_to_line")
-    qs = []
+    sigmas = np.asarray([v for p in points if (v := _finite(p.get("localization_sigma_q")))
+                         is not None and v > 0], dtype=float)
+    median_sigma = float(np.median(sigmas)) if sigmas.size else None
+    origin_qs = []
+    candidate_centered_qs = []
+    center_qx = _finite(candidate.get("center_qx"))
+    center_qy = _finite(candidate.get("center_qy"))
+    center = candidate.get("center")
+    if (center_qx is None or center_qy is None) and isinstance(center, (list, tuple)) and len(center) == 2:
+        center_qx = _finite(center[0]) if center_qx is None else center_qx
+        center_qy = _finite(center[1]) if center_qy is None else center_qy
+    center_qx = 0.0 if center_qx is None else center_qx
+    center_qy = 0.0 if center_qy is None else center_qy
     for point in points:
         qx = _finite(point.get("qx"))
         qy = _finite(point.get("qy"))
         if qx is not None and qy is not None:
-            qs.append(math.hypot(qx, qy))
-    hint = None
+            dx, dy = qx - center_qx, qy - center_qy
+            origin_qs.append(math.hypot(qx, qy))
+            candidate_centered_qs.append(math.hypot(dx, dy))
+    first_order = None
     diagnostics = trace.get("diagnostics")
     if isinstance(diagnostics, Mapping):
         first_order = diagnostics.get("first_order_q_hint")
         if isinstance(first_order, Mapping):
-            hint = _finite(first_order.get("q_star"))
+            if first_order.get("selection_status") == "ambiguous":
+                common.append("first_order_q_hint_ambiguous")
+        radial_population = diagnostics.get("radial_population")
+        if (
+            isinstance(radial_population, Mapping)
+            and radial_population.get("split")
+            and radial_population.get("selection_status") == "ambiguous"
+        ):
+            common.append("mixed_radial_populations")
         if diagnostics.get("outer_window_truncated"):
             common.append("annular_outer_window_truncated")
-    if hint is not None and hint > 0.0:
-        family = [radius for radius in qs if radius <= FIRST_ORDER_FAMILY_SPAN * hint]
-        if family:
-            qs = family
-    q_extent = max(qs) if qs else None
+    # The actual fitted points define the observed radial extent. q* remains
+    # useful for reporting peak-selection ambiguity, but it is not an outer
+    # support boundary for elongated butterfly wings.
+    q_extent = max(origin_qs) if origin_qs else None
+    candidate_centered_q_extent = max(candidate_centered_qs) if candidate_centered_qs else None
     a_value = _finite(candidate.get("a"))
+    extent_tolerance = 3.0 * median_sigma if median_sigma is not None else 0.0
     major_exceeds_extent = (
         a_value is not None
-        and q_extent is not None
-        and q_extent > 0
-        and a_value > 1.2 * q_extent
+        and candidate_centered_q_extent is not None
+        and candidate_centered_q_extent > 0
+        and a_value > candidate_centered_q_extent + extent_tolerance
     )
-    if (
-        a_value is not None
-        and hint is not None
-        and hint > 0.0
-        and a_value > MAJOR_AXIS_TO_QSTAR_MAX * hint
-    ):
-        major_exceeds_extent = True
     if major_exceeds_extent:
         common.append("major_axis_exceeds_observed_extent")
     arc_rows = _arc_rows(trace, candidate)
@@ -274,9 +285,6 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     seed_matches = trace_diagnostics.get("seed_matches", []) if isinstance(trace_diagnostics, Mapping) else []
     if any(not match.get("matched", False) for match in seed_matches if isinstance(match, Mapping)):
         common.append("seed_not_supported_by_observed_arc")
-    sigmas = np.asarray([v for p in points if (v := _finite(p.get("localization_sigma_q")))
-                         is not None and v > 0], dtype=float)
-    median_sigma = float(np.median(sigmas)) if sigmas.size else None
     if median_sigma is not None:
         if any(
             (value := _finite(row.get("normal_residual_q_rms", row.get("normal_residual_q_p95")))) is not None
@@ -305,7 +313,7 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     rows = {}
     b = _finite(candidate.get("b"))
     geometry_usable = bool(
-        candidate.get("success") and qs
+        candidate.get("success") and candidate_centered_qs
         and a_value is not None and b is not None and 0 < b <= a_value
         and ratio is not None and 0 < ratio <= 1
         and _finite(candidate.get("theta_deg")) is not None
@@ -407,6 +415,7 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
             "thresholds_frozen": False,
             "metrics": {"side_counts": groups, "occupied_sides": occupied_sides,
                         "observed_q_extent": q_extent,
+                        "candidate_centered_q_extent": candidate_centered_q_extent,
                         "a_over_observed_extent": (
                             a_value / q_extent
                             if a_value is not None and q_extent not in (None, 0)

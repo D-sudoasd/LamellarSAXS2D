@@ -557,7 +557,7 @@ def test_coarse_flat_ellipse_trace_recovers_four_identity_sides() -> None:
     assert sides == {(0, "upper"), (0, "lower"), (1, "upper"), (1, "lower")}
 
 
-def test_secondary_radial_population_is_demoted_and_unimodal_wings_are_kept() -> None:
+def test_radial_population_selection_requires_a_valid_q_hint() -> None:
     mixed = []
     for index, radius in enumerate([0.11] * 8 + [0.48] * 10):
         angle = 0.4 + 0.05 * (index % 4)
@@ -570,19 +570,34 @@ def test_secondary_radial_population_is_demoted_and_unimodal_wings_are_kept() ->
                 "accepted": True,
             }
         )
+    mixed_q_before = [(point["qx"], point["qy"]) for point in mixed]
     summary = _demote_secondary_radial_population(mixed)
     assert summary["split"] is True
-    assert summary["keep"] == "low_q"
-    assert summary["demoted"] == 10
-    assert sum(1 for point in mixed if point["accepted"]) == 8
-    assert all(point["reason"] == "secondary_radial_population" for point in mixed if not point["accepted"])
+    assert summary["selection_status"] == "ambiguous"
+    assert summary["reason"] == "q_hint_unavailable"
+    assert summary["keep"] == "all_observed"
+    assert summary["demoted"] == 0
+    assert summary["low_q_population"] == {"q_min": pytest.approx(0.11), "q_max": pytest.approx(0.11), "n_points": 8}
+    assert summary["high_q_population"] == {"q_min": pytest.approx(0.48), "q_max": pytest.approx(0.48), "n_points": 10}
+    assert all(point["accepted"] for point in mixed)
+    assert [(point["qx"], point["qy"]) for point in mixed] == mixed_q_before
+    assert summary["flags"] == ["mixed_radial_populations"]
+    for invalid_hint in (float("nan"), 0.0, "not-a-q-value"):
+        invalid_points = [dict(point) for point in mixed]
+        invalid = _demote_secondary_radial_population(invalid_points, prefer_radius=invalid_hint)
+        assert invalid["selection_status"] == "ambiguous"
+        assert invalid["reason"] == "q_hint_invalid"
+        assert invalid["keep"] == "all_observed"
+        assert invalid["demoted"] == 0
+        assert all(point["accepted"] for point in invalid_points)
+
     harmonic = [dict(point) for point in mixed]
-    for point in harmonic:
-        point["accepted"] = True
-        point.pop("reason", None)
     hinted = _demote_secondary_radial_population(harmonic, prefer_radius=0.48)
+    assert hinted["selection_status"] == "selected"
+    assert hinted["reason"] == "nearest_radial_population_to_q_hint"
     assert hinted["keep"] == "high_q"
     assert hinted["demoted"] == 8
+    assert sum(1 for point in harmonic if point["accepted"]) == 10
 
     unimodal = []
     for index in range(16):
@@ -613,14 +628,12 @@ def test_secondary_radial_population_is_demoted_and_unimodal_wings_are_kept() ->
                 "accepted": True,
             }
         )
-    trimmed = _demote_secondary_radial_population(continuum, prefer_radius=0.092)
-    assert trimmed["demoted"] > 0
-    assert trimmed["keep"] == "first_order_hint"
-    assert all(
-        math.hypot(float(point["qx"]), float(point["qy"])) <= 3.5 * 0.092 + 1e-12
-        for point in continuum
-        if point["accepted"]
-    )
+    retained = _demote_secondary_radial_population(continuum, prefer_radius=0.092)
+    assert retained["split"] is False
+    assert retained["demoted"] == 0
+    assert all(point["accepted"] for point in continuum)
+    assert max(math.hypot(point["qx"], point["qy"]) for point in continuum) > 3.5 * 0.092
+    assert retained["keep"] is None
 
 
 def test_first_order_q_hint_selects_inner_ring_not_brighter_harmonic() -> None:

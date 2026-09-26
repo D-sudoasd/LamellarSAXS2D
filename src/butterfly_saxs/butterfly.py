@@ -19,7 +19,11 @@ from .butterfly_quality import (
     NEAR_CIRCULAR_AXIS_RATIO_MIN, PARAMETERS, evaluate_arc_evidence,
 )
 from .cancellation import raise_if_cancelled
-from .public_ellipse import canonical_ellipse_payload, observed_arc_radius_period
+from .public_ellipse import (
+    canonical_ellipse_payload,
+    observed_arc_q_median,
+    observed_arc_radius_period,
+)
 from .ridge_inputs import canonical_inputs
 from .serialization import strict_jsonable
 from .settings import canonical_q_unit
@@ -143,6 +147,50 @@ def _used_trace_points(trace_points: Any, point_diagnostics: Any) -> list[Mappin
                 pass
         used_points.append(point)
     return used_points
+
+
+def _radial_arc_comparison(
+    observed_arc_q, radial_hint_q, q_unit, *, observed_arc_q_source
+):
+    """Report numeric agreement without assigning reflection order."""
+
+    arc_q = _finite_bound(observed_arc_q)
+    hint_q = _finite_bound(radial_hint_q)
+    if arc_q is not None and arc_q <= 0.0:
+        arc_q = None
+    if hint_q is not None and hint_q <= 0.0:
+        hint_q = None
+    if observed_arc_q_source == "prescribed_annulus_coordinates":
+        status = "prescribed_annulus_coordinates"
+        ratio = (
+            hint_q / arc_q
+            if arc_q is not None and hint_q is not None else None
+        )
+        relative_difference = (
+            (hint_q - arc_q) / arc_q
+            if arc_q is not None and hint_q is not None else None
+        )
+    elif arc_q is not None and hint_q is not None:
+        status = "available"
+        ratio = hint_q / arc_q
+        relative_difference = (hint_q - arc_q) / arc_q
+    else:
+        status = (
+            "both_unavailable" if arc_q is None and hint_q is None
+            else "observed_arc_unavailable" if arc_q is None
+            else "radial_hint_unavailable"
+        )
+        ratio = None
+        relative_difference = None
+    return {
+        "status": status,
+        "q_unit": str(q_unit or "unknown"),
+        "observed_arc_q_source": observed_arc_q_source,
+        "observed_arc_q_median": arc_q,
+        "radial_hint_q": hint_q,
+        "radial_hint_to_observed_arc_ratio": ratio,
+        "signed_relative_difference": relative_difference,
+    }
 
 
 def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, max_nfev=800):
@@ -294,10 +342,35 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
     diagnostics = trace.get("diagnostics") if isinstance(trace, Mapping) else {}
     first_order = diagnostics.get("first_order_q_hint") if isinstance(diagnostics, Mapping) else {}
     hint = first_order.get("q_star") if isinstance(first_order, Mapping) else None
-    q_star, radius_period, radius_flags = observed_arc_radius_period(
-        fitted_points, unit, first_order_q=hint
+    raw_hint_status = (
+        first_order.get("selection_status")
+        if isinstance(first_order, Mapping) else None
     )
+    hint_status = str(raw_hint_status).strip() if raw_hint_status is not None else ""
+    if not hint_status:
+        hint_status = "not_available"
+    hint_reason = first_order.get("reason") if isinstance(first_order, Mapping) else None
+    q_star, radius_period, radius_flags = observed_arc_radius_period(
+        fitted_points,
+        unit,
+        first_order_q=hint,
+        first_order_selection_status=hint_status,
+    )
+    observed_arc_q = observed_arc_q_median(fitted_points)
+    observed_arc_q = _finite_bound(observed_arc_q)
+    hint_q = _finite_bound(hint)
+    if hint_q is not None and hint_q <= 0.0:
+        hint_q = None
     annular = trace.get("method_version", "").startswith("butterfly-annular-")
+    observed_arc_q_source = (
+        "prescribed_annulus_coordinates" if annular else "accepted_arc_point_coordinates"
+    )
+    radial_arc_comparison = _radial_arc_comparison(
+        observed_arc_q,
+        hint_q,
+        unit,
+        observed_arc_q_source=observed_arc_q_source,
+    )
     if annular:
         q_star, radius_period = None, None
         radius_flags = ("prescribed_q_not_radial_peak",)
@@ -310,18 +383,30 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
         extra_flags.append("near_circular_ellipse_axis_unidentifiable")
     payload["q_star_from_arcs"] = q_star
     payload["L_from_observed_radius_nm"] = radius_period
-    payload["q_star_source"] = (
-        "unavailable_prescribed_annuli" if annular else "first_order_iq"
-        if "spacing_from_first_order_iq" in radius_flags
-        else "observed_arc_radius"
-    )
+    if annular:
+        q_star_source = "unavailable_prescribed_annuli"
+    elif "spacing_from_first_order_iq" in radius_flags:
+        q_star_source = "first_order_iq"
+    elif np.isfinite(q_star):
+        q_star_source = "observed_arc_radius_not_order_assigned"
+    else:
+        q_star_source = "unavailable"
+    payload["q_star_source"] = q_star_source
+    payload["observed_arc_q_median"] = observed_arc_q
+    payload["observed_arc_q_source"] = observed_arc_q_source
+    payload["radial_hint_q"] = hint_q
+    payload["radial_hint_selection_status"] = hint_status
+    payload["radial_hint_reason"] = hint_reason
+    payload["radial_arc_comparison"] = radial_arc_comparison
     values["q_star_from_arcs"] = q_star
     values["L_from_observed_radius_nm"] = radius_period
-    values["q_star_source"] = payload["q_star_source"]
+    values["q_star_source"] = q_star_source
+    values["observed_arc_q_median"] = observed_arc_q
+    values["radial_hint_q"] = hint_q
     for member in members:
         member["q_star_from_arcs"] = q_star
         member["L_from_observed_radius_nm"] = radius_period
-        member["q_star_source"] = payload["q_star_source"]
+        member["q_star_source"] = q_star_source
     payload.update(
         {
             "success": bool(fit.success),

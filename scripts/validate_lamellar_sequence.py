@@ -41,10 +41,14 @@ from butterfly_saxs.benchmark_sequence import (  # noqa: E402
     pipeline_analysis_config,
 )
 from butterfly_saxs.butterfly import analyze_butterfly  # noqa: E402
-from butterfly_saxs.pipeline import analyze_frame  # noqa: E402
+from butterfly_saxs.analysis_config import validate_analysis_settings  # noqa: E402
+from butterfly_saxs.io import load_image  # noqa: E402
+from butterfly_saxs.models import ImageFrame, QMap  # noqa: E402
+from butterfly_saxs.pipeline import analyze_frame, build_qmap, read_frame  # noqa: E402
+from butterfly_saxs.service import ButterflyAnalysisService  # noqa: E402
 
 
-OUTPUT_FILES = (
+BASE_OUTPUT_FILES = (
     "summary.json",
     "sequence.csv",
     "t2_intensity_contact_sheet.png",
@@ -66,6 +70,26 @@ def _finite(value: object) -> float | None:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _source_hashes() -> dict[str, str]:
+    sources = {REPO / "scripts" / "validate_lamellar_sequence.py"}
+    sources.update(SRC.rglob("*.py"))
+    return {
+        str(path.relative_to(REPO)).replace("\\", "/"): _sha256(path)
+        for path in sorted(sources)
+    }
+
+
+def _expected_output_files(oblique_frames: int) -> tuple[str, ...]:
+    missing_index = min(4, oblique_frames - 1)
+    demo_ids = ("oblique_00", f"oblique_{missing_index:02d}", "noise_control")
+    demo_files = tuple(
+        f"demo_frames/{frame_id}{suffix}"
+        for frame_id in dict.fromkeys(demo_ids)
+        for suffix in (".npz", "_mask.npy", "_truth.json")
+    )
+    return (*BASE_OUTPUT_FILES, *demo_files)
 
 
 def _package_version(name: str) -> str | None:
@@ -99,21 +123,7 @@ def _first_order_hint(result: object) -> dict[str, object] | None:
     hint = diagnostics.get("first_order_q_hint")
     if not isinstance(hint, dict):
         return None
-    return {
-        key: hint.get(key)
-        for key in (
-            "q_star",
-            "selection_status",
-            "reason",
-            "n_supported_bins",
-            "n_supported_runs",
-            "n_significant_peaks",
-            "profile_noise_mad",
-            "significance_prominence_threshold",
-            "candidate_peaks",
-        )
-        if key in hint
-    }
+    return dict(hint)
 
 
 def _ridge_summary(result: object) -> dict[str, object]:
@@ -137,7 +147,10 @@ def _ridge_summary(result: object) -> dict[str, object]:
 
 
 def _analyze_curvature(
-    frame: dict[str, object], q_window: tuple[float, float], multistart: int
+    frame: dict[str, object],
+    q_window: tuple[float, float],
+    multistart: int,
+    max_nfev: int = 800,
 ) -> dict[str, object]:
     qmap = {
         "qx": frame["qx"],
@@ -150,6 +163,7 @@ def _analyze_curvature(
         warnings.simplefilter("always", RuntimeWarning)
         analysis_config = pipeline_analysis_config(q_window=q_window)
         analysis_config["analysis"]["ellipse"]["multistart"] = multistart
+        analysis_config["analysis"]["max_nfev"] = max_nfev
         result = analyze_frame(
             frame["intensity_noisy"],
             qmap=qmap,
@@ -171,6 +185,10 @@ def _analyze_curvature(
             for key in ("a", "b", "axis_ratio", "theta_deg", "rmse", "condition", "q_star_from_arcs")
         },
         "q_star_source": fit.get("q_star_source"),
+        "observed_arc_q_median": _finite(fit.get("observed_arc_q_median")),
+        "observed_arc_q_source": fit.get("observed_arc_q_source"),
+        "radial_hint_q": _finite(fit.get("radial_hint_q")),
+        "radial_arc_comparison": fit.get("radial_arc_comparison"),
         "parameter_status": {
             name: {
                 "value": _finite(parameter.get("value")),
@@ -190,7 +208,10 @@ def _analyze_curvature(
 
 
 def _analyze_radial_trace(
-    frame: dict[str, object], q_window: tuple[float, float], multistart: int
+    frame: dict[str, object],
+    q_window: tuple[float, float],
+    multistart: int,
+    max_nfev: int = 800,
 ) -> dict[str, object]:
     qmap = {
         "qx": frame["qx"],
@@ -201,6 +222,7 @@ def _analyze_radial_trace(
     start = time.perf_counter()
     analysis_config = pipeline_analysis_config(q_window=q_window, ridge_method="radial_peak")
     analysis_config["analysis"]["ellipse"]["multistart"] = multistart
+    analysis_config["analysis"]["max_nfev"] = max_nfev
     result = analyze_frame(
         frame["intensity_noisy"],
         qmap=qmap,
@@ -218,7 +240,10 @@ def _analyze_radial_trace(
 
 
 def _analyze_annular_trajectory(
-    frame: dict[str, object], q_window: tuple[float, float], multistart: int
+    frame: dict[str, object],
+    q_window: tuple[float, float],
+    multistart: int,
+    max_nfev: int = 800,
 ) -> dict[str, object]:
     qmap = {
         "qx": frame["qx"],
@@ -237,6 +262,7 @@ def _analyze_annular_trajectory(
             "stage": "evaluate",
             "resamples": 0,
             "sensitivity": False,
+            "max_nfev": max_nfev,
             "annular_radial_bins": 40,
             "annular_angle_bins": 72,
         },
@@ -314,7 +340,9 @@ def _frame_record(
     q_window: tuple[float, float],
     radial_frames: set[int],
     annular_frames: set[int],
-    multistart: int,
+    requested_multistart: int,
+    effective_multistart: int,
+    max_nfev: int,
 ) -> dict[str, object]:
     model_id = str(frame.get("model_id", "unknown_model"))
     frame_id = str(frame.get("frame_id", "unknown_frame"))
@@ -350,6 +378,11 @@ def _frame_record(
         "noise_target_first_order_snr": _safe_number(frame.get("noise_target_first_order_snr")),
         "noise_reference": frame.get("noise_reference"),
         "structure_truth": frame.get("structure_truth"),
+        "optimizer_settings": {
+            "requested_ellipse_multistart": requested_multistart,
+            "effective_ellipse_multistart": effective_multistart,
+            "effective_max_nfev": max_nfev,
+        },
     }
     if q0 is not None:
         record["noise_free_annular_reference"] = measure_annular_local_peak(
@@ -362,7 +395,9 @@ def _frame_record(
         record["noise_free_annular_reference"] = None
     print(f"[validation] {model_id}/{frame_id}: curvature start", file=sys.stderr, flush=True)
     try:
-        record["curvature_pipeline"] = _analyze_curvature(frame, q_window, multistart)
+        record["curvature_pipeline"] = _analyze_curvature(
+            frame, q_window, effective_multistart, max_nfev
+        )
     except Exception as exc:  # Keep the frame and failure reason in sequence outputs.
         record["curvature_pipeline"] = {
             "execution_status": "failed",
@@ -381,7 +416,9 @@ def _frame_record(
     if int(frame["frame_index"]) in radial_frames:
         print(f"[validation] {model_id}/{frame_id}: radial start", file=sys.stderr, flush=True)
         try:
-            record["radial_peak_pipeline"] = _analyze_radial_trace(frame, q_window, multistart)
+            record["radial_peak_pipeline"] = _analyze_radial_trace(
+                frame, q_window, effective_multistart, max_nfev
+            )
         except Exception as exc:
             record["radial_peak_pipeline"] = {
                 "execution_status": "failed",
@@ -395,7 +432,7 @@ def _frame_record(
         print(f"[validation] {model_id}/{frame_id}: annular start", file=sys.stderr, flush=True)
         try:
             record["annular_trajectory"] = _analyze_annular_trajectory(
-                frame, q_window, multistart
+                frame, q_window, effective_multistart, max_nfev
             )
         except Exception as exc:
             record["annular_trajectory"] = {
@@ -769,6 +806,115 @@ def _plot_truth_observed(path: Path, records: list[dict[str, object]]) -> None:
     plt.close(fig)
 
 
+def _save_gui_demo_frames(
+    output: Path,
+    frames: tuple[dict[str, object], ...],
+    settings: ObliqueStackSettings,
+) -> list[str]:
+    """Save representative oblique inputs and separate structural truth JSON."""
+
+    missing_id = f"oblique_{settings.local_missing_lobe_frame:02d}"
+    selected_ids = {"oblique_00", missing_id, "noise_control"}
+    demo_dir = output / "demo_frames"
+    demo_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    for frame in frames:
+        frame_id = str(frame["frame_id"])
+        if frame_id not in selected_ids:
+            continue
+        array_path = demo_dir / f"{frame_id}.npz"
+        np.savez_compressed(
+            array_path,
+            image=np.asarray(frame["intensity_noisy"], dtype=float),
+            qx=np.asarray(frame["qx"], dtype=float),
+            qy=np.asarray(frame["qy"], dtype=float),
+            q_unit=np.asarray(frame.get("q_unit", "nm^-1")),
+            mask=np.asarray(frame["mask"], dtype=bool),
+        )
+        mask_path = demo_dir / f"{frame_id}_mask.npy"
+        np.save(mask_path, np.asarray(frame["mask"], dtype=bool), allow_pickle=False)
+        truth = {
+            "frame_id": frame_id,
+            "sequence_role": frame["sequence_role"],
+            "structural_q0_nm_inv": frame.get("structural_q0_nm_inv"),
+            "noise_sigma": frame.get("noise_sigma"),
+            "noise_reference": frame.get("noise_reference"),
+            "structure_truth": frame.get("structure_truth"),
+            "mask_diagnostics": frame.get("mask_diagnostics"),
+            "truth_scope": "generator_parameters_not_projection_or_fit_target",
+        }
+        truth_path = demo_dir / f"{frame_id}_truth.json"
+        truth_path.write_text(
+            json.dumps(_jsonable(truth), ensure_ascii=False, indent=2, allow_nan=False),
+            encoding="utf-8",
+        )
+        written.extend(
+            [
+                str(array_path.relative_to(output)),
+                str(mask_path.relative_to(output)),
+                str(truth_path.relative_to(output)),
+            ]
+        )
+    return written
+
+
+def _validate_gui_demo_roundtrip(path: Path) -> dict[str, object]:
+    """Exercise pipeline NPZ loading and the image/mask/q-map adapters used by the UI."""
+
+    with np.load(path, allow_pickle=False) as archive:
+        image = np.asarray(archive["image"])
+        mask = np.asarray(archive["mask"], dtype=bool)
+    mask_path = path.with_name(f"{path.stem}_mask.npy")
+    sidecar_mask = np.load(mask_path, allow_pickle=False)
+    if not np.array_equal(sidecar_mask, mask):
+        raise ValueError(f"GUI mask sidecar differs from embedded mask: {path}")
+    loaded = load_image(path, dataset="image", external_mask=mask_path)
+    if not np.array_equal(loaded.data, image):
+        raise ValueError(f"GUI image loader changed source intensities: {path}")
+    if loaded.valid_mask is None or not np.array_equal(loaded.valid_mask, ~mask):
+        raise ValueError(f"GUI image loader did not preserve the embedded exclusion mask: {path}")
+    pipeline_image, _metadata, embedded_qmap = read_frame(path)
+    if not np.array_equal(pipeline_image, image) or not isinstance(embedded_qmap, dict):
+        raise ValueError(f"pipeline did not auto-select the image and embedded q map: {path}")
+    qmap_data = build_qmap(pipeline_image, qmap=embedded_qmap)
+    qx = np.asarray(qmap_data["qx"], dtype=float)
+    qy = np.asarray(qmap_data["qy"], dtype=float)
+    q_unit = str(qmap_data["q_unit"])
+    if q_unit != "nm^-1":
+        raise ValueError(f"pipeline did not preserve physical q units in {path}: {q_unit}")
+    valid_mask = qmap_data.get("valid_mask")
+    if valid_mask is None or not np.array_equal(valid_mask, ~mask):
+        raise ValueError(f"pipeline did not preserve the embedded mask in {path}")
+    service = ButterflyAnalysisService()
+    payload = service.set_observed(
+        loaded.data,
+        qmap={"qx": qx, "qy": qy, "q_unit": q_unit, "valid_mask": valid_mask},
+        metadata=loaded.metadata,
+    )
+    frame = ImageFrame(payload["observed"], mask=mask)
+    qmap = QMap(
+        payload["qx"], payload["qy"],
+        q_unit=str(payload["qmap"]["q_unit"]),
+        mask=mask,
+    )
+    if frame.shape != qmap.shape or qmap.q_unit != q_unit:
+        raise ValueError(f"GUI data adapters lost the calibrated q-map contract: {path}")
+    if frame.mask is None or not np.array_equal(frame.mask, mask):
+        raise ValueError(f"GUI frame adapter changed mask polarity: {path}")
+    if not np.array_equal(qmap.qx, qx) or not np.array_equal(qmap.qy, qy):
+        raise ValueError(f"GUI data adapters changed calibrated q coordinates: {path}")
+    return {
+        "file": path.name,
+        "image_shape": list(frame.shape),
+        "q_unit": qmap.q_unit,
+        "masked_pixel_count": int(np.count_nonzero(frame.mask)),
+        "mask_sidecar": mask_path.name,
+        "image_loader": "load_image(dataset='image', external_mask=mask sidecar)",
+        "calibrated_map_adapter": "pipeline read_frame/build_qmap reads embedded qx/qy/q_unit/mask; ButterflyAnalysisService.set_observed accepts the calibrated map",
+        "status": "passed",
+    }
+
+
 def _make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -825,6 +971,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--multistart must be at least 1")
     if not args.no_resolution_control and args.resolution_control_size < 32:
         raise ValueError("--resolution-control-size must be >= 32")
+    source_hashes_start = _source_hashes()
     output = args.output.resolve()
     try:
         output.relative_to(REPO / "data_local")
@@ -833,7 +980,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         raise ValueError("validation outputs cannot be written under data_local")
     output.mkdir(parents=True, exist_ok=True)
-    existing = [output / filename for filename in OUTPUT_FILES if (output / filename).exists()]
+    expected_outputs = _expected_output_files(args.oblique_frames)
+    existing = [output / filename for filename in expected_outputs if (output / filename).exists()]
     if existing and not args.force:
         raise FileExistsError(
             "output files already exist; use --force to replace only this script's known files"
@@ -848,6 +996,13 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         local_missing_lobe_frame=min(5, args.frames - 1),
     )
+    q_window = (0.15, 0.85)
+    curvature_recipe = pipeline_analysis_config(q_window=q_window)
+    curvature_recipe["analysis"]["ellipse"]["multistart"] = args.multistart
+    curvature_recipe["analysis"]["max_nfev"] = 800
+    canonical_analysis = validate_analysis_settings(curvature_recipe["analysis"])
+    effective_multistart = int(canonical_analysis["ellipse_multistart"])
+    effective_max_nfev = int(canonical_analysis["max_nfev"])
     frames = generate_sequence(settings)
     for frame in frames:
         frame["model_id"] = "t2_finite_layer_stack"
@@ -860,9 +1015,11 @@ def main(argv: list[str] | None = None) -> int:
         annular_frames = {int(value) for value in args.annular_frames.split(",") if value.strip()}
         if any(index < 0 or index >= len(frames) for index in annular_frames):
             raise ValueError("--annular-frames indices must identify generated signal/control frames")
-    q_window = (0.15, 0.85)
     records = [
-        _frame_record(frame, q_window, radial_frames, annular_frames, args.multistart)
+        _frame_record(
+            frame, q_window, radial_frames, annular_frames,
+            args.multistart, effective_multistart, effective_max_nfev,
+        )
         for frame in frames
     ]
     oblique_settings = ObliqueStackSettings(
@@ -872,6 +1029,12 @@ def main(argv: list[str] | None = None) -> int:
         local_missing_lobe_frame=min(4, args.oblique_frames - 1),
     )
     oblique_frames = generate_oblique_stack_sequence(oblique_settings)
+    demo_frame_files = _save_gui_demo_frames(output, oblique_frames, oblique_settings)
+    demo_roundtrips = [
+        _validate_gui_demo_roundtrip(output / relative_path)
+        for relative_path in demo_frame_files
+        if relative_path.endswith(".npz")
+    ]
     for frame in oblique_frames:
         frame["model_id"] = "oblique_lamella_stack"
     if args.oblique_annular_frames is None:
@@ -888,7 +1051,10 @@ def main(argv: list[str] | None = None) -> int:
         if any(index < 0 or index >= len(oblique_frames) for index in oblique_annular_frames):
             raise ValueError("--oblique-annular-frames must identify generated frames/controls")
     oblique_records = [
-        _frame_record(frame, q_window, set(), oblique_annular_frames, args.multistart)
+        _frame_record(
+            frame, q_window, set(), oblique_annular_frames,
+            args.multistart, effective_multistart, effective_max_nfev,
+        )
         for frame in oblique_frames
     ]
     resolution_control = None
@@ -919,7 +1085,11 @@ def main(argv: list[str] | None = None) -> int:
         low_frame = generate_sequence(low_settings)[0]
         low_frame["frame_id"] = f"resolution_{args.resolution_control_size}_signal_00"
         low_frame["sequence_role"] = "resolution_control"
-        low_record = _frame_record(low_frame, q_window, set(), set(), args.multistart)
+        low_frame["model_id"] = "t2_finite_layer_stack"
+        low_record = _frame_record(
+            low_frame, q_window, set(), set(),
+            args.multistart, effective_multistart, effective_max_nfev,
+        )
         resolution_control = {
             "shape": [args.resolution_control_size, args.resolution_control_size],
             "paired_with_main_frame": "signal_00",
@@ -927,35 +1097,6 @@ def main(argv: list[str] | None = None) -> int:
             "frame": low_record,
         }
 
-    script_hashes = {
-        "scripts/validate_lamellar_sequence.py": _sha256(Path(__file__).resolve()),
-        "src/butterfly_saxs/benchmark_sequence.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "benchmark_sequence.py"
-        ),
-        "src/butterfly_saxs/benchmark_t2.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "benchmark_t2.py"
-        ),
-        "src/butterfly_saxs/pipeline.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "pipeline.py"
-        ),
-        "src/butterfly_saxs/butterfly_ridge.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "butterfly_ridge.py"
-        ),
-        "src/butterfly_saxs/butterfly.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "butterfly.py"
-        ),
-        "src/butterfly_saxs/observables.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "observables.py"
-        ),
-        "src/butterfly_saxs/analysis_config.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "analysis_config.py"
-        ),
-        "src/butterfly_saxs/annular_trace.py": _sha256(
-            REPO / "src" / "butterfly_saxs" / "annular_trace.py"
-        ),
-    }
-    curvature_recipe = pipeline_analysis_config(q_window=q_window)
-    curvature_recipe["analysis"]["ellipse"]["multistart"] = args.multistart
     summary = {
         "schema_version": "lamellarsaxs2d.validation.lamellar_sequence.v1",
         "model_scope": [
@@ -964,7 +1105,10 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "generator_version": benchmark_t2.GENERATOR_VERSION,
         "generator_hash": benchmark_t2.GENERATOR_HASH,
-        "source_hashes": script_hashes,
+        "source_hashes": source_hashes_start,
+        "source_hashes_end": {},
+        "source_changed_during_run": False,
+        "changed_source_files": [],
         "settings": {"t2": asdict(settings), "oblique_stack": asdict(oblique_settings)},
         "runtime": {
             "python": sys.version,
@@ -977,8 +1121,12 @@ def main(argv: list[str] | None = None) -> int:
         "q_window_nm_inv": list(q_window),
         "analysis_recipes": {
             "curvature": curvature_recipe,
-            "ellipse_multistart": args.multistart,
-            "optimizer_max_nfev": 800,
+            "optimizer": {
+                "requested_ellipse_multistart": args.multistart,
+                "effective_ellipse_multistart": effective_multistart,
+                "effective_max_nfev": effective_max_nfev,
+                "canonical_settings_source": "validate_analysis_settings",
+            },
             "radial_peak_pipeline_frames": sorted(radial_frames),
             "annular_peak_trajectory_frames": sorted(annular_frames),
             "oblique_annular_peak_trajectory_frames": sorted(oblique_annular_frames),
@@ -1018,9 +1166,16 @@ def main(argv: list[str] | None = None) -> int:
             "confidence": "engineering and synthetic-model evidence only; not experimental calibration or scientific acceptance",
         },
         "frame_count": len(records) + len(oblique_records),
-        "signal_frame_count": settings.n_signal_frames,
-        "noise_control_count": int(settings.noise_control),
+        "signal_frame_count": settings.n_signal_frames + oblique_settings.n_signal_frames,
+        "noise_control_count": int(settings.noise_control) + int(oblique_settings.include_noise_control),
         "resolution_control": resolution_control,
+        "gui_demo_frame_files": demo_frame_files,
+        "gui_demo_roundtrip_validation": {
+            "method": "public io.load_image plus pipeline read_frame/build_qmap and Qt-free ButterflyAnalysisService/ImageFrame/QMap adapters",
+            "q_map_source": "pipeline automatically reads embedded qx/qy/q_unit/mask; the generic GUI image loader reads intensity with explicit dataset selection and applies the supplied mask sidecar; calibrated maps can be supplied through the service qmap seam",
+            "gui_load_instructions": "Select the image dataset named image in the NPZ, apply the sibling *_mask.npy as external mask, and use the embedded q-map through the pipeline/service qmap path; the generic GUI image loader does not auto-detect embedded q maps.",
+            "frames": demo_roundtrips,
+        },
         "sequences": {
             "t2_finite_layer_stack": {
                 "model_scope": "finite_2d_density_sum_then_fft_intensity",
@@ -1039,9 +1194,6 @@ def main(argv: list[str] | None = None) -> int:
         "oblique_frames": oblique_records,
     }
     summary = _jsonable(summary)
-    (output / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
-    )
     _write_csv(output / "sequence.csv", [*records, *oblique_records])
     _plot_intensity_sheet(output / "t2_intensity_contact_sheet.png", frames)
     _plot_truth_observed(output / "t2_truth_vs_observed.png", records)
@@ -1052,6 +1204,17 @@ def main(argv: list[str] | None = None) -> int:
         output / "annular_profile_overlay.png",
         oblique_frames,
         oblique_records,
+    )
+    source_hashes_end = _source_hashes()
+    changed_source_files = sorted(
+        path for path, start_hash in source_hashes_start.items()
+        if source_hashes_end.get(path) != start_hash
+    )
+    summary["source_hashes_end"] = source_hashes_end
+    summary["source_changed_during_run"] = bool(changed_source_files)
+    summary["changed_source_files"] = changed_source_files
+    (output / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8"
     )
     print(
         f"Wrote {len(records) + len(oblique_records)} frames "

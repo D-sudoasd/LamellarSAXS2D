@@ -495,9 +495,14 @@ _EN = {
     "ellipse.ln": "Ln from minor axis (nm)",
     "ellipse.lz": "Lz from draw axis (nm)",
     "ellipse.l_major": "L from major axis (nm)",
-    "ellipse.l_radial": "L from first-order ring (nm)",
-    "ellipse.q_star": "q* (first-order)",
+    "ellipse.l_radial": "Radial period candidate L (nm)",
+    "ellipse.q_star": "q* candidate",
     "ellipse.q_star_source": "q* source",
+    "q_star_source.first_order_iq": "radial I(q) peak (candidate first order)",
+    "q_star_source.observed_arc_radius_not_order_assigned": "observed arc radius (order unassigned)",
+    "q_star_source.unavailable_prescribed_annuli": "prescribed annuli (no radial peak position)",
+    "q_star_source.unavailable": "unavailable",
+    "q_star_source.selected_sector_peak_median": "selected-sector peak median",
     "ellipse.rmse": "RMSE",
     "ellipse.rss": "RSS",
     "ellipse.n_points": "n points",
@@ -915,9 +920,14 @@ _ZH = {
     "ellipse.ln": "短轴换算 Ln（nm）",
     "ellipse.lz": "拉伸轴换算 Lz（nm）",
     "ellipse.l_major": "长轴换算 L（nm）",
-    "ellipse.l_radial": "一阶环 L（nm）",
-    "ellipse.q_star": "一阶 q*",
+    "ellipse.l_radial": "径向周期候选 L（nm）",
+    "ellipse.q_star": "q* 候选",
     "ellipse.q_star_source": "q* 来源",
+    "q_star_source.first_order_iq": "径向强度峰（首阶候选）",
+    "q_star_source.observed_arc_radius_not_order_assigned": "观测弧半径（级次未确定）",
+    "q_star_source.unavailable_prescribed_annuli": "预设环采样（无径向峰位）",
+    "q_star_source.unavailable": "不可用",
+    "q_star_source.selected_sector_peak_median": "扇区峰位中位数",
     "ellipse.n_points": "点数",
     "ellipse.quality": "求解成功",
     "ellipse.rmse": "RMSE",
@@ -1293,11 +1303,35 @@ def translate(language: Any, key: str, **values: Any) -> str:
     return template.format(**values)
 
 
+_Q_STAR_SOURCE_KEYS = {
+    "first_order_iq": "q_star_source.first_order_iq",
+    "observed_arc_radius_not_order_assigned": "q_star_source.observed_arc_radius_not_order_assigned",
+    # Older results used this shorter name before the reflection order was
+    # carried explicitly. Its meaning remains an unassigned observed radius.
+    "observed_arc_radius": "q_star_source.observed_arc_radius_not_order_assigned",
+    "unavailable_prescribed_annuli": "q_star_source.unavailable_prescribed_annuli",
+    "unavailable": "q_star_source.unavailable",
+    "selected_sector_peak_median": "q_star_source.selected_sector_peak_median",
+    "median of selected sector-profile peaks": "q_star_source.selected_sector_peak_median",
+}
+
+
+def translate_q_star_source(language: Any, source: Any) -> Any:
+    """Translate known q* source codes for display, preserving unknown values."""
+
+    if source is None or source == "":
+        return source
+    raw = str(source)
+    key = _Q_STAR_SOURCE_KEYS.get(raw.strip().lower())
+    return translate(language, key) if key is not None else raw
+
+
 __all__ = [
     "CATALOGS",
     "DEFAULT_LANGUAGE",
     "LANGUAGE_SETTING_KEY",
     "SUPPORTED_LANGUAGES",
     "translate",
+    "translate_q_star_source",
     "validate_language",
 ]

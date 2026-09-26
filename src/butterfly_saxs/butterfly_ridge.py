@@ -1376,6 +1376,7 @@ def _first_order_q_hint(
             candidate_peaks.append(
                 {
                     "index": index,
+                    "bin_index": index,
                     "q_bin": float(centres[index]),
                     "height": height,
                     "prominence": prominence,
@@ -1491,6 +1492,323 @@ def _first_order_q_hint(
             ),
         }
     )
+    return summary
+
+
+def _circular_angular_span_deg(points: Sequence[Mapping[str, Any]]) -> float:
+    """Return the smallest circular span containing the observed arc points."""
+
+    angles = np.asarray(
+        [
+            math.degrees(math.atan2(float(point["qy"]), float(point["qx"]))) % 360.0
+            for point in points
+            if np.isfinite(float(point.get("qx", float("nan"))))
+            and np.isfinite(float(point.get("qy", float("nan"))))
+        ],
+        dtype=float,
+    )
+    if angles.size < 2:
+        return 0.0
+    angles.sort()
+    gaps = np.diff(np.concatenate((angles, angles[:1] + 360.0)))
+    return float(max(0.0, 360.0 - float(np.max(gaps))))
+
+
+def _apply_hint_independent_arc_support(
+    first_order: Mapping[str, Any],
+    arcs: Sequence[Mapping[str, Any]],
+    points: Sequence[Mapping[str, Any]],
+    *,
+    q_min: float,
+    q_max: float,
+    radii: np.ndarray | None = None,
+    weights: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Reconcile radial peaks with curvature arcs found before hint weighting.
+
+    Radial candidates remain inspectable. A lower-q family is bypassed only
+    when a higher-q family has stronger support in every observed-trajectory
+    summary and stronger radial prominence. Conflicting evidence leaves q*
+    unset instead of steering NMS with an unverified hint.
+    """
+
+    summary = dict(first_order)
+    peaks = [dict(peak) for peak in first_order.get("candidate_peaks", [])]
+    summary["candidate_peaks"] = peaks
+    summary["selection_method"] = "radial_peak_with_hint_independent_observed_arc_support"
+    summary["order_assignment"] = "provisional"
+    summary["target_definition"] = (
+        "radial peak family supported by observed two-dimensional curvature arcs; "
+        "not a definitive Bragg-order assignment"
+    )
+    summary["arc_support_method"] = "unweighted_curvature_candidates_nms_and_valid_arc_topology"
+    summary["candidate_families"] = []
+    summary["arc_support_comparisons"] = []
+    summary["competing_peaks"] = []
+    if not peaks:
+        summary.update(
+            {"selection_status": "no_hint", "q_star": None, "band": None,
+             "reason": first_order.get("reason") or "no_radial_peak_candidates"}
+        )
+        return summary
+
+    eligible = [
+        peak for peak in peaks
+        if peak.get("support_status") == "eligible"
+        and np.isfinite(float(peak.get("q_bin", float("nan"))))
+    ]
+    eligible.sort(key=lambda peak: float(peak["q_bin"]))
+    family_span = float(first_order.get("peak_family_span", FIRST_ORDER_PEAK_FAMILY_SPAN))
+    groups: list[list[dict[str, Any]]] = []
+    for peak in eligible:
+        if not groups or float(peak["q_bin"]) > family_span * float(groups[-1][0]["q_bin"]):
+            groups.append([peak])
+        else:
+            groups[-1].append(peak)
+
+    points_by_id = {
+        str(point.get("point_id")): point
+        for point in points
+        if point.get("point_id") is not None
+    }
+    bin_width = (float(q_max) - float(q_min)) / max(int(first_order.get("n_bins", 96)), 1)
+    pixel_step = first_order.get("radial_q_pixel_step")
+    pixel_step = float(pixel_step) if pixel_step is not None else 0.0
+    peak_bands: dict[int, tuple[float, float]] = {}
+    for peak in eligible:
+        peak_width = max(float(peak.get("width_bins", 0.0)), 0.0)
+        half_width = max(0.5 * peak_width * bin_width, 0.5 * pixel_step, bin_width)
+        peak_q = float(peak["q_bin"])
+        peak_bands[id(peak)] = (
+            max(float(q_min), peak_q - half_width),
+            min(float(q_max), peak_q + half_width),
+        )
+
+    significant_threshold = first_order.get("significance_prominence_threshold")
+    ambiguity_floor = first_order.get("ambiguity_prominence_floor")
+    significant_threshold = float(significant_threshold) if significant_threshold is not None else float("inf")
+    ambiguity_floor = float(ambiguity_floor) if ambiguity_floor is not None else float("inf")
+    ambiguity_width = float(first_order.get(
+        "ambiguity_min_width_bins", FIRST_ORDER_PEAK_AMBIGUITY_MIN_WIDTH_BINS
+    ))
+    for family_id, family_peaks in enumerate(groups):
+        for peak in family_peaks:
+            peak["family_id"] = int(family_id)
+        family_bands = [peak_bands[id(peak)] for peak in family_peaks]
+        support_arcs: list[dict[str, Any]] = []
+        supported_point_ids: set[str] = set()
+        for arc in arcs:
+            if not bool(arc.get("valid", False)):
+                continue
+            ordered_ids = arc.get("ordered_point_ids", arc.get("point_ids", ()))
+            arc_points = [points_by_id[str(point_id)] for point_id in ordered_ids if str(point_id) in points_by_id]
+            if len(arc_points) < 2:
+                continue
+            radii_on_arc = np.asarray(
+                [math.hypot(float(point["qx"]), float(point["qy"])) for point in arc_points],
+                dtype=float,
+            )
+            matched = np.asarray(
+                [any(low <= radius <= high for low, high in family_bands) for radius in radii_on_arc],
+                dtype=bool,
+            )
+            positions = np.flatnonzero(matched)
+            if positions.size == 0:
+                continue
+            runs = np.split(positions, np.flatnonzero(np.diff(positions) > 1) + 1)
+            matched_points = [arc_points[int(index)] for index in positions]
+            supported_point_ids.update(str(point["point_id"]) for point in matched_points)
+            matched_spans = [
+                _circular_angular_span_deg([arc_points[int(index)] for index in run])
+                for run in runs
+                if run.size >= 2
+            ]
+            support_arcs.append(
+                {
+                    "arc_id": int(arc.get("arc_id", -1)),
+                    "n_arc_points": int(len(arc_points)),
+                    "n_family_points": int(positions.size),
+                    "n_matched_runs": int(len(runs)),
+                    "n_contiguous_matched_runs": int(len(matched_spans)),
+                    "has_contiguous_match": bool(matched_spans),
+                    "matched_angular_span_deg": float(sum(matched_spans)),
+                    "full_arc_angular_span_reference_deg": _circular_angular_span_deg(arc_points),
+                    "q_median": float(np.median(radii_on_arc)),
+                    "branch_ids": list(arc.get("branch_ids", [])),
+                    "side": str(arc.get("side", "unknown")),
+                }
+            )
+        significant_peaks = [
+            peak for peak in family_peaks
+            if float(peak.get("prominence", 0.0)) >= significant_threshold
+        ]
+        ambiguous_peaks = [
+            peak for peak in family_peaks
+            if float(peak.get("prominence", 0.0)) >= ambiguity_floor
+            and float(peak.get("width_bins", 0.0)) >= ambiguity_width
+        ]
+        continuous_support_arcs = [arc for arc in support_arcs if arc["has_contiguous_match"]]
+        family_summary: dict[str, Any] = {
+            "family_id": int(family_id),
+            "q_min": float(min(peak["q_bin"] for peak in family_peaks)),
+            "q_max": float(max(peak["q_bin"] for peak in family_peaks)),
+            "radial_evidence_status": "significant" if significant_peaks else "ambiguous" if ambiguous_peaks else "below_significance",
+            "n_radial_peaks": int(len(family_peaks)),
+            "max_prominence": float(max(float(peak.get("prominence", 0.0)) for peak in family_peaks)),
+            "n_significant_peaks": int(len(significant_peaks)),
+            "n_ambiguous_peaks": int(len(ambiguous_peaks)),
+            "n_valid_arcs": int(len(continuous_support_arcs)),
+            "n_isolated_arc_hits": int(len(support_arcs) - len(continuous_support_arcs)),
+            "n_arc_supported_points": int(len(supported_point_ids)),
+            "n_matched_runs": int(sum(arc["n_contiguous_matched_runs"] for arc in support_arcs)),
+            "matched_angular_span_deg": float(sum(arc["matched_angular_span_deg"] for arc in support_arcs)),
+            "mean_matched_arc_points": float(np.mean([arc["n_family_points"] for arc in continuous_support_arcs])) if continuous_support_arcs else None,
+            "mean_matched_arc_span_deg": float(np.mean([arc["matched_angular_span_deg"] for arc in continuous_support_arcs])) if continuous_support_arcs else None,
+            "full_arc_angular_span_reference_deg": float(sum(arc["full_arc_angular_span_reference_deg"] for arc in support_arcs)),
+            "arc_support_status": "observed_contiguous_arc_segments" if continuous_support_arcs else "isolated_radial_hits_only" if support_arcs else "no_valid_arc_support",
+            "supporting_arcs": support_arcs,
+            "weaker_observed_support_than_family_ids": [],
+        }
+        summary["candidate_families"].append(family_summary)
+
+    families = summary["candidate_families"]
+    for lower_index, lower in enumerate(families):
+        for higher in families[lower_index + 1:]:
+            lower_arc_n = int(lower["n_valid_arcs"])
+            higher_arc_n = int(higher["n_valid_arcs"])
+            lower_span = float(lower["mean_matched_arc_span_deg"] or 0.0)
+            higher_span = float(higher["mean_matched_arc_span_deg"] or 0.0)
+            lower_points = float(lower["mean_matched_arc_points"] or 0.0)
+            higher_points = float(higher["mean_matched_arc_points"] or 0.0)
+            higher_dominates = bool(
+                lower_arc_n > 0
+                and higher_arc_n > 0
+                and higher_span > lower_span
+                and higher_points >= lower_points
+            )
+            lower_dominates = bool(
+                lower_arc_n > 0
+                and higher_arc_n > 0
+                and lower_span > higher_span
+                and lower_points >= higher_points
+            )
+            similar_support = bool(
+                lower_arc_n == higher_arc_n
+                and np.isclose(lower_span, higher_span, rtol=1e-6, atol=1e-6)
+                and np.isclose(lower_points, higher_points, rtol=1e-6, atol=1e-6)
+            )
+            lower_prominence = float(lower["max_prominence"])
+            higher_prominence = float(higher["max_prominence"])
+            prominence_relation = (
+                "higher_q_stronger" if higher_prominence > lower_prominence
+                else "lower_q_stronger" if lower_prominence > higher_prominence
+                else "similar"
+            )
+            weaker = bool(higher_dominates and higher_prominence > lower_prominence)
+            if weaker:
+                lower["weaker_observed_support_than_family_ids"].append(int(higher["family_id"]))
+            relation = (
+                "higher_q_only_observed_arc_support" if lower_arc_n == 0 and higher_arc_n > 0
+                else "lower_q_only_observed_arc_support" if lower_arc_n > 0 and higher_arc_n == 0
+                else "higher_q_dominates_observed_support" if higher_dominates
+                else "lower_q_dominates_observed_support" if lower_dominates
+                else "similar_observed_support" if similar_support
+                else "incomparable_observed_support"
+            )
+            summary["arc_support_comparisons"].append(
+                {
+                    "lower_family_id": int(lower["family_id"]),
+                    "higher_family_id": int(higher["family_id"]),
+                    "observed_support_relation": relation,
+                    "lower_mean_matched_arc_span_deg": lower["mean_matched_arc_span_deg"],
+                    "higher_mean_matched_arc_span_deg": higher["mean_matched_arc_span_deg"],
+                    "lower_mean_matched_arc_points": lower["mean_matched_arc_points"],
+                    "higher_mean_matched_arc_points": higher["mean_matched_arc_points"],
+                    "radial_prominence_relation": prominence_relation,
+                    "weaker_observed_support": weaker,
+                }
+            )
+
+    significant_families = [family for family in families if family["radial_evidence_status"] == "significant"]
+    supported_significant = [
+        family for family in significant_families
+        if int(family["n_valid_arcs"]) > 0
+        and not family["weaker_observed_support_than_family_ids"]
+    ]
+    selected_family = supported_significant[0] if supported_significant else None
+    unresolved_lower = [
+        family for family in families
+        if family["radial_evidence_status"] in {"significant", "ambiguous"}
+        and not family["weaker_observed_support_than_family_ids"]
+        and int(family["n_valid_arcs"]) == 0
+        and (selected_family is None or int(family["family_id"]) < int(selected_family["family_id"]))
+    ]
+    ambiguous_lower = [
+        family for family in families
+        if family["radial_evidence_status"] == "ambiguous"
+        and not family["weaker_observed_support_than_family_ids"]
+        and (selected_family is None or int(family["family_id"]) < int(selected_family["family_id"]))
+    ]
+    summary["q_star"] = None
+    summary["q_star_bin"] = None
+    summary["band"] = None
+    summary.pop("selected_peak", None)
+    summary.pop("ambiguous_peaks", None)
+    if unresolved_lower or ambiguous_lower:
+        blocking = unresolved_lower or ambiguous_lower
+        summary["selection_status"] = "ambiguous"
+        summary["reason"] = (
+            "lower_q_peak_without_independent_arc_support"
+            if unresolved_lower
+            else "ambiguous_lower_q_peak_family_with_observed_arc_support"
+        )
+        blocking_ids = {int(family["family_id"]) for family in blocking}
+        summary["ambiguous_peaks"] = [peak for peak in peaks if int(peak.get("family_id", -1)) in blocking_ids]
+    elif selected_family is None:
+        summary["selection_status"] = "ambiguous" if significant_families else "no_hint"
+        summary["reason"] = (
+            "no_hint_independent_observed_arc_support"
+            if significant_families
+            else "no_significant_supported_peak"
+        )
+    else:
+        family_id = int(selected_family["family_id"])
+        selected_peaks = [
+            peak for peak in eligible
+            if int(peak.get("family_id", -1)) == family_id
+            and float(peak.get("prominence", 0.0)) >= significant_threshold
+        ]
+        selected_peak = max(selected_peaks, key=lambda peak: float(peak.get("height", 0.0)))
+        q_bin = float(selected_peak["q_bin"])
+        q_star = (
+            _refine_radial_peak_q(
+                np.asarray(radii, dtype=float), np.asarray(weights, dtype=float), q_bin,
+                q_min, q_max, coarse_bins=int(first_order.get("n_bins", 96)),
+            )
+            if radii is not None and weights is not None else q_bin
+        )
+        if not np.isfinite(q_star) or q_star <= 0.0:
+            summary["selection_status"] = "no_hint"
+            summary["reason"] = "invalid_observed_arc_supported_peak"
+        else:
+            summary.update(
+                {
+                    "q_star": float(q_star),
+                    "q_star_bin": q_bin,
+                    "band": [max(float(q_min), 0.62 * float(q_star)), min(float(q_max), 1.45 * float(q_star))],
+                    "selection_status": "selected",
+                    "reason": "ok_observed_arc_supported",
+                    "selected_peak": dict(selected_peak),
+                    "selected_family_id": family_id,
+                }
+            )
+    selected_id = summary.get("selected_family_id")
+    summary["competing_peaks"] = [
+        dict(peak) for peak in peaks
+        if selected_id is None or int(peak.get("family_id", -1)) != int(selected_id)
+    ]
+    if selected_id is None:
+        summary.pop("selected_family_id", None)
     return summary
 
 
@@ -1957,21 +2275,16 @@ def _fill_sparse_first_order_ring(
     return summary
 
 
-# First-order tips of a flat origin-centred ellipse can reach ~3× q*.
-# A 3–4× harmonic sits beyond that and must not remain in the same family.
-FIRST_ORDER_FAMILY_SPAN = 3.5
-
-
 def _demote_secondary_radial_population(
     points: Sequence[dict[str, Any]],
     prefer_radius: float | None = None,
 ) -> dict[str, Any]:
-    """Keep one radial family when a late frame still has an earlier ring.
+    """Diagnose clearly separated radial populations without losing support.
 
-    A single origin-centred ellipse cannot carry the first-order butterfly and
-    a harmonic at once.  A clear |q| gap demotes the family farther from the
-    first-order hint; without a hint the inner ring is kept.  Unimodal wings
-    are unchanged.
+    A finite positive q* hint may select the nearer population for one-ellipse
+    fitting. Without a usable hint, retain both groups and expose the
+    ambiguity for review. A continuous wing remains intact regardless of its
+    distance from q*.
     """
 
     accepted = [
@@ -1987,7 +2300,18 @@ def _demote_secondary_radial_population(
             continue
         if np.isfinite(radius) and radius > 0.0:
             radii.append(radius)
-    summary = {"split": False, "kept": 0, "demoted": 0, "threshold": None, "keep": None}
+    summary = {
+        "split": False,
+        "kept": 0,
+        "demoted": 0,
+        "threshold": None,
+        "keep": None,
+        "selection_status": "not_split",
+        "reason": "no_separated_radial_populations",
+        "low_q_population": None,
+        "high_q_population": None,
+        "flags": [],
+    }
     if len(radii) >= 12:
         ordered = np.sort(np.asarray(radii, dtype=float))
         gaps = np.diff(ordered)
@@ -2005,82 +2329,59 @@ def _demote_secondary_radial_population(
                 and float(high[0] / max(float(low[-1]), np.finfo(float).eps)) >= 1.8
             )
             if can_split:
-                if prefer_radius is not None:
-                    try:
-                        hint_radius = float(prefer_radius)
-                    except (TypeError, ValueError):
-                        hint_radius = float("nan")
-                    if np.isfinite(hint_radius) and hint_radius > 0.0:
-                        keep_high = abs(float(np.median(high)) - hint_radius) < abs(
-                            float(np.median(low)) - hint_radius
-                        )
-                    else:
-                        keep_high = False
-                else:
-                    keep_high = False
+                try:
+                    hint_radius = float(prefer_radius)
+                except (TypeError, ValueError):
+                    hint_radius = float("nan")
+                hint_valid = bool(np.isfinite(hint_radius) and hint_radius > 0.0)
                 threshold = 0.5 * (float(low[-1]) + float(high[0]))
                 demoted = 0
-                for point in accepted:
-                    try:
-                        radius = float(np.hypot(float(point["qx"]), float(point["qy"])))
-                    except (KeyError, TypeError, ValueError):
-                        continue
-                    drop = radius < threshold if keep_high else radius >= threshold
-                    if drop:
-                        _demote_unresolved_identity_point(
-                            point, "secondary_radial_population", "mixed_radial_populations"
-                        )
-                        demoted += 1
+                if hint_valid:
+                    keep_high = abs(float(np.median(high)) - hint_radius) < abs(
+                        float(np.median(low)) - hint_radius
+                    )
+                    for point in accepted:
+                        try:
+                            radius = float(np.hypot(float(point["qx"]), float(point["qy"])))
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                        drop = radius < threshold if keep_high else radius >= threshold
+                        if drop:
+                            _demote_unresolved_identity_point(
+                                point, "secondary_radial_population", "mixed_radial_populations"
+                            )
+                            demoted += 1
+                    selection_status = "selected"
+                    reason = "nearest_radial_population_to_q_hint"
+                    keep = "high_q" if keep_high else "low_q"
+                else:
+                    selection_status = "ambiguous"
+                    reason = "q_hint_unavailable" if prefer_radius is None else "q_hint_invalid"
+                    keep = "all_observed"
                 summary.update(
                     {
                         "split": True,
                         "kept": int(len(accepted) - demoted),
                         "demoted": int(demoted),
                         "threshold": threshold,
-                        "keep": "high_q" if keep_high else "low_q",
+                        "keep": keep,
+                        "selection_status": selection_status,
+                        "reason": reason,
+                        "low_q_population": {
+                            "q_min": float(low[0]),
+                            "q_max": float(low[-1]),
+                            "n_points": int(low.size),
+                        },
+                        "high_q_population": {
+                            "q_min": float(high[0]),
+                            "q_max": float(high[-1]),
+                            "n_points": int(high.size),
+                        },
+                        "flags": ["mixed_radial_populations"] if not hint_valid else [],
                     }
                 )
-    extra = _demote_beyond_first_order_family(accepted, prefer_radius)
-    if extra:
-        summary["demoted"] = int(summary.get("demoted") or 0) + extra
-        summary["hint_ceiling"] = _first_order_family_ceiling(prefer_radius)
-        if not summary["split"]:
-            summary["keep"] = "first_order_hint"
     summary["kept"] = int(sum(1 for point in accepted if point.get("accepted")))
     return summary
-
-
-def _first_order_family_ceiling(prefer_radius: Any) -> float | None:
-    try:
-        hint = float(prefer_radius) if prefer_radius is not None else float("nan")
-    except (TypeError, ValueError):
-        return None
-    if not (np.isfinite(hint) and hint > 0.0):
-        return None
-    return float(FIRST_ORDER_FAMILY_SPAN) * hint
-
-
-def _demote_beyond_first_order_family(
-    accepted: Sequence[dict[str, Any]],
-    prefer_radius: Any,
-) -> int:
-    ceiling = _first_order_family_ceiling(prefer_radius)
-    if ceiling is None:
-        return 0
-    demoted = 0
-    for point in accepted:
-        if not bool(point.get("accepted", False)):
-            continue
-        try:
-            radius = float(np.hypot(float(point["qx"]), float(point["qy"])))
-        except (KeyError, TypeError, ValueError):
-            continue
-        if radius > ceiling:
-            _demote_unresolved_identity_point(
-                point, "secondary_radial_population", "beyond_first_order_family"
-            )
-            demoted += 1
-    return demoted
 
 
 def _component_major_direction(
@@ -3022,6 +3323,33 @@ def trace_butterfly_ridges(
     q_step = float(np.nanmedian(raw_steps)) if raw_steps else float(coordinate_cache[2])
     if not np.isfinite(q_step) or q_step <= 0:
         q_step = 1.0
+    if first_order.get("candidate_peaks") and first_order.get("selection_status") in {
+        "selected",
+        "ambiguous",
+    }:
+        # Resolve competing radial peaks against the actual curvature
+        # trajectories before the hint can alter candidate scores, NMS, or
+        # topology.  This pass deliberately stops before profile fitting and
+        # never mutates the raw candidates used by the final trace.
+        _check_cancelled(cancel_event, "ridge-trace:first-order-arc-support")
+        support_candidates = [dict(candidate) for candidate in raw_candidates]
+        support_candidates = _nms(support_candidates, opts, q_step)
+        _assign_point_ids(support_candidates, signature)
+        _assign_reference_branches(support_candidates, opts)
+        support_groups, support_edges = _graph_arcs(support_candidates, opts, q_step)
+        support_arcs = _arc_topology(
+            support_groups, support_edges, support_candidates, opts, q_step
+        )
+        first_order = _apply_hint_independent_arc_support(
+            first_order,
+            support_arcs,
+            support_candidates,
+            q_min=q_min,
+            q_max=q_max,
+            radii=np.asarray(q[valid], dtype=float),
+            weights=np.clip(np.asarray(image_array[valid], dtype=float), 0.0, None),
+        )
+        first_order["applied"] = False
     if bool(opts.get("first_order_prefer", True)):
         n_weighted = _prefer_first_order_scores(raw_candidates, first_order.get("q_star"))
         first_order["applied"] = bool(n_weighted)
@@ -3220,7 +3548,7 @@ def trace_butterfly_ridges(
         "radial_population": radial_split,
         "wang2007_vertical_slice": wang,
         "flags": ["observed_only", "no_ellipse_fit", "rejected_candidates_retained", "topology_before_ellipse_fit"]
-        + (["mixed_radial_populations"] if radial_split.get("split") else []),
+        + (["mixed_radial_populations"] if radial_split.get("selection_status") == "ambiguous" else []),
     }
     return {"points": public_points, "arcs": arcs, "profiles": profiles, "diagnostics": diagnostics, "method_version": METHOD_VERSION}
 

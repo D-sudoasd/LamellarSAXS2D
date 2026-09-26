@@ -75,6 +75,16 @@ _ELLIPSE_PRESET_DEFAULTS: dict[str, dict[str, Any]] = ELLIPSE_PRESET_DEFAULTS
 # Keep the service's historical private name as an import-compatible alias;
 # the canonical preset values live in settings.py for CLI and Qt restoration.
 
+
+def _normalize_ellipse_residual(value: Any) -> str:
+    residual = str(value).strip().lower().replace("-", "_")
+    if residual in {"closest", "distance", "geometric_distance"}:
+        residual = "geometric"
+    if residual not in {"sampson", "geometric"}:
+        raise ValueError("ellipse residual must be 'sampson' or 'geometric'")
+    return residual
+
+
 def normalize_ellipse_settings(settings: Mapping[str, Any] | None) -> dict[str, Any] | None:
     """Normalize the shared constrained-ellipse configuration.
 
@@ -133,13 +143,9 @@ def normalize_ellipse_settings(settings: Mapping[str, Any] | None) -> dict[str, 
         explicit = True
     result = ellipse_preset_defaults(preset)
     result["preset"] = preset
-    result["residual"] = str(
+    result["residual"] = _normalize_ellipse_residual(
         nested.get("residual", source.get("ellipse_residual", "sampson"))
-    ).strip().lower().replace("-", "_")
-    if result["residual"] in {"closest", "distance", "geometric_distance"}:
-        result["residual"] = "geometric"
-    if result["residual"] not in {"sampson", "geometric"}:
-        raise ValueError("ellipse residual must be 'sampson' or 'geometric'")
+    )
     multistart = strict_int(
         nested.get("multistart", source.get("ellipse_multistart", 7)),
         "ellipse multistart",
@@ -744,8 +750,20 @@ def validate_analysis_settings(
         # Pipeline fitting separately checks the caller's raw geometry controls
         # so this display/persistence default does not become an ellipse prior.
         ellipse_settings = ellipse_preset_defaults("standard")
-        ellipse_settings["residual"] = merged["ellipse_residual"]
-        ellipse_settings["multistart"] = merged["ellipse_multistart"]
+        nested_ellipse = merged.get("ellipse")
+        nested_ellipse = nested_ellipse if isinstance(nested_ellipse, Mapping) else {}
+        # Solver controls are independent of a geometry prior.  The normalizer
+        # intentionally returns None for unconstrained standard geometry, so
+        # copy these already-validated nested controls into the editable row
+        # before the canonical values are written back to the top level.
+        ellipse_settings["residual"] = _normalize_ellipse_residual(
+            nested_ellipse.get("residual", merged["ellipse_residual"])
+        )
+        ellipse_settings["multistart"] = strict_int(
+            nested_ellipse.get("multistart", merged["ellipse_multistart"]),
+            "ellipse multistart",
+            minimum=1,
+        )
     merged["ellipse"] = ellipse_settings
     if ellipse_settings is not None:
         merged["ellipse_preset"] = ellipse_settings["preset"]
