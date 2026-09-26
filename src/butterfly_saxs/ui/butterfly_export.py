@@ -77,6 +77,8 @@ def _parameter_rows(quantities: Any) -> list[dict[str, Any]]:
                 "value": payload.get("value"),
                 "candidate_value": payload.get("candidate_value", payload.get("candidate")),
                 "status": payload.get("status"),
+                "confidence": payload.get("confidence"),
+                "publication_status": payload.get("publication_status"),
                 "reason": payload.get("reason"),
                 "interval": payload.get("interval", payload.get("confidence_interval")),
                 "unit": payload.get("unit"),
@@ -160,7 +162,17 @@ def export_butterfly_analysis(
         _write_csv(
             temporary / "parameters.csv",
             _parameter_rows(quantities),
-            ("parameter", "value", "candidate_value", "status", "reason", "interval", "unit"),
+            (
+                "parameter",
+                "value",
+                "candidate_value",
+                "status",
+                "confidence",
+                "publication_status",
+                "reason",
+                "interval",
+                "unit",
+            ),
         )
         point_rows = _point_rows(result.get("points", []))
         columns = sorted({key for row in point_rows for key in row})

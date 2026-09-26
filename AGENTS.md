@@ -1,103 +1,91 @@
-# WingSAXS agent notes
+# Working on WingSAXS
 
-This file is the machine/operator contract for coding agents. Human scientific
-scope remains in `docs/scientific_basis_zh.md`. Do not commit `CHANGELOG.md` or
-`data_local/`; both are local-only (see `.gitignore`).
+WingSAXS (`butterfly-saxs`, import `butterfly_saxs`, CLI `bsaxs`) helps users
+extract butterfly-pattern SAXS trajectories and follow their evolution across
+image sequences. The aim is useful, inspectable measurements from actual
+intensity data, with uncertainty and model limitations attached to the results.
 
-## What this software is
+## How to work
 
-WingSAXS (`butterfly-saxs`, import `butterfly_saxs`, CLI `bsaxs`)
-identifies and parameterizes butterfly-pattern 2D SAXS. Typical experimental
-frames support a **first-order ring** (`q*` and ring L = `2π/q*`). Apparent
-ellipse `a`, `b/a`, `θ`, and unpublished Ln/Lz/major-axis candidates exist only
-when an interior ellipse is actually supported.
+For Astra and other coding agents, this document supplies project context and
+decision principles, not a fixed sequence of approval gates. Read the relevant
+code, tests and scientific definitions, reproduce the problem, and finish the
+implementation and appropriate verification within the user's authorization.
+Choose routine tools and implementation details independently. Parallelize
+independent investigation where useful; coordinate edits to shared files.
+Ask only when missing information changes the scientific question, scope,
+acceptance criteria or permission and cannot be inferred reliably.
 
-`success=True` is an engineering status, not scientific acceptance.
+Prefer focused improvements to the real workflow: loading/calibration, selecting
+the signal region, tracing observed intensity, inspecting local profiles,
+fitting, and reviewing/exporting a sequence. Existing tests describe current
+behavior; update a test when an authorized behavior change makes it obsolete,
+while retaining a test for the underlying numerical or scientific failure.
 
-## Environment
+## Measurements and confidence
 
-Python **3.11–3.13** (3.14+ unsupported).
+- Fit observed intensity trajectories. Seeds, neighboring frames and explicit
+  bounds guide optimization; they do not create pixels, mirror missing lobes or
+  turn interpolated values into observations.
+- Preserve finite fitted estimates and per-frame diagnostics when signal is weak,
+  support is incomplete or an optional uncertainty assessment has not run.
+  Distinguish estimates, constrained candidates, failed fits and missing data in
+  the UI and exports. Explain the limitation and the next useful action.
+- Quality thresholds are diagnostic heuristics unless supported by a stated
+  measurement model. A warning should help the user refine the q window, mask,
+  calibration or fit; it should not silently discard the result or whole frame.
+- Initialization across frames is an optimization aid. Fit each new frame to its
+  own data and retain source-frame information. Do not force smooth evolution
+  or copy a previous fit into a failed measurement.
+- Keep ring `q*` / `L = 2π/q*` separate from ellipse `a`, `b/a`, axis angle and
+  conditional Ln/Lz estimates. A boundary solution, near-circle or extrapolated
+  major axis can remain visible as a candidate, with its specific limitation.
+- Physical lengths require calibrated physical q units; pixel-q cannot produce
+  nm. Ellipse geometry alone does not determine a unique 3D lamellar structure.
+  Use `docs/scientific_basis_zh.md` for the Grubb 2016/2021 definitions.
+- Geometry analysis does not implicitly run `full2d`, which is a separate
+  empirical intensity model. Engineering success and human review describe
+  their respective operations, not automatic scientific acceptance.
 
-```bash
-python -m venv .venv-project
-.venv-project/bin/python -m pip install -U pip
-.venv-project/bin/python -m pip install \
-  -c constraints/validation-py311-313.txt -e ".[all]"
+Invalid array shapes, empty numerical domains and invalid calibration/weights
+need actionable errors. Continue other frames where possible and retain the
+failed frame's place and reason in the sequence.
+
+## Practical reference
+
+Python 3.11–3.13 is supported. Prefer an existing suitable environment. On
+Windows use an explicit interpreter if `python` resolves to the Store stub.
+For a new environment install `-e ".[all]"` with
+`constraints/validation-py311-313.txt`. The desktop entry is
+`启动_WingSAXS.cmd` (optional `--check`).
+
+Useful commands, selected as appropriate:
+
+```text
 bsaxs doctor --json
-# equivalent: bsaxs-doctor --json
-```
-
-If `bsaxs` cannot import, start with `bsaxs-doctor --json` (stdlib-only). Core
-analysis does not need Qt; the workbench does (`--require-ui`).
-
-Windows desktop entry: `启动_WingSAXS.cmd` (optional `--check`); the old filename remains an alias.
-
-## Discover commands
-
-```bash
-bsaxs describe          # default if you run `bsaxs` with no subcommand
-bsaxs --help
-```
-
-Stdout is strict JSON (`allow_nan=False`, ASCII-escaped). Human diagnostics
-belong on stderr. Failed commands also print a JSON envelope:
-
-```json
-{"schema_version": "lamellarsaxs2d.cli_error.v1", "ok": false, "exit_code": 2}
-```
-
-### Exit codes
-
-| Code | Meaning |
-| ---: | --- |
-| 0 | Completed; required quality gates passed (or the command has none). |
-| 1 | Completed with WARN, quality FAIL, partial batch failure, or cancel; keep evidence. |
-| 2 | Usage/input/config/overwrite error. Do not treat stdout as a scientific result. |
-
-## Safe agent workflow
-
-1. `bsaxs doctor --json` — environment ready?
-2. `bsaxs describe` — catalog, invariants, recommended flags.
-3. Prefer synthetic or user-supplied fixtures. Never write into raw data dirs.
-4. `bsaxs inspect INPUT [--poni PONI] [--mask MASK]` — read-only diagnostics.
-5. `bsaxs analyze INPUT --ridge-method butterfly_curvature --ellipse-preset flat_ellipse --butterfly-stage evaluate --butterfly-resamples 0`
-6. Real packages: `bsaxs preflight PACKAGE --manifest MANIFEST --poni PONI --mask MASK -o results/preflight` before fitting.
-7. Series: `bsaxs batch "data/frame_*.edf" --poni PONI --mask MASK --mode independent -o results/batch`
-
-Do not pass `--full2d` unless an empirical whole-pixel intensity model is
-explicitly requested. It is not the butterfly geometry measurement.
-
-Do not overwrite outputs without `--force`. `--force` never applies to raw
-inputs, PONI, masks, or `data_local/`.
-
-## Invariants you must not violate
-
-- pixel-q is not a physical period. Load a PONI before reporting L in nm.
-- Do not fabricate missing butterfly quadrants.
-- A `flat_ellipse` bound hit or runaway major axis is **ring-only**; do not copy ring L into Ln.
-- Identify (trace) then Evaluate. GUI order is the same.
-- geometry-only analysis must not silently start full2d.
-- P3/P4 gates are engineering evidence, not scientific acceptance.
-
-The inspect/analyze/batch JSON includes an `agent` object with `next` / `do_not`
-hints and `scientific_acceptance: false`. Those hints are operator guidance,
-not a publication decision.
-
-## Tests and layout
-
-```bash
+bsaxs describe
+bsaxs inspect INPUT --poni PONI --mask MASK
+bsaxs analyze INPUT --ridge-method butterfly_curvature --butterfly-stage evaluate --butterfly-resamples 0
+bsaxs batch "data/frame_*.edf" --poni PONI --mask MASK --mode warm_start -o results/batch
 python -m ruff check src tests scripts
 python -m pytest -q
 ```
 
-Package code lives in `src/butterfly_saxs/`. CLI seam: `cli.py` (lazy scientific
-imports). Qt-free service: `service.py`. Do not put QWidget work in workers.
+CLI stdout is strict JSON (`allow_nan=False`, ASCII escaped); diagnostics go to
+stderr. Exit 0 means completion without reported quality warnings; 1 preserves
+results with warnings, partial failures or cancellation; 2 denotes an input,
+configuration or overwrite error. Preflight and P3/P4 reports support evidence
+review; they are not substitutes for fitting or scientific judgment.
 
-## Docs
+Package code is in `src/butterfly_saxs/`. `cli.py` imports scientific modules
+lazily; `service.py` is Qt-free; workers do not access widgets. Preserve these
+boundaries and test behavior through the CLI/service/UI seam actually affected.
 
-| Topic | Path |
-| --- | --- |
-| First run / Identify then Evaluate | `docs/first_run_zh.md` |
-| CLI, TOML, batch, exports | `docs/user_guide_zh.md` |
-| Result schema | `docs/validation/result_schema_v1.md` |
-| Architecture | `docs/architecture_zh.md` |
+Keep raw inputs, PONI and masks unchanged. Write outputs separately and respect
+explicit overwrite choices. `CHANGELOG.md`, `data_local/`, private literature
+and local validation artifacts are not committed or uploaded. Review the staged
+files before publishing.
+
+More context: `docs/first_run_zh.md`, `docs/user_guide_zh.md`,
+`docs/butterfly_arcs_zh.md`, `docs/validation/result_schema_v1.md`,
+`docs/architecture_zh.md`.

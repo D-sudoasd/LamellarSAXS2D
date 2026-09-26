@@ -20,7 +20,7 @@ from ..butterfly_settings import normalize_butterfly_settings
 from ..fit_overlays import fit_geometry_layers
 from ..settings import canonical_q_unit
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
-from .qspace import QSpaceView
+from .qspace import QSpaceView, _point_is_accepted
 from .butterfly_export import export_butterfly_analysis
 from .i18n import translate
 from .butterfly_summary import ButterflyQualitySummary
@@ -453,26 +453,30 @@ if QT_AVAILABLE:
                             )
                     except (TypeError, ValueError):
                         continue
-                grouped: dict[str, tuple[list[float], list[float]]] = {}
+                grouped: dict[tuple[str, bool], tuple[list[float], list[float]]] = {}
                 for point in points or ():
-                    if not isinstance(point, Mapping) or not bool(point.get("accepted", True)):
+                    if not isinstance(point, Mapping):
                         continue
                     try:
                         side = str(point.get("side", "unknown"))
-                        grouped.setdefault(side, ([], []))[0].append(float(point.get("u")))
-                        grouped.setdefault(side, ([], []))[1].append(float(point.get("v")) * float(v_scale))
+                        accepted = _point_is_accepted(point)
+                        group = grouped.setdefault((side, accepted), ([], []))
+                        group[0].append(float(point.get("u")))
+                        group[1].append(float(point.get("v")) * float(v_scale))
                     except (TypeError, ValueError):
                         continue
-                for side, (u_values, v_values) in grouped.items():
+                for (side, accepted), (u_values, v_values) in grouped.items():
                     if u_values:
+                        color = curve_colors.get(side, (180, 180, 185))
                         self.plot.plot(
                             u_values,
                             v_values,
                             pen=None,
-                            symbol="o" if side == "upper" else "s",
-                            symbolSize=6,
-                            symbolBrush=_pg.mkBrush(curve_colors.get(side, (180, 180, 185))),
-                            name=f"{side} points",
+                            symbol=("o" if side == "upper" else "s") if accepted else "x",
+                            symbolSize=6 if accepted else 8,
+                            symbolPen=_pg.mkPen(color if accepted else (135, 135, 145), width=1.5),
+                            symbolBrush=_pg.mkBrush(color) if accepted else None,
+                            name=f"{side} points" if accepted else f"{side} excluded candidates",
                         )
                 self.plot.setLabel("bottom", x_label)
                 self.plot.setLabel("left", y_label)
@@ -542,6 +546,7 @@ if QT_AVAILABLE:
             self._landmark_zoomed = False
             self._excluded_count = 0
             self._batch_success_count: int | None = None
+            self._batch_limited_count = 0
             self._batch_failure_items: list[Any] = []
             self._detached_status_restore: tuple[str, str, Any] | None = None
             self._radial_sector_seen = False
@@ -991,7 +996,8 @@ if QT_AVAILABLE:
             self.show_excluded_check = QtWidgets.QCheckBox("Show excluded", branch_group)
             self.show_excluded_check.setObjectName("showExcludedPoints")
             self.show_excluded_check.setFixedHeight(20)
-            self.show_excluded_check.setChecked(False)
+            self.show_excluded_check.setChecked(True)
+            self.show_excluded_check.setToolTip(self._tr("tooltip.show_excluded_points"))
             self.show_excluded_check.toggled.connect(self.qspace.set_show_excluded)
             excluded_row.addWidget(self.show_excluded_check)
             self.excluded_count_label = QtWidgets.QLabel("0", branch_group)
@@ -2196,21 +2202,28 @@ if QT_AVAILABLE:
                 return
             english = self._language.lower().startswith("en")
             success_count = int(self._batch_success_count)
+            limited_count = int(self._batch_limited_count)
             failures = list(self._batch_failure_items)
             if failures:
                 details = "; ".join(str(item) for item in failures[:4])
                 if len(failures) > 4:
                     details += f" (+{len(failures) - 4})"
                 self.batch_feedback_label.setText(
-                    f"Batch applied: {success_count} ready; failures: {details}"
+                    f"Batch completed: {success_count} frames retained, {limited_count} need review; failures: {details}"
                     if english
-                    else f"批处理已应用：{success_count} 帧可用；失败：{details}"
+                    else f"批处理已完成：保留 {success_count} 帧结果供判读，其中 {limited_count} 帧需复核；失败：{details}"
+                )
+            elif limited_count:
+                self.batch_feedback_label.setText(
+                    f"Batch completed: {success_count} frames retained, {limited_count} need review"
+                    if english
+                    else f"批处理已完成：保留 {success_count} 帧结果供判读，其中 {limited_count} 帧需复核"
                 )
             else:
                 self.batch_feedback_label.setText(
-                    f"Batch applied: {success_count} frame(s) ready"
+                    f"Batch completed: {success_count} frame(s) retained for review"
                     if english
-                    else f"批处理已应用：{success_count} 帧可用"
+                    else f"批处理已完成：保留 {success_count} 帧结果供判读"
                 )
 
         def _render_page_status(self) -> None:
@@ -2453,6 +2466,7 @@ if QT_AVAILABLE:
                 elif key == (-1, "unknown"):
                     check.setText("Unknown" if english else "未知")
             self.show_excluded_check.setText("Show excluded" if english else "显示排除点")
+            self.show_excluded_check.setToolTip(self._tr("tooltip.show_excluded_points"))
             self.findChild(QtWidgets.QGroupBox, "butterflyQuantitativeParameters").setTitle(
                 "Quantitative parameters" if english else "定量参数"
             )
@@ -3044,22 +3058,7 @@ if QT_AVAILABLE:
             *,
             marker: str | None = None,
         ) -> str:
-            if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
-                selected = _read(point, ("selected_peaks", "peaks"), ())
-                has_selected = bool(
-                    isinstance(selected, Sequence)
-                    and not isinstance(selected, (str, bytes))
-                    and len(selected)
-                )
-                accepted = bool(
-                    _read(
-                        point,
-                        ("accepted",),
-                        _read(point, ("valid",), has_selected),
-                    )
-                )
-            else:
-                accepted = bool(_read(point, ("accepted",), _read(point, ("valid",), True)))
+            accepted = _point_is_accepted(point)
             marker_text = marker or ("✓" if accepted else "×")
             if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
                 q_center = _read(point, ("q_center", "q"), None)
@@ -3163,22 +3162,7 @@ if QT_AVAILABLE:
             for index, point in enumerate(list_points):
                 if not isinstance(point, Mapping):
                     continue
-                if self._trace_method() == _TRACE_METHOD_ANNULAR_PEAK:
-                    selected = _read(point, ("selected_peaks", "peaks"), ())
-                    has_selected = bool(
-                        isinstance(selected, Sequence)
-                        and not isinstance(selected, (str, bytes))
-                        and len(selected)
-                    )
-                    accepted = bool(
-                        _read(
-                            point,
-                            ("accepted",),
-                            _read(point, ("valid",), has_selected),
-                        )
-                    )
-                else:
-                    accepted = bool(_read(point, ("accepted",), _read(point, ("valid",), True)))
+                accepted = _point_is_accepted(point)
                 marker = "✓" if accepted else "×"
                 item = QtWidgets.QListWidgetItem(
                     self._point_list_label(point, index, marker=marker)
@@ -3188,8 +3172,10 @@ if QT_AVAILABLE:
                     ("failure_reason", "reason", "status"),
                     None,
                 )
-                if source_reason not in (None, ""):
-                    item.setToolTip(str(source_reason))
+                confidence = _read(point, ("confidence",), None)
+                tooltip_parts = [str(value) for value in (source_reason, confidence) if value not in (None, "")]
+                if tooltip_parts:
+                    item.setToolTip(" · ".join(tooltip_parts))
                 item.setData(QtCore.Qt.ItemDataRole.UserRole, dict(point))
                 self.point_list.addItem(item)
             self.point_list.blockSignals(False)
@@ -3197,10 +3183,7 @@ if QT_AVAILABLE:
                 1
                 for point in points
                 if isinstance(point, Mapping)
-                and (
-                    not bool(_read(point, ("valid",), True))
-                    or not bool(_read(point, ("accepted",), True))
-                )
+                and not _point_is_accepted(point)
             )
             self._render_excluded_count()
             self._profiles = dict(profiles or {}) if isinstance(profiles, Mapping) else {}
@@ -3283,6 +3266,13 @@ if QT_AVAILABLE:
                 value = _read(payload, ("value",), None)
                 candidate_value = _read(payload, ("candidate_value", "candidate"), None)
                 status = _read(payload, ("status",), "unknown")
+                if (
+                    value not in (None, "")
+                    and candidate_value not in (None, "")
+                    and _finite(value) is not None
+                    and _finite(value) == _finite(candidate_value)
+                ):
+                    candidate_value = None
                 interval = _read(payload, ("interval", "ci", "confidence_interval"), None)
                 if isinstance(interval, Sequence) and not isinstance(interval, (str, bytes)):
                     interval_text = "[" + ", ".join(_fmt(item) for item in interval) + "]"
@@ -3296,12 +3286,44 @@ if QT_AVAILABLE:
                 }.get(str(name), str(name))
                 status_text = str(status)
                 reason_text = str(reason or "")
-                if not self._language.lower().startswith("en"):
+                english = self._language.lower().startswith("en")
+                status_key = status_text.strip().lower()
+                if english:
+                    status_text = {
+                        "ok": "available",
+                        "pass": "available",
+                        "warn": "warning",
+                        "warning": "warning",
+                        "estimate": "estimate",
+                        "candidate": "candidate",
+                        "available": "available",
+                        "unavailable": "unavailable",
+                        "undetermined": "undetermined",
+                        "not_evaluated": "not evaluated",
+                        "not assessed": "not assessed",
+                    }.get(status_key, status_text)
+                    if status_text.lower() in {
+                        "not_evaluated",
+                        "not evaluated",
+                        "pending",
+                        "pending_evaluation",
+                    }:
+                        status_text = "not evaluated"
+                        if not reason_text:
+                            reason_text = self._tr(
+                                "workflow.trace_evaluate_reason",
+                                resamples=self._evaluation_resamples(),
+                            )
+                else:
                     status_text = {
                         "ok": "通过",
                         "pass": "通过",
                         "warn": "警告",
                         "warning": "警告",
+                        "estimate": "估计值",
+                        "candidate": "候选值",
+                        "available": "可用",
+                        "unavailable": "不可用",
                         "not_evaluated": "待评估",
                         "not evaluated": "待评估",
                         "pending": "待评估",
@@ -3315,17 +3337,47 @@ if QT_AVAILABLE:
                             "workflow.trace_evaluate_reason",
                             resamples=self._evaluation_resamples(),
                         )
-                elif status_text.lower() in {"not_evaluated", "not evaluated", "pending", "pending_evaluation"}:
-                    status_text = "not evaluated"
-                    if not reason_text:
-                        reason_text = self._tr(
-                            "workflow.trace_evaluate_reason",
-                            resamples=self._evaluation_resamples(),
-                        )
+                confidence = str(_read(payload, ("confidence",), "") or "").strip()
+                publication_status = str(
+                    _read(payload, ("publication_status",), "") or ""
+                ).strip()
+                if confidence:
+                    confidence_label = confidence
+                    if not english:
+                        confidence_label = {
+                            "empirical": "经验支持",
+                            "limited": "有限支持",
+                            "unavailable": "不可用",
+                        }.get(confidence.lower(), confidence)
+                    status_text = f"{status_text} · {confidence_label}"
+                if publication_status:
+                    publication_label = publication_status
+                    if not english:
+                        publication_label = {
+                            "available": "可报告",
+                            "not_assessed": "未评估发表状态",
+                        }.get(publication_status.lower(), publication_status)
+                    elif publication_status.lower() == "not_assessed":
+                        publication_label = "publication not assessed"
+                    reason_text = " · ".join(
+                        part for part in (publication_label, reason_text) if part
+                    )
+                state_tip = " · ".join(
+                    part
+                    for part in (
+                        str(status),
+                        f"confidence: {confidence}" if confidence else "",
+                        f"publication_status: {publication_status}" if publication_status else "",
+                    )
+                    if part
+                )
                 for column, text in enumerate(
                     (display_name, _fmt(value), status_text, _fmt(candidate_value), interval_text, reason_text)
                 ):
                     self._set_quantity_cell(row, column, text)
+                state_cell = self.quantity_table.item(row, 2)
+                if state_cell is not None and state_tip:
+                    state_cell.setToolTip(state_tip)
             self._render_review_observables()
 
         def _render_review_observables(self) -> None:
@@ -3511,25 +3563,105 @@ if QT_AVAILABLE:
                     None,
                 ),
             )
-            if not unpublished_shape and not annular_result:
+            if not annular_result:
                 extra = []
-                ln = candidate.get("Ln_from_minor_axis_nm", candidate.get("L_N"))
-                lz = candidate.get("Lz_from_draw_axis_nm", candidate.get("L_z"))
-                l_major = candidate.get("L_from_major_axis_nm")
-                reason = (
-                    "apparent; unpublished until independently supported"
+                quantitative = result.get("quantitative_parameters")
+                quantitative = quantitative if isinstance(quantitative, Mapping) else {}
+                shape_issue = unpublished_shape or kind in {"ring", "fail", "undetermined"}
+                default_reason = (
+                    "Candidate derived from the apparent ellipse; review the fit flags before interpretation."
                     if english
-                    else "表观值；尚未独立支持，故不发表"
+                    else "基于表观椭圆的候选值；解释前请结合拟合标记判读。"
+                )
+                quality_flags = [
+                    str(item)
+                    for item in (quality.get("flags") or ())
+                    if item
+                ]
+                candidate_flags = [
+                    str(item)
+                    for item in (candidate.get("flags") or ())
+                    if item
+                ]
+                flag_reason = ", ".join(dict.fromkeys(quality_flags + candidate_flags))
+                if flag_reason:
+                    default_reason = f"{default_reason} {flag_reason}"
+                if shape_issue:
+                    default_reason = (
+                        "Ellipse shape is not supported as a measured result; the fitted value is retained as a candidate."
+                        if english
+                        else "椭圆形状尚不支持作为测量结果；保留拟合值供判读。"
+                    )
+                    if flag_reason:
+                        default_reason = f"{default_reason} {flag_reason}"
+
+                def candidate_parameter(
+                    names: tuple[str, ...],
+                    quantity_names: tuple[str, ...],
+                ) -> tuple[Any, str, str, str]:
+                    value = next(
+                        (
+                            candidate.get(name)
+                            for name in names
+                            if candidate.get(name) not in (None, "")
+                        ),
+                        None,
+                    )
+                    state = "candidate"
+                    confidence = "limited"
+                    reason = default_reason
+                    parameter = next(
+                        (quantitative.get(name) for name in quantity_names if name in quantitative),
+                        None,
+                    )
+                    if isinstance(parameter, Mapping):
+                        parameter_value = next(
+                            (
+                                parameter.get(name)
+                                for name in ("candidate_value", "candidate", "value")
+                                if parameter.get(name) not in (None, "")
+                            ),
+                            None,
+                        )
+                        if parameter_value is not None:
+                            value = parameter_value
+                        state = str(_read(parameter, ("status",), state) or state)
+                        confidence = str(_read(parameter, ("confidence",), confidence) or confidence)
+                        reason = str(_read(parameter, ("reason",), reason) or reason)
+                    return value, state, confidence, reason
+
+                ln, ln_state, ln_confidence, ln_reason = candidate_parameter(
+                    (
+                        "Ln_candidate_from_minor_axis_nm",
+                        "Ln_from_minor_axis_nm",
+                        "L_N",
+                    ),
+                    ("Ln_from_minor_axis_nm", "Ln", "L_N"),
+                )
+                lz, lz_state, lz_confidence, lz_reason = candidate_parameter(
+                    (
+                        "Lz_candidate_from_draw_axis_nm",
+                        "Lz_from_draw_axis_nm",
+                        "L_z",
+                    ),
+                    ("Lz_from_draw_axis_nm", "Lz", "L_z"),
+                )
+                l_major, major_state, major_confidence, major_reason = candidate_parameter(
+                    (
+                        "L_candidate_from_major_axis_nm",
+                        "L_from_major_axis_nm",
+                    ),
+                    ("L_from_major_axis_nm", "L_major"),
                 )
                 if ln not in (None, ""):
                     extra.append(
                         (
                             "Ln candidate (nm)" if english else "Ln 候选（nm）",
                             None,
-                            None,
+                            f"{ln_state} · {ln_confidence}",
                             ln,
                             None,
-                            reason,
+                            ln_reason,
                         )
                     )
                 if lz not in (None, ""):
@@ -3537,10 +3669,10 @@ if QT_AVAILABLE:
                         (
                             "Lz candidate (nm)" if english else "Lz 候选（nm）",
                             None,
-                            None,
+                            f"{lz_state} · {lz_confidence}",
                             lz,
                             None,
-                            reason,
+                            lz_reason,
                         )
                     )
                 if l_major not in (None, ""):
@@ -3548,10 +3680,10 @@ if QT_AVAILABLE:
                         (
                             "L major candidate (nm)" if english else "长轴 L 候选（nm）",
                             None,
-                            None,
+                            f"{major_state} · {major_confidence}",
                             l_major,
                             None,
-                            reason,
+                            major_reason,
                         )
                     )
                 if extra:
@@ -4222,8 +4354,15 @@ if QT_AVAILABLE:
                 return
             self.applyToBatchRequested.emit({"analysis": self.analysis_settings, "edits": self.edits})
 
-        def set_batch_feedback(self, successes: Sequence[Any] = (), failures: Sequence[Any] = ()) -> None:
+        def set_batch_feedback(
+            self,
+            successes: Sequence[Any] = (),
+            failures: Sequence[Any] = (),
+            *,
+            limited: Sequence[Any] = (),
+        ) -> None:
             self._batch_success_count = len(list(successes))
+            self._batch_limited_count = len(list(limited))
             self._batch_failure_items = list(failures)
             self._render_batch_feedback()
 

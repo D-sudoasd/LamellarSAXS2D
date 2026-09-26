@@ -73,7 +73,7 @@ def test_annular_recipe_dispatch_and_sampling_coordinates_do_not_become_periods(
         "trace_method": "annular_peak", "stage": "evaluate", "resamples": 0,
         "sensitivity": False, "annular_radial_bins": 20,
     }, multistart=1)
-    assert result["method_version"] == "butterfly-annular-trajectory-v1.0"
+    assert result["method_version"] == "butterfly-annular-trajectory-v1.1"
     assert result["candidate_fit"]["q_star_from_arcs"] is None
     assert result["candidate_fit"]["L_from_observed_radius_nm"] is None
     assert result["candidate_fit"]["q_star_source"] == "unavailable_prescribed_annuli"

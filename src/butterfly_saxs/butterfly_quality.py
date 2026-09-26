@@ -45,6 +45,12 @@ def classify_ellipse_publication(
     else:
         flag_tokens = [str(item) for item in (flags or ()) if item]
     flag_text = ",".join(flag_tokens)
+    ratio = _finite(axis_ratio)
+    # A ring can fail the four-side butterfly test. Preserve that shape
+    # diagnosis independently of the quality of a double-ellipse fit.
+    if ((ratio is not None and ratio >= NEAR_CIRCULAR_AXIS_RATIO_MIN)
+            or "near_circular_ellipse_axis_unidentifiable" in flag_tokens):
+        return "ring"
     if quality in {"FAIL", "FAILED", "INVALID"}:
         return "fail"
     if any(
@@ -58,10 +64,7 @@ def classify_ellipse_publication(
         )
     ):
         return "ring"
-    ratio = _finite(axis_ratio)
     if ratio is not None:
-        if ratio >= NEAR_CIRCULAR_AXIS_RATIO_MIN:
-            return "ring"
         return "ellipse"
     return "undetermined"
 
@@ -87,21 +90,26 @@ def _finite(value):
 def _arc_rows(trace, candidate):
     """Read lossless per-arc evidence from either trace or fit payload."""
 
+    # The fit adds projection/normal-residual evidence to the traced support.
+    # Prefer those diagnostics over the pre-fit rows when both are present.
     candidates = []
+    if isinstance(candidate, Mapping):
+        candidates.extend((candidate.get("arc_diagnostics"), candidate.get("arc_support")))
     if isinstance(trace, Mapping):
         candidates.extend((trace.get("arc_diagnostics"), trace.get("arc_support")))
         diagnostics = trace.get("diagnostics")
         if isinstance(diagnostics, Mapping):
             candidates.extend((diagnostics.get("arc_diagnostics"), diagnostics.get("arc_support")))
-    if isinstance(candidate, Mapping):
-        candidates.extend((candidate.get("arc_diagnostics"), candidate.get("arc_support")))
-    elif isinstance(trace, Sequence) and not isinstance(trace, (str, bytes)):
+    if isinstance(trace, Sequence) and not isinstance(trace, (str, bytes)):
         candidates.append(trace)
     for value in candidates:
         if isinstance(value, Mapping):
             value = value.get("rows", value.get("arcs", value.get("records")))
-        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
-            return [dict(item) for item in value if isinstance(item, Mapping)]
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)) and value:
+            # Unassigned/rejected points remain in point diagnostics but are
+            # not an additional measured arc or a manually constrained arc.
+            return [dict(item) for item in value if isinstance(item, Mapping)
+                    and (_finite(item.get("arc_id")) is None or _finite(item["arc_id"]) >= 0)]
     return []
 
 
@@ -145,7 +153,17 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
     """Keep a candidate, its empirical support, and publishability separate."""
     trace = trace if isinstance(trace, Mapping) else {}
     candidate = candidate if isinstance(candidate, Mapping) else {}
-    points = [p for p in trace.get("points", []) if p.get("accepted", p.get("valid", False))
+    fit_points = candidate.get("point_diagnostics")
+    used_ids = None
+    if isinstance(fit_points, (list, tuple)) and fit_points:
+        used_ids = {str(p.get("point_id", index)) for index, p in enumerate(fit_points)
+                    if isinstance(p, Mapping) and p.get("used") is True}
+    points = [p for index, p in enumerate(trace.get("points", []))
+              if isinstance(p, Mapping) and p.get("accepted", p.get("valid", False))
+              and p.get("valid", True)
+              and (used_ids is None or str(p.get("point_id", index)) in used_ids)
+              and (_finite(p.get("arc_id")) is None or _finite(p["arc_id"]) >= 0)
+              and _finite(p.get("qx")) is not None and _finite(p.get("qy")) is not None
               and p.get("side") in ("upper", "lower") and p.get("branch_id") in (0, 1)]
     groups = {f"{branch}:{side}": sum(p.get("branch_id") == branch and p.get("side") == side
                                     for p in points)
@@ -160,6 +178,9 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
         common.append("insufficient_occupied_sides")
     if any(count < 3 for count in groups.values()):
         common.append("insufficient_independent_side_support")
+    if any(p.get("trajectory_confidence") == "low"
+           or p.get("trajectory_ambiguous") for p in points):
+        common.append("annular_trajectory_support_limited")
     ratio = _finite(candidate.get("axis_ratio"))
     if ratio is not None and ratio >= NEAR_CIRCULAR_AXIS_RATIO_MIN:
         common.append("near_circular_ellipse_axis_unidentifiable")
@@ -283,6 +304,12 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
                 common.append("held_out_arc_prediction_exceeds_localization")
     rows = {}
     b = _finite(candidate.get("b"))
+    geometry_usable = bool(
+        candidate.get("success") and qs
+        and a_value is not None and b is not None and 0 < b <= a_value
+        and ratio is not None and 0 < ratio <= 1
+        and _finite(candidate.get("theta_deg")) is not None
+    )
     width_scales = [v for p in points if (v := _finite(p.get("normal_fwhm_q")))
                     is not None and v > 0]
     bound_flags = candidate.get("bound_flags", {})
@@ -321,19 +348,31 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
             reasons.append("analysis_choice_topology_unstable")
         if not sensitivity.get("completed", False):
             reasons.append("analysis_choice_sensitivity_unassessed")
-        # No machine setting or human Accept click can self-certify coverage.
-        # Candidate/empirical information remains available even before the
-        # external evidence gate has closed.
         reasons = _dedupe_reasons(reasons)
-        support = "supported" if not reasons else "undetermined"
+        # Optional uncertainty work describes an estimate; it does not decide
+        # whether an already fitted numerical value can be inspected/exported.
+        assessment_only = {
+            "image_resampling_interval_unavailable",
+            "analysis_choice_sensitivity_unassessed",
+        }
+        empirical_reasons = [reason for reason in reasons if reason not in assessment_only]
+        support = "supported" if geometry_usable and not empirical_reasons else "undetermined"
         calibrated = bool(uncertainty.get("coverage_calibrated", False))
         publication_reasons = list(reasons)
         if not calibrated:
             publication_reasons.append("interval_coverage_not_calibrated")
+        available = geometry_usable and value is not None
+        publication_available = available and not publication_reasons
+        estimate_status = (
+            "unavailable" if not available else "available" if publication_available
+            else "estimate" if support == "supported" else "candidate"
+        )
         rows[name] = {
-            "value": value if not publication_reasons else None,
+            "value": value if available else None,
             "candidate_value": value,
-            "status": "available" if not publication_reasons else "undetermined",
+            "status": estimate_status,
+            "publication_status": "available" if publication_available else "not_assessed",
+            "confidence": "unavailable" if not available else "empirical" if support == "supported" else "limited",
             "empirical_status": support,
             "reason": "; ".join(_dedupe_reasons(publication_reasons)),
             "reasons": _dedupe_reasons(publication_reasons),
@@ -342,10 +381,19 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
             "unit": "degree" if name == "theta_deg" else "dimensionless" if name == "axis_ratio" else candidate.get("q_unit", "unknown"),
         }
     status = "supported" if all(r["empirical_status"] == "supported" for r in rows.values()) else "undetermined"
+    # Reusing a finite, resolved fit as an optimizer initial value is not a
+    # publication decision. Each subsequent frame is measured independently.
+    seed_blockers = {
+        "insufficient_occupied_sides", "insufficient_independent_side_support",
+        "near_circular_ellipse_axis_unidentifiable", "axis_ratio_collapsed_to_line",
+        "observed_support_infeasible", "ill_conditioned_geometry",
+        "residual_exceeds_localization_scale", "annular_trajectory_support_limited",
+    }
+    warm_start_eligible = geometry_usable and not seed_blockers.intersection(common)
     return {
         "quantitative_parameters": rows,
         "measurement_status": status,
-        "warm_start_eligible": status == "supported",
+        "warm_start_eligible": warm_start_eligible,
         "quality": {
             "status": (
                 "FAIL"
@@ -354,7 +402,7 @@ def evaluate_arc_evidence(trace, candidate, *, uncertainty=None, sensitivity=Non
             ),
             "engineering_status": "WARN" if status != "supported" else "PASS",
             "scientific_status": "NOT_ACCEPTED",
-            "scientific_reason": "Independent human/instrument evidence and a frozen dataset-specific gate are required",
+            "scientific_reason": "Numerical estimates and their limitations are retained; structural interpretation uses the image, calibration and model assumptions",
             "thresholds_version": "butterfly-arcs-engineering-provisional-v1",
             "thresholds_frozen": False,
             "metrics": {"side_counts": groups, "occupied_sides": occupied_sides,

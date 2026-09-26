@@ -8,12 +8,12 @@
 
 WingSAXS reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), builds physical `q`, `chi`, `qx`, and `qy` from a PONI file through pyFAI, traces observed butterfly arcs, and reports what the image actually supports:
 
-| A typical frame reports | Only when a radial reflection or interior ellipse is supported |
+| Observed data | Fitted estimates and interpretation |
 | --- | --- |
 | q-ring profiles, observed petal trajectories, quality, and flags | First-order `q*` and **L ring** = `2π/q*` |
-| Occupied sides and supported branches | Apparent `a`, `b/a`, `θ` |
+| Occupied sides and supported branches | Apparent `a`, `b/a`, `θ`, with support and confidence |
 | Missing lobes/rings remain missing | Unpublished **Ln / Lz / L major** candidates |
-| `ring` when the fit sits on a bound or the major axis runs away | Never a silent overwrite of user bounds or of ring L into the Ln column |
+| Ring diagnosis and explicit fit limitations | Boundary/extrapolated candidates remain available; ring L and Ln stay distinct |
 
 `success=True` is not scientific acceptance. Pixel-q never invents a physical period. Opposite quadrants are never fabricated.
 
@@ -21,15 +21,15 @@ WingSAXS reads calibrated detector frames (CBF, EDF, TIFF, NPY/NPZ, HDF5), build
 
 ![Synthetic butterfly pattern with an origin-centred double-ellipse overlay](docs/assets/refinement-ui.png)
 
-Synthetic demonstration (pixel-q): the Wang/Grubb double ellipse drawn on a generated butterfly. Real experimental frames more often support a first-order **ring** until an interior ellipse is actually identified.
+Synthetic demonstration (pixel-q): the empirical double ellipse drawn on a generated butterfly. Inspect the observed trajectories and confidence information alongside the overlay.
 
 ## What it does
 
 - **Butterfly arcs** (`ridge_method=butterfly_curvature`): curvature ridges, branch/side labels (QI+QIII vs QII+QIV), first-order family vs harmonics, sparse-ring fill. See the [butterfly arc guide](docs/butterfly_arcs_zh.md).
 - **Annular butterfly trajectories**: the new workbench session defaults to fixed-q annuli and angular profiles `I(χ)`, connecting up to four observed lobe maxima into long butterfly petals. Each ring retains its raw profile, counts, and coverage; missing lobes/rings remain missing. See the [annular trajectory guide](docs/annular_trajectories_zh.md).
 - **Independent radial diagnostics**: `radial_sector` measures fixed-χ `I(q)` profiles for a separate check. Its `q*` values are not the default butterfly trajectory or the primary ellipse input. See the [radial-sector guide](docs/sector_peaks_zh.md).
-- **Honest ellipse publication**: `flat_ellipse` (editable `b/a` bounds, default `0.005–0.35`) and `very_flat_ellipse`. A cap, floor, or major axis longer than the observed first-order ridge is **ring-only** — `a`, tilt, and ellipticity stay unpublished.
-- **Batch review**: independent frames, cancel/progress, checkpoints, streaming CSV/JSON/NPZ. The table shows `WARN · ring` / `WARN · ellipse`, L ring, and candidate-period tooltips. Warm-start stays quality-gated.
+- **Estimates with confidence**: the default `standard` fit follows the measured trajectories. Optional `flat_ellipse` / `very_flat_ellipse` presets supply explicit bounds. Finite boundary or extrapolated solutions remain inspectable candidates, with their support and limitations alongside the values.
+- **Batch review**: independent or warm-start fitting, cancel/progress, checkpoints, streaming CSV/JSON/NPZ. Limited results remain warning frames in the sequence; missing measurements remain gaps. Resolved geometry can initialize the next frame, which is refitted to its own data.
 - **Workbench**: Identify trajectories → Evaluate; bilingual UI; first-order ring overlay instead of a capped tilted ellipse; lamellar studio and 0.4 publication artboards are schematics, not a unique inversion ([studio](docs/lamellar_workbench_zh.md), [figures](docs/publication_figures_zh.md)).
 - **Optional `full2d`**: empirical whole-pixel intensity refinement. It is a different model from the butterfly geometry measurement.
 - **Measurement and fit figures**: export fixed-size SVG/PDF and high-resolution TIFF/PNG with source arrays, curve/profile CSVs, and checksums. Inspect measured data, candidate ellipses, overlays, and actual `full2d` predictions without promoting a candidate to a scientifically accepted result. See the [figure export guide](docs/butterfly_figures_zh.md).
@@ -81,7 +81,7 @@ Calibrated detector frame — geometry / butterfly measurement (not `--full2d`):
 ```bash
 bsaxs inspect data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy
 bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
-  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --ridge-method butterfly_curvature --ellipse-preset standard \
   --butterfly-stage evaluate --butterfly-resamples 0 \
   -o results/frame_0001
 ```
@@ -90,7 +90,7 @@ Folder of frames:
 
 ```bash
 bsaxs batch "data/frame_*.edf" --poni geometry/detector.poni --mask masks/detector.npy \
-  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --ridge-method butterfly_curvature --ellipse-preset standard \
   --butterfly-stage evaluate --mode independent \
   -o results/batch --checkpoint results/checkpoint.json
 ```
@@ -132,6 +132,7 @@ Agents (and any non-interactive operator) should start with `bsaxs describe` or 
 | Lamellar studio / publication artboards | [docs/lamellar_workbench_zh.md](docs/lamellar_workbench_zh.md), [docs/publication_figures_zh.md](docs/publication_figures_zh.md) |
 | P3 / P4 evidence | [docs/validation/benchmark_protocol.md](docs/validation/benchmark_protocol.md) |
 | 2D capability acceptance and remaining work | [docs/validation/2d_capability_acceptance_zh.md](docs/validation/2d_capability_acceptance_zh.md) |
+| Independent lamellar sequence and noise controls | [docs/validation/lamellar_sequence_zh.md](docs/validation/lamellar_sequence_zh.md) |
 
 ## Scientific scope
 
@@ -143,7 +144,7 @@ The double ellipse is an **empirical reciprocal-space measurement**. The current
 
 WingSAXS 面向取向层片的各向异性二维 SAXS 蝴蝶纹：用 PONI（pyFAI）得到物理 `q/chi/qx/qy`，提取固定 q 环的 `I(χ)` 花瓣轨迹，并只发表图像真正支持的量。
 
-只有在径向反射峰有明确支持、单位有效且级次解释另有依据时，才把 `q*` 换算为一阶环周期 **L = 2π/q***。annular 的 `q_annulus` 只是固定 q 环采样坐标。只有内凹椭圆真正成立时，才显示表观 `a`、`b/a`、`θ`，以及未发表的 **Ln / Lz / 长轴 L** 候选。贴在 `flat_ellipse` 上下界、或长轴超出观测支持的解，按 **仅环/候选限制** 处理，不会把求解器的倾角或环 L 写进 Ln 列。`success=True` 不是科学验收；像素 q 不能冒充物理周期；缺失象限不会被镜像补齐。
+有径向反射峰和物理 q 单位时，可报告 **L = 2π/q***，其级次与结构解释同时保留说明。annular 的 `q_annulus` 是固定 q 环采样坐标。表观 `a`、`b/a`、`θ` 和条件性的 **Ln / Lz / 长轴 L** 候选随拟合结果保留，并标明观测支持、可信度和限制；碰到边界或长轴超出观测范围时，数值仍可检查和导出。默认使用 `standard`，扁椭圆边界由用户明确选择。环 L 与 Ln 分列，缺失象限不镜像补齐，未标定的像素 q 不换算为 nm。
 
 ### 安装与启动
 
@@ -176,14 +177,14 @@ bsaxs describe
 bsaxs doctor --json
 bsaxs inspect data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy
 bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
-  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --ridge-method butterfly_curvature --ellipse-preset standard \
   --butterfly-stage evaluate --butterfly-resamples 0 -o results/frame_0001
 bsaxs analyze data/frame_0001.edf --poni geometry/detector.poni --mask masks/detector.npy \
   --butterfly-stage evaluate --butterfly-trace-method annular_peak \
   --annular-rings 40 --annular-angles 72 --butterfly-resamples 0 \
   -o results/frame_0001_annular
 bsaxs batch "data/frame_*.edf" --poni geometry/detector.poni --mask masks/detector.npy \
-  --ridge-method butterfly_curvature --ellipse-preset flat_ellipse \
+  --ridge-method butterfly_curvature --ellipse-preset standard \
   --butterfly-stage evaluate --mode independent -o results/batch
 bsaxs-gui data/frame_0001.edf --poni geometry/detector.poni
 ```

@@ -459,7 +459,7 @@ def _parameter_value(value: Any) -> tuple[float | None, bool, str]:
         )
         candidate_number = _finite(candidate) if candidate is not _MISSING else None
         candidate_status = (
-            status in {"candidate", "provisional", "undetermined"}
+            status in {"estimate", "candidate", "provisional", "undetermined"}
             or candidate_number is not None
             and status != "available"
         )
@@ -482,6 +482,11 @@ def _ellipse_components(
     q_unit = str(_read(ellipse, ("q_unit", "source_q_unit"), "unknown") or "unknown")
     parameters = _read(ellipse, ("parameters", "quantitative_parameters"), {})
     b_value = _read(ellipse, ("b", "semi_minor", "minor_axis"), _MISSING)
+    evidence = _read(ellipse, ("quantitative_parameters",), {})
+    if isinstance(evidence, Mapping) and isinstance(evidence.get("b"), Mapping):
+        # The raw solver alias is useful for calculation, but does not replace
+        # the parameter's evidence status when building a structural scene.
+        b_value = evidence["b"]
     b_candidate = False
     b_status = str(
         _read(ellipse, ("status", "identifiability_status"), "available") or "available"
@@ -531,7 +536,7 @@ def _ellipse_components(
         )
         if existing is not None and existing > 0.0:
             center_pair = (0.0, 0.0)
-    if b_status in {"candidate", "provisional", "undetermined"}:
+    if b_status in {"estimate", "candidate", "provisional", "undetermined"}:
         b_candidate = True
     return (
         b,

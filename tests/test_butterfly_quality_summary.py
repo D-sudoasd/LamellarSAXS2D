@@ -87,6 +87,26 @@ def test_summary_trace_and_evaluate_are_distinct(qtbot) -> None:
     page.close()
 
 
+def test_parameter_estimate_status_is_visible_without_promoting_it(qtbot) -> None:
+    page = _page(qtbot)
+    page.set_analysis_settings({"stage": "evaluate", "resamples": 0})
+    result = _result()
+    result["quantitative_parameters"] = {
+        "a": {
+            "value": 0.2,
+            "status": "estimate",
+            "confidence": "empirical",
+            "publication_status": "not_assessed",
+            "reason": "interval is not calibrated",
+        }
+    }
+    page.set_result(result)
+    assert page.quality_summary.state.status_key == "ellipse_candidate"
+    assert "parameter_candidates_require_review" in page.quality_summary.state.reasons
+    assert "估计值或候选值" in page.quality_summary.reason_label.text()
+    page.close()
+
+
 def test_summary_ring_only_and_poor_match_reasons_are_visible(qtbot) -> None:
     page = _page(qtbot)
     page.set_analysis_settings({"stage": "evaluate", "resamples": 32})
@@ -97,6 +117,7 @@ def test_summary_ring_only_and_poor_match_reasons_are_visible(qtbot) -> None:
     assert page.quality_summary.state.status_key == "ring_only"
     assert "axis_ratio_at_bound" in page.quality_summary.state.reasons
     assert "#fff5d6" in page.quality_summary.styleSheet()
+    assert "观测弧迹/峰轨迹" in page.quality_summary.next_label.text()
 
     near_circle = _result(flags=["near_circular_ellipse_axis_unidentifiable"])
     near_circle["candidate_fit"]["axis_ratio"] = 0.98
@@ -300,7 +321,7 @@ def test_excluded_count_batch_feedback_and_cell_tooltips_follow_language(qtbot) 
     assert "批处理" in page.batch_feedback_label.text()
     page.set_language("en")
     assert "excluded" in page.excluded_count_label.text()
-    assert "Batch applied" in page.batch_feedback_label.text()
+    assert "Batch completed" in page.batch_feedback_label.text()
     refreshed = page.quantity_table.item(0, 5)
     assert refreshed is not None
     assert refreshed.toolTip() == refreshed.text()

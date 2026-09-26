@@ -14,6 +14,22 @@ from butterfly_saxs.cli_contract import (
 from butterfly_saxs.errors import PipelineError
 
 
+def test_project_reports_warning_candidates_as_completed_not_failed_or_certified(monkeypatch, capsys):
+    import butterfly_saxs.cli as cli_module
+    from butterfly_saxs.batch import BatchRunResult, FrameFitResult
+
+    run = BatchRunResult(
+        [FrameFitResult("partial.npy", result={"parameters": {"a": 0.7}}, status="warning")],
+        mode="independent", input_hash="input", config_hash="config",
+    )
+    monkeypatch.setattr(cli_module, "run_project", lambda *args, **kwargs: run)
+    assert main(["project", "project.toml"]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["n_warning"] == report["n_completed"] == 1
+    assert report["n_success"] == report["n_failed"] == 0
+    assert report["frames"][0]["result"]["parameters"]["a"] == 0.7
+
+
 def test_cli_module_keeps_numpy_off_the_import_path() -> None:
     source = (Path(__file__).resolve().parents[1] / "src" / "butterfly_saxs" / "cli.py").read_text(
         encoding="utf-8"

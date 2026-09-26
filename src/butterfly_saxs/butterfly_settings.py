@@ -12,7 +12,9 @@ from .settings import strict_int
 # v2 records all-arc holdout and per-arc support diagnostics; v2.1 preserves
 # the input validity domain through include edits and records the prominence-
 # gated radial hint selection. Keep earlier outputs identifiable.
-METHOD_VERSION = "butterfly-curvature-arcs-v2.1"
+# v2.2 separates usable estimates from uncertainty assessment and excludes
+# unassigned background points from the observed-arc evidence summary.
+METHOD_VERSION = "butterfly-curvature-arcs-v2.2"
 MAX_RESAMPLES = 10_000
 
 

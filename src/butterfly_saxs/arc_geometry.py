@@ -325,6 +325,11 @@ def _parse_points(
                 reason = "unknown_side"
             elif isinstance(arc_id, (bool, np.bool_)) or not isinstance(arc_id, Integral):
                 reason = "malformed_arc_id"
+            elif int(arc_id) < 0:
+                # Negative IDs are the tracer's unassigned sentinel. A
+                # rejected observation may retain this ID for diagnostics,
+                # but it cannot define a fitted arc.
+                reason = "unassigned_arc_id"
             elif sigma is None or sigma <= 0.0:
                 reason = "malformed_localization_sigma_q"
             else:
@@ -384,6 +389,25 @@ def _parse_points(
                     diagnostic["side"] = raw.get("side")
                 if isinstance(raw.get("arc_id"), Integral) and not isinstance(raw.get("arc_id"), (bool, np.bool_)):
                     diagnostic["arc_id"] = int(raw["arc_id"])
+                support_status = raw.get("support_status")
+                observed_support = raw.get("observed_support")
+                if support_status is None and isinstance(observed_support, Mapping):
+                    support_status = observed_support.get(
+                        "status", observed_support.get("support_status")
+                    )
+                has_manual_bounds = bool(
+                    {"arc_t_min", "arc_t_max", "arc_t_intervals", "manual_t_intervals"}
+                    .intersection(raw)
+                )
+                if support_status is None:
+                    support_status = "manual_only" if has_manual_bounds else "unavailable"
+                diagnostic["support_status"] = str(support_status)
+                component_count = _as_finite(raw.get("support_component_count"))
+                gap_count = _as_finite(raw.get("support_gap_count"))
+                diagnostic["support_component_count"] = (
+                    max(0, int(component_count)) if component_count is not None else 0
+                )
+                diagnostic["support_gap_count"] = max(0, int(gap_count)) if gap_count is not None else 0
             point_diagnostics.append(diagnostic)
             continue
         diagnostic.update(
@@ -457,6 +481,8 @@ def _parse_points(
         side = diagnostic.get("side")
         if not isinstance(arc_id, Integral) or isinstance(arc_id, (bool, np.bool_)):
             continue
+        if int(arc_id) < 0:
+            continue
         arc = arc_records.setdefault(
             int(arc_id),
             {
@@ -467,6 +493,9 @@ def _parse_points(
                 "n_used": 0,
                 "n_excluded": 0,
                 "metadata_consistent": True,
+                "support_status": diagnostic.get("support_status", "unavailable"),
+                "support_component_count": int(diagnostic.get("support_component_count", 0) or 0),
+                "support_gap_count": int(diagnostic.get("support_gap_count", 0) or 0),
             },
         )
         if arc.get("branch_id") != branch or arc.get("side") != side:
@@ -506,7 +535,12 @@ def _parse_points(
                     "reason": "mixed_arc_metadata",
                 }
             )
-        if diagnostic.get("excluded") and isinstance(arc_id, Integral) and not isinstance(arc_id, (bool, np.bool_)):
+        if (
+            diagnostic.get("excluded")
+            and isinstance(arc_id, Integral)
+            and not isinstance(arc_id, (bool, np.bool_))
+            and int(arc_id) >= 0
+        ):
             arc = arc_records.setdefault(
                 int(arc_id),
                 {
@@ -1217,27 +1251,12 @@ def _parameter_set_for_arcs(
 ) -> ParameterSet:
     result = _make_parameter_set(points, parameters)
     if parameters is None:
-        # The arc API is designed for q-space data already centred at the
-        # calibrated origin.  Keep this as an editable explicit choice rather
-        # than allowing the point median to become a hidden fitted centre.
-        result["cx"] = result["cx"].copy(value=0.0, vary=False, name="cx")
-        result["cy"] = result["cy"].copy(value=0.0, vary=False, name="cy")
+        # Re-express the data-derived orientation relative to the shared
+        # reference axis.  Center and axis ratio remain free under their
+        # physical bounds; the arc solver must not impose a hidden centered or
+        # very-flat prior when callers selected the standard fit.
         relative = (result["theta"].value - reference_axis + _HALF_PI) % math.pi - _HALF_PI
         result["theta"].set_value(relative)
-        # Short-arc closest-point fits collapse onto a line unless the
-        # butterfly very-flat prior keeps b/a away from zero.  Callers that
-        # pass an explicit mapping keep their own bounds.
-        ratio = result["axis_ratio"]
-        ratio_min = 0.005 if ratio.min is None or float(ratio.min) <= 10.0 * np.finfo(float).eps else float(ratio.min)
-        ratio_max = 0.35 if ratio.max is None or float(ratio.max) >= 1.0 else float(ratio.max)
-        if ratio_min > ratio_max:
-            ratio_min, ratio_max = 0.005, 0.35
-        result["axis_ratio"] = ratio.copy(
-            value=float(np.clip(ratio.value, ratio_min, ratio_max)),
-            min=ratio_min,
-            max=ratio_max,
-            name="axis_ratio",
-        )
 
     theta_spec = result["theta"]
     lower = max(0.0, theta_spec.min if theta_spec.min is not None else 0.0)
@@ -1703,7 +1722,7 @@ def _update_diagnostics(
         arc["support_violation_q_max"] = float(np.max(support_violations)) if support_violations.size else None
         arc["support_infeasible"] = bool(invalid_count > 0)
         arc.setdefault("support_gap_count", 0)
-        arc.setdefault("support_status", "manual_only")
+        arc.setdefault("support_status", "unavailable")
         arc["evidence_status"] = "incomplete" if invalid_count or not normal_residuals.size else "observed"
     _update_mirror_evidence(
         point_diagnostics,

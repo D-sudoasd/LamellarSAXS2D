@@ -777,13 +777,15 @@ def test_run_project_isolates_exceptions_and_quality_failures(
         )
     )
 
-    assert [item.status for item in run.frame_results] == ["ok", "failed", "failed", "ok"]
+    assert [item.status for item in run.frame_results] == ["ok", "failed", "warning", "ok"]
     assert [name for name, _ in calls] == [path.name for path in inputs]
     assert calls[1][1] == {"a": 1.25}
     assert calls[2][1] == {"a": 1.25}
     assert calls[3][1] == {"a": 1.25}
     assert "OSError: simulated read failure" in (run.frame_results[1].error or "")
-    assert "ellipse_fit" in (run.frame_results[2].error or "")
+    assert run.frame_results[2].error is None
+    assert "ellipse_fit.success=False" in (run.frame_results[2].diagnostic or "")
+    assert run.frame_results[2] in run.successful
     assert checkpoint.exists()
     assert (tmp_path / "results" / "frame1.json").exists()
     assert (tmp_path / "results" / "frame3.json").exists()

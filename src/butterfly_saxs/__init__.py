@@ -11,7 +11,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "PublicationStyle": (".publication_models", "PublicationStyle"),

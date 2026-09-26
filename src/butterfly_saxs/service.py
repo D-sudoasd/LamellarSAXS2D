@@ -235,7 +235,9 @@ def _stash_unpublished_periods(
     bound_flags = ellipse.get("bound_flags") if isinstance(ellipse, Mapping) else {}
     if isinstance(candidate, Mapping) and candidate.get("bound_flags"):
         bound_flags = candidate.get("bound_flags")
-    if isinstance(published_b, Mapping) and published_b.get("value") is not None:
+    if (isinstance(published_b, Mapping)
+            and published_b.get("status") == "available"
+            and published_b.get("value") is not None):
         return
     ln_candidate = geometry_parameters.get("Ln_from_minor_axis_nm")
     lz_candidate = geometry_parameters.get("Lz_from_draw_axis_nm")
@@ -271,6 +273,30 @@ def _withhold_unpublished_shape_parameters(geometry_parameters: dict[str, Any]) 
         "semi_minor", "axes_ratio", "ellipticity", "eccentricity",
     ):
         geometry_parameters.pop(alias, None)
+
+
+def _candidate_geometry_parameters(ellipse: Any, candidate: Any) -> dict[str, float]:
+    """Retain finite optimizer values separately from the measurement summary."""
+
+    values: dict[str, float] = {}
+    for source in (ellipse, candidate):
+        if not isinstance(source, Mapping):
+            continue
+        parameters = source.get("parameters", source.get("parameter_values", {}))
+        for name in (
+            "a", "b", "axis_ratio", "theta_deg", "center_qx", "center_qy",
+            "Ln_from_minor_axis_nm", "Lz_from_draw_axis_nm", "L_from_major_axis_nm",
+        ):
+            raw = source.get(name)
+            if raw is None and isinstance(parameters, Mapping):
+                raw = parameters.get(name)
+            try:
+                value = float(raw)
+            except (ValueError, TypeError):
+                continue
+            if np.isfinite(value):
+                values[name] = value
+    return values
 
 
 def _ring_only_butterfly_shape(ellipse: Any, candidate: Any, butterfly: Any) -> bool:
@@ -1991,6 +2017,7 @@ class ButterflyAnalysisService:
             geometry_q_unit = str(ellipse.get("q_unit", "unknown") or "unknown")
             result["intensity_parameters"] = deepcopy(result.get("parameters", {}))
             result["geometry_parameters"] = geometry_parameters
+            result["candidate_geometry_parameters"] = _candidate_geometry_parameters(ellipse, candidate)
             result["geometry_metrics"] = {
                 "rmse": geometry_rmse,
                 "ndata": geometry_ndata,
@@ -2123,6 +2150,7 @@ class ButterflyAnalysisService:
         # geometry-only measurement.
         result["intensity_parameters"] = intensity_parameters
         result["geometry_parameters"] = deepcopy(geometry_parameters)
+        result["candidate_geometry_parameters"] = _candidate_geometry_parameters(ellipse, candidate)
         result["geometry_parameter_units"] = {
             "a": geometry_q_unit,
             "b": geometry_q_unit,
@@ -2382,17 +2410,6 @@ class ButterflyAnalysisService:
                 and len(window) == 2
             ):
                 analysis["q_min"], analysis["q_max"] = window[0], window[1]
-            ellipse = dict(analysis.get("ellipse") or {})
-            preset = str(ellipse.get("preset", analysis.get("ellipse_preset", "standard")) or "standard")
-            if preset.strip().lower().replace("-", "_") in {"", "standard"}:
-                seeded = {
-                    name: ellipse[name]
-                    for name in ("a", "b", "axis_ratio", "center_qx", "center_qy", "angle_deg")
-                    if name in ellipse and ellipse[name] is not None
-                }
-                seeded["preset"] = "flat_ellipse"
-                analysis["ellipse"] = seeded
-                analysis["ellipse_preset"] = "flat_ellipse"
             return analysis
 
         def analyze_with_state(frame: Any, initial: Any = None, *, warm_start: bool = False, config: Any = None) -> dict[str, Any]:
@@ -2578,6 +2595,7 @@ class ButterflyAnalysisService:
                     "time": _read(item.frame, ("time",), None),
                     "status": item.status,
                     "error": item.error,
+                    "diagnostic": item.diagnostic,
                     "traceback": item.traceback,
                     "warm_start_from": item.warm_start_from,
                     "elapsed_s": item.elapsed_s,
@@ -2601,6 +2619,18 @@ class ButterflyAnalysisService:
                     "parameters": _read(result, ("parameters",), {}),
                     "geometry_parameters": _read(
                         result, ("geometry_parameters",), {}
+                    ),
+                    "candidate_geometry_parameters": _read(
+                        result, ("candidate_geometry_parameters",), {}
+                    ),
+                    "quantitative_parameters": _read(
+                        _read(result, ("butterfly",), {}), ("quantitative_parameters",), {}
+                    ),
+                    "measurement_status": _read(
+                        _read(result, ("butterfly",), {}), ("measurement_status",), None
+                    ),
+                    "warm_start_eligible": _read(
+                        _read(result, ("butterfly",), {}), ("warm_start_eligible",), False
                     ),
                     "intensity_parameters": _read(
                         result, ("intensity_parameters",), {}
