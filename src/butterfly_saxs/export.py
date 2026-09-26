@@ -646,6 +646,61 @@ def _quality_summary(value: Any) -> dict[str, Any]:
     }
 
 
+def _radial_arc_summary(value: Any) -> dict[str, Any]:
+    """Flatten radial-hint and observed-arc comparison data for frame CSVs."""
+
+    geometry = _as_mapping(_value(value, "geometry_parameters", default=None)) or {}
+    butterfly = _value(value, "butterfly", default=None)
+    if butterfly is None:
+        butterfly = _value(_value(value, "observables", default={}), "butterfly", default=None)
+    candidate = _value(butterfly, "candidate_fit", default={})
+    candidate_parameters = _value(candidate, "parameters", "parameter_values", default={})
+    comparison = _value(geometry, "radial_arc_comparison", default=_MISSING)
+    if comparison is _MISSING:
+        comparison = _value(candidate, "radial_arc_comparison", default={})
+
+    def geometry_or_candidate(name: str, *, parameter_value: bool = False) -> Any:
+        result_value = _value(geometry, name, default=_MISSING)
+        if result_value is not _MISSING:
+            return result_value
+        if parameter_value:
+            result_value = _value(candidate_parameters, name, default=_MISSING)
+            if result_value is not _MISSING:
+                return result_value
+        return _value(candidate, name, default=None)
+
+    q_unit = _value(comparison, "q_unit", default=_MISSING)
+    if q_unit is _MISSING:
+        q_unit = _value(candidate, "q_unit", default=_MISSING)
+    if q_unit is _MISSING:
+        q_unit = _value(_value(value, "geometry_metrics", default={}), "q_unit", default="")
+    return {
+        "observed_arc_q_median": _scalar(
+            geometry_or_candidate("observed_arc_q_median", parameter_value=True)
+        ),
+        "radial_hint_q": _scalar(
+            geometry_or_candidate("radial_hint_q", parameter_value=True)
+        ),
+        "radial_arc_comparison_q_unit": _scalar(q_unit),
+        "radial_hint_selection_status": _scalar(
+            geometry_or_candidate("radial_hint_selection_status")
+        ),
+        "radial_hint_reason": _scalar(geometry_or_candidate("radial_hint_reason")),
+        "observed_arc_q_source": _scalar(
+            geometry_or_candidate("observed_arc_q_source")
+        ),
+        "radial_arc_comparison_status": _scalar(
+            _value(comparison, "status", default=None)
+        ),
+        "radial_hint_to_observed_arc_ratio": _scalar(
+            _value(comparison, "radial_hint_to_observed_arc_ratio", default=None)
+        ),
+        "radial_arc_comparison_signed_relative_difference": _scalar(
+            _value(comparison, "signed_relative_difference", default=None)
+        ),
+    }
+
+
 def _frame_summary_rows(results: Sequence[FrameFitResult]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for index, item in enumerate(results):
@@ -738,6 +793,7 @@ def _frame_summary_rows(results: Sequence[FrameFitResult]) -> list[dict[str, Any
                 or _value(result, "q_star_source", default=None)
             ),
         )
+        row.update(_radial_arc_summary(result))
         row.setdefault(
             "ellipse_kind",
             _scalar(
@@ -1234,6 +1290,10 @@ class StreamingBatchExporter:
     _FRAME_COLUMNS = [
         "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error", "diagnostic",
         "quality_status", "confidence", "confidence_reason", "quality_diagnostic",
+        "observed_arc_q_median", "radial_hint_q", "radial_arc_comparison_q_unit",
+        "radial_hint_selection_status", "radial_hint_reason", "observed_arc_q_source",
+        "radial_arc_comparison_status", "radial_hint_to_observed_arc_ratio",
+        "radial_arc_comparison_signed_relative_difference",
         "warm_start_from", "elapsed_s", "resumed", "flags", "scientific_flags",
         "parameters_json",
     ]
@@ -1834,6 +1894,15 @@ def export_batch(
             "q_star_from_arcs",
             "L_from_observed_radius_nm",
             "q_star_source",
+            "observed_arc_q_median",
+            "radial_hint_q",
+            "radial_arc_comparison_q_unit",
+            "radial_hint_selection_status",
+            "radial_hint_reason",
+            "observed_arc_q_source",
+            "radial_arc_comparison_status",
+            "radial_hint_to_observed_arc_ratio",
+            "radial_arc_comparison_signed_relative_difference",
             "error",
             "diagnostic",
             "warm_start_from",

@@ -10,11 +10,49 @@ pytest.importorskip("PySide6")
 from PySide6 import QtCore, QtWidgets
 
 from butterfly_saxs.ui import MainWindow, create_app
-from butterfly_saxs.ui.i18n import CATALOGS, LANGUAGE_SETTING_KEY, validate_language
+from butterfly_saxs.ui.i18n import (
+    CATALOGS,
+    LANGUAGE_SETTING_KEY,
+    translate_q_star_source,
+    validate_language,
+)
 
 
 def _settings(path) -> QtCore.QSettings:
     return QtCore.QSettings(str(path), QtCore.QSettings.Format.IniFormat)
+
+
+@pytest.mark.parametrize(
+    ("source", "zh_label", "en_label"),
+    [
+        ("first_order_iq", "径向强度峰（首阶候选）", "radial I(q) peak (candidate first order)"),
+        (
+            "observed_arc_radius_not_order_assigned",
+            "观测弧半径（级次未确定）",
+            "observed arc radius (order unassigned)",
+        ),
+        (
+            "observed_arc_radius",
+            "观测弧半径（级次未确定）",
+            "observed arc radius (order unassigned)",
+        ),
+        (
+            "unavailable_prescribed_annuli",
+            "预设环采样（无径向峰位）",
+            "prescribed annuli (no radial peak position)",
+        ),
+        ("unavailable", "不可用", "unavailable"),
+        ("selected_sector_peak_median", "扇区峰位中位数", "selected-sector peak median"),
+        (
+            "median of selected sector-profile peaks",
+            "扇区峰位中位数",
+            "selected-sector peak median",
+        ),
+    ],
+)
+def test_q_star_source_codes_have_human_labels(source, zh_label, en_label) -> None:
+    assert translate_q_star_source("zh_CN", source) == zh_label
+    assert translate_q_star_source("en", source) == en_label
 
 
 class _PreviewEngine:
@@ -414,6 +452,8 @@ def test_measurement_terms_and_booleans_retranslate_without_changing_raw_data(
                 "n_points": 48,
                 "success": False,
                 "flags": ["raw_ellipse_flag"],
+                "q_star_from_arcs": 0.092,
+                "q_star_source": "first_order_iq",
             },
             "phi_app_deg": 22.5,
             "alpha_candidate_deg": 11.25,
@@ -421,6 +461,7 @@ def test_measurement_terms_and_booleans_retranslate_without_changing_raw_data(
         }
     }
     window._update_measurements(result)
+    window._last_result = result
 
     user_role = QtCore.Qt.ItemDataRole.UserRole
     assert window.lobe_table.horizontalHeaderItem(4).text() == "半高宽（deg）"
@@ -436,9 +477,10 @@ def test_measurement_terms_and_booleans_retranslate_without_changing_raw_data(
     assert window.ellipse_table.item(5, 0).text() == "短轴换算 Ln（nm）"
     assert window.ellipse_table.item(6, 0).text() == "拉伸轴换算 Lz（nm）"
     assert window.ellipse_table.item(7, 0).text() == "长轴换算 L（nm）"
-    assert window.ellipse_table.item(8, 0).text() == "一阶环 L（nm）"
-    assert window.ellipse_table.item(9, 0).text() == "一阶 q*"
+    assert window.ellipse_table.item(8, 0).text() == "径向周期候选 L（nm）"
+    assert window.ellipse_table.item(9, 0).text() == "q* 候选"
     assert window.ellipse_table.item(10, 0).text() == "q* 来源"
+    assert window.ellipse_table.item(10, 1).text() == "径向强度峰（首阶候选）"
     assert window.ellipse_table.item(13, 0).text() == "点数"
     assert window.ellipse_table.item(14, 0).text() == "求解成功"
     assert window.ellipse_table.item(14, 1).text() == "False"
@@ -464,8 +506,9 @@ def test_measurement_terms_and_booleans_retranslate_without_changing_raw_data(
     assert window.ellipse_table.item(4, 0).text() == "theta (ellipse axis, deg)"
     assert window.ellipse_table.item(5, 0).text() == "Ln from minor axis (nm)"
     assert window.ellipse_table.item(7, 0).text() == "L from major axis (nm)"
-    assert window.ellipse_table.item(8, 0).text() == "L from first-order ring (nm)"
-    assert window.ellipse_table.item(9, 0).text() == "q* (first-order)"
+    assert window.ellipse_table.item(8, 0).text() == "Radial period candidate L (nm)"
+    assert window.ellipse_table.item(9, 0).text() == "q* candidate"
+    assert window.ellipse_table.item(10, 1).text() == "radial I(q) peak (candidate first order)"
     assert window.measurement_observables is raw_observables
     window.close()
 

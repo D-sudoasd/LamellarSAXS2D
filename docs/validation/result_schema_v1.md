@@ -570,6 +570,32 @@ P0–P2/R0 运行必须记录实际命令、环境、PONI/mask/manifest/config/c
 `value=null`。条件性椭圆周期继续使用候选字段。`warm_start_eligible`
 描述当前拟合能否用作后续优化的初值，不代表结构解释已被确认。
 
+蝴蝶候选拟合还可同时保留两种不同的 q-space 证据：`observed_arc_q_median`
+是拟合器实际使用的有限弧点 `|q|` 中位数，单位取自同一候选的 `q_unit`；它描述
+弧点所在半径，不指定反射级次，也不单独等同于 Bragg `q*`。`radial_hint_q`、
+`radial_hint_selection_status` 与 `radial_hint_reason` 描述径向平均强度剖面的峰候选
+及其选择状态。`radial_arc_comparison` 记录两值、单位、径向提示/弧点中位数的比值
+以及有符号相对差 `(radial_hint_q - observed_arc_q_median) /
+observed_arc_q_median`；这些差异是数值诊断，不能单独判为谐波或错误级次。
+在 annular 方法中，这些点坐标来自预设采样环；`observed_arc_q_source` 与
+`radial_arc_comparison.status` 必须标为 `prescribed_annulus_coordinates`。该坐标统计
+不构成径向峰或周期测量；此时 `q_star_source="unavailable_prescribed_annuli"`，
+`q_star_from_arcs` 与 `L_from_observed_radius_nm` 保持 null。
+
+兼容字段 `q_star_from_arcs`、`L_from_observed_radius_nm` 保留既有输出，读取时必须
+同时检查 `q_star_source`。只有 `radial_hint_selection_status="selected"` 时，径向
+提示才用于这两个字段；`ambiguous`、`no_hint`、`not_used` 或缺少状态时，不把提示当作
+已选峰，候选周期改由弧点半径统计提供。此时 `q_star_source` 为
+`observed_arc_radius_not_order_assigned`，表示观测半径的派生候选，不是已确认的
+Bragg 周期。径向提示被选中时来源为 `first_order_iq`。以上 q 值沿用 `q_unit`，不带
+`_nm_inv` 后缀；只有实际单位可换算且来源解释成立时，长度字段才以 nm 报告。
+
+`diagnostics.radial_population` 记录观测弧点是否存在明显分离的径向群。
+缺少有效峰位提示时，各群继续保留，`keep="all_observed"`、
+`selection_status="ambiguous"`；两群的 q 范围和点数分别记录，质量说明包含
+`mixed_radial_populations`。这时全部拟合点的半径中位数仍是描述性统计，
+不代表已经选定一个共同反射级次。用户可根据原始强度选择目标 q 范围并比较拟合。
+
 批次保持输入顺序，含有限观测或候选的受限结果可使用 `warning` 状态；
 读取异常或无可用结果使用 `failed`。`n_completed` 包括 ok 和 warning，
 `n_success` 仅包括 ok，`n_warning` 单列。JSON 中非有限数值仍为 null。

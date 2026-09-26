@@ -22,7 +22,7 @@ from ..settings import canonical_q_unit
 from .qt_compat import QT_AVAILABLE, QtCore, QtGui, QtWidgets, require_qt
 from .qspace import QSpaceView, _point_is_accepted
 from .butterfly_export import export_butterfly_analysis
-from .i18n import translate
+from .i18n import translate, translate_q_star_source
 from .butterfly_summary import ButterflyQualitySummary
 
 try:
@@ -2542,7 +2542,21 @@ if QT_AVAILABLE:
             self._render_excluded_count()
             self._render_batch_feedback()
             self._render_page_status()
+            self._retranslate_q_star_source_cells()
             self._sync_action_state()
+
+        def _retranslate_q_star_source_cells(self) -> None:
+            for row in range(self.quantity_table.rowCount()):
+                item = self.quantity_table.item(row, 2)
+                if item is None or item.data(QtCore.Qt.ItemDataRole.UserRole + 1) != "q_star_source":
+                    continue
+                text = translate_q_star_source(
+                    self._language,
+                    item.data(QtCore.Qt.ItemDataRole.UserRole),
+                )
+                display = "" if text is None else str(text)
+                item.setText(display)
+                item.setToolTip(display)
 
         def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802 - Qt API
             if watched is getattr(self, "point_list", None) and event.type() == QtCore.QEvent.Type.KeyPress:
@@ -3695,17 +3709,27 @@ if QT_AVAILABLE:
                     continue
                 row = self.quantity_table.rowCount()
                 self.quantity_table.insertRow(row)
+                is_q_star_source = str(name) == str(q_star_label) and status not in (None, "")
+                display_status = (
+                    translate_q_star_source(self._language, status)
+                    if is_q_star_source
+                    else status
+                )
                 for column, text in enumerate(
                     (
                         str(name),
                         _fmt(value),
-                        "" if status is None else str(status),
+                        "" if display_status is None else str(display_status),
                         _fmt(candidate_value),
                         "" if interval is None else str(interval),
                         "" if reason is None else str(reason),
                     )
                 ):
                     self._set_quantity_cell(row, column, text)
+                if is_q_star_source:
+                    source_item = self.quantity_table.item(row, 2)
+                    source_item.setData(QtCore.Qt.ItemDataRole.UserRole, status)
+                    source_item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, "q_star_source")
 
         def _on_point_selected(self, point: Any) -> None:
             if not isinstance(point, Mapping):

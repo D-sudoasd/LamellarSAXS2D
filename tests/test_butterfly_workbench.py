@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Mapping
+
 import numpy as np
 import pytest
 
@@ -89,6 +91,33 @@ def test_butterfly_page_actions_pass_trace_and_evaluate_recipes(qtbot):
     evaluate = [payload for kind, payload in engine.calls if kind == "refine_geometry"][-1]
     assert evaluate["analysis"]["butterfly"]["stage"] == "evaluate"
     assert evaluate["analysis"]["butterfly"]["resamples"] == 32
+    window.close()
+
+
+def test_q_star_source_labels_follow_ui_language_and_keep_machine_value(qtbot):
+    window = MainWindow(engine=object(), auto_preview=False, language="zh_CN")
+    qtbot.addWidget(window)
+    page = window.butterfly_workbench
+    source = "observed_arc_radius_not_order_assigned"
+    page.set_result(
+        {
+            "points": [],
+            "candidate_fit": {"q_star_from_arcs": 0.1, "q_star_source": source},
+            "quality": {"status": "WARN", "metrics": {"side_counts": {}}},
+            "quantitative_parameters": {},
+        }
+    )
+    row = next(
+        index
+        for index in range(page.quantity_table.rowCount())
+        if page.quantity_table.item(index, 0).text() == "一阶 q*"
+    )
+    assert page.quantity_table.item(row, 2).text() == "观测弧半径（级次未确定）"
+    assert page.quantity_table.item(row, 2).data(QtCore.Qt.ItemDataRole.UserRole) == source
+
+    page.set_language("en")
+    assert page.quantity_table.item(row, 2).text() == "observed arc radius (order unassigned)"
+    assert page._result["candidate_fit"]["q_star_source"] == source
     window.close()
 
 
@@ -388,6 +417,12 @@ def test_actual_service_arc_ids_resolve_to_contiguous_visible_segments(qtbot):
     state = service.set_observed(case["image"], qmap=case["qmap"])
     result = service.measure_geometry(payload=state)
     payload = result["butterfly"]
+    assert isinstance(payload, Mapping), (
+        "service.measure_geometry returned no butterfly evidence; "
+        f"flags={result.get('flags')!r}; "
+        f"metrics_flags={result.get('metrics', {}).get('flags')!r}; "
+        f"analysis={result.get('analysis')!r}"
+    )
     view = QSpaceView()
     qtbot.addWidget(view)
     view.set_data(case["image"], qx=case["qmap"].qx, qy=case["qmap"].qy)

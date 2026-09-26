@@ -30,6 +30,55 @@ from butterfly_saxs.export import StreamingBatchExporter
 from butterfly_saxs.cancellation import AnalysisCancelled
 
 
+def test_measure_geometry_copies_radial_arc_scalars_and_keeps_comparison_diagnostic(
+    monkeypatch,
+) -> None:
+    service = ButterflyAnalysisService()
+    candidate = {
+        "parameters": {"observed_arc_q_median": 0.41, "radial_hint_q": None},
+        "radial_hint_selection_status": "no_radial_hint",
+        "radial_hint_reason": None,
+        "observed_arc_q_source": "accepted_arc_point_coordinates",
+        "radial_arc_comparison": {
+            "status": "radial_hint_unavailable",
+            "q_unit": "nm^-1",
+            "radial_hint_to_observed_arc_ratio": None,
+            "signed_relative_difference": None,
+        },
+    }
+    monkeypatch.setattr(
+        service,
+        "_state",
+        lambda payload: (None, None, [], None, None, None),
+    )
+    monkeypatch.setattr(
+        service,
+        "preview",
+        lambda **kwargs: {
+            "parameters": {},
+            "ellipse_fit": {
+                "parameters": {},
+                "q_unit": "unknown",
+                "success": True,
+                "rmse": 0.03,
+                "n_points": 12,
+            },
+            "butterfly": {"candidate_fit": candidate},
+        },
+    )
+
+    result = service.measure_geometry()
+
+    geometry = result["geometry_parameters"]
+    assert geometry["observed_arc_q_median"] == pytest.approx(0.41)
+    assert geometry["radial_hint_q"] is None
+    assert geometry["radial_hint_selection_status"] == "no_radial_hint"
+    assert geometry["radial_hint_reason"] is None
+    assert geometry["observed_arc_q_source"] == "accepted_arc_point_coordinates"
+    assert "radial_arc_comparison" not in geometry
+    assert result["geometry_metrics"]["q_unit"] == "nm^-1"
+
+
 def test_butterfly_refine_passes_flat_ellipse_bounds_to_solver(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -418,25 +467,48 @@ def test_service_batch_butterfly_stage_uses_standard_fit_and_keeps_warning_candi
         seen.append(analysis)
         return {
             "parameters": {"amplitude_plus": {"value": 1.0}},
-            "geometry_parameters": {
-                "a": 0.72,
-                "b": 0.0144,
-                "axis_ratio": 0.02,
-                "theta_deg": 17.0,
-                "Ln_candidate_from_minor_axis_nm": 436.0,
-                "Lz_candidate_from_draw_axis_nm": 8.7,
-            },
+                "geometry_parameters": {
+                    "a": 0.72,
+                    "b": 0.0144,
+                    "axis_ratio": 0.02,
+                    "theta_deg": 17.0,
+                    "observed_arc_q_median": 0.41,
+                    "radial_hint_q": None,
+                    "radial_hint_selection_status": "no_radial_hint",
+                    "radial_hint_reason": None,
+                    "observed_arc_q_source": "accepted_arc_point_coordinates",
+                    "Ln_candidate_from_minor_axis_nm": 436.0,
+                    "Lz_candidate_from_draw_axis_nm": 8.7,
+                },
             "ellipse_fit": {
                 "rmse": 0.01,
                 "success": True,
-                "q_unit": "nm^-1",
+                "q_unit": "unknown",
                 "Ln_from_minor_axis_nm": 436.0,
                 "Lz_from_draw_axis_nm": 8.7,
             },
             "butterfly": {
                 "candidate_fit": {
                     "success": True,
-                    "parameters": {"a": 0.72, "b": 0.0144, "axis_ratio": 0.02, "theta_deg": 17.0},
+                    "parameters": {
+                        "a": 0.72,
+                        "b": 0.0144,
+                        "axis_ratio": 0.02,
+                        "theta_deg": 17.0,
+                        "observed_arc_q_median": 0.41,
+                        "radial_hint_q": None,
+                    },
+                    "radial_hint_selection_status": "no_radial_hint",
+                    "radial_hint_reason": None,
+                    "observed_arc_q_source": "accepted_arc_point_coordinates",
+                    "radial_arc_comparison": {
+                        "status": "radial_hint_unavailable",
+                        "q_unit": "nm^-1",
+                        "observed_arc_q_median": 0.41,
+                        "radial_hint_q": None,
+                        "radial_hint_to_observed_arc_ratio": None,
+                        "signed_relative_difference": None,
+                    },
                 },
                 "quality": {
                     "status": "WARN",
@@ -445,6 +517,7 @@ def test_service_batch_butterfly_stage_uses_standard_fit_and_keeps_warning_candi
                     }},
                 },
             },
+            "geometry_metrics": {"q_unit": "nm^-1"},
             "metrics": {"rmse": 0.01, "success": True},
             "flags": [],
         }
@@ -475,6 +548,16 @@ def test_service_batch_butterfly_stage_uses_standard_fit_and_keeps_warning_candi
     assert record["geometry_parameters"]["Lz_candidate_from_draw_axis_nm"] == pytest.approx(8.7)
     assert "Ln_from_minor_axis_nm" not in record["geometry_parameters"]
     assert "Lz_from_draw_axis_nm" not in record["geometry_parameters"]
+    assert record["geometry_parameters"]["observed_arc_q_median"] == pytest.approx(0.41)
+    assert record["geometry_parameters"]["radial_hint_q"] is None
+    assert record["geometry_parameters"]["radial_hint_selection_status"] == "no_radial_hint"
+    assert record["geometry_parameters"]["radial_hint_reason"] is None
+    assert record["geometry_parameters"]["observed_arc_q_source"] == "accepted_arc_point_coordinates"
+    assert "radial_arc_comparison" not in record["geometry_parameters"]
+    assert record["q_unit"] == "nm^-1"
+    assert record["radial_arc_comparison"]["status"] == "radial_hint_unavailable"
+    assert record["radial_arc_comparison"]["radial_hint_q"] is None
+    assert "radial_arc_comparison" not in record["parameters"]
 
 
 def test_service_batch_butterfly_warm_start_seeds_next_ellipse(monkeypatch, tmp_path: Path) -> None:
@@ -1176,7 +1259,7 @@ def test_observed_arc_radius_period_uses_median_q() -> None:
     assert hinted_q == pytest.approx(0.092)
     assert hinted_L == pytest.approx(2.0 * np.pi / 0.092)
     assert "spacing_from_first_order_iq" in hinted_flags
-    assert "arc_radius_on_secondary_population" in hinted_flags
+    assert "radial_peak_arc_radius_mismatch" in hinted_flags
     unknown_q, unknown_L, unknown_flags = observed_arc_radius_period(points, "pixel-q")
     assert unknown_q == pytest.approx(q_star)
     assert math.isnan(unknown_L)

@@ -231,6 +231,14 @@ def _result_failed(result: Mapping[str, Any]) -> bool:
 
 
 _REASON_TEXT: dict[str, tuple[str, str]] = {
+    "mixed_radial_populations": (
+        "检测到分离的径向轨迹群，当前保留各群；建议在图中选择目标 q 范围后比较拟合",
+        "Separated radial trajectory groups were detected and retained. Select a target q range in the plot and compare the fits.",
+    ),
+    "first_order_q_hint_ambiguous": (
+        "首阶峰选择存在歧义",
+        "first-order peak selection is ambiguous",
+    ),
     "axis_ratio_at_bound": ("轴比触及边界，按仅一阶环处理", "axis ratio at bound; ring only"),
     "axis_ratio_collapsed_to_line": ("轴比塌缩，椭圆不可分辨", "axis ratio collapsed; ellipse unresolved"),
     "major_axis_exceeds_observed_extent": ("长轴超出观测范围", "major axis exceeds observed extent"),

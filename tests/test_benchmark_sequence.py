@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from butterfly_saxs.butterfly_ridge import trace_butterfly_ridges
 from butterfly_saxs.benchmark_sequence import (
     ObliqueStackSettings,
     SequenceSettings,
@@ -23,6 +24,7 @@ def test_sequence_is_deterministic_continuous_and_retains_noise_control() -> Non
     second = generate_sequence(settings)
 
     assert len(first) == 6
+    assert [frame["frame_index"] for frame in first] == list(range(len(first)))
     assert [frame["frame_id"] for frame in first] == [
         "signal_00", "signal_01", "signal_02", "signal_03",
         "buried_signal_stress", "noise_control",
@@ -48,6 +50,7 @@ def test_sequence_is_deterministic_continuous_and_retains_noise_control() -> Non
 
     control = first[-1]
     assert control["sequence_role"] == "noise_only_control"
+    assert control["frame_index"] == 5
     assert control["structural_q0_nm_inv"] is None
     assert control["structure_truth"] is None
     assert np.count_nonzero(control["intensity_noiseless"]) == 0
@@ -124,3 +127,48 @@ def test_oblique_stack_sequence_uses_finite_density_fft_and_matched_noise_contro
     assert np.isclose(
         first[-1]["noise_sigma"], np.median([frame["noise_sigma"] for frame in first[:3]])
     )
+
+
+def test_512_t2_signal_01_retains_both_radial_populations_without_q_hint() -> None:
+    frame = next(
+        item
+        for item in generate_sequence(SequenceSettings(shape=(512, 512)))
+        if item["frame_id"] == "signal_01"
+    )
+    qmap = {
+        "qx": frame["qx"],
+        "qy": frame["qy"],
+        "q": frame["q"],
+        "q_unit": frame["q_unit"],
+    }
+
+    # Only the measured image, q coordinates, and detector mask reach the
+    # tracer; structural q0 remains an independent test reference.
+    trace = trace_butterfly_ridges(
+        frame["intensity_noisy"], qmap, (0.15, 0.85), mask=frame["mask"]
+    )
+
+    diagnostics = trace["diagnostics"]
+    hint = diagnostics["first_order_q_hint"]
+    radial = diagnostics["radial_population"]
+    assert hint["selection_status"] == "ambiguous"
+    assert hint["q_star"] is None
+    assert radial["split"] is True
+    assert radial["selection_status"] == "ambiguous"
+    assert radial["keep"] == "all_observed"
+    assert radial["demoted"] == 0
+    assert radial["low_q_population"]["n_points"] > 0
+    assert radial["high_q_population"]["n_points"] > 0
+
+    threshold = float(radial["threshold"])
+    accepted_radii = [
+        float(np.hypot(point["qx"], point["qy"]))
+        for point in trace["points"]
+        if point.get("accepted")
+        and point.get("branch_id") in (0, 1)
+        and point.get("side") in ("upper", "lower")
+    ]
+    low_count = sum(radius < threshold for radius in accepted_radii)
+    high_count = sum(radius >= threshold for radius in accepted_radii)
+    assert low_count >= radial["low_q_population"]["n_points"] > 0
+    assert high_count >= radial["high_q_population"]["n_points"] > 0

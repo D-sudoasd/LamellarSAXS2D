@@ -272,7 +272,7 @@ def test_major_axis_beyond_observed_ridge_is_a_ring_warning() -> None:
     assert "major_axis_exceeds_observed_extent" not in supported["quality"]["flags"]
     harmonic = dict(points[0])
     harmonic.update({"qx": 0.55, "qy": 0.02, "branch_id": 0, "side": "upper"})
-    inflated = evaluate_arc_evidence(
+    observed_long_wing = evaluate_arc_evidence(
         {
             "points": [*points, harmonic],
             "diagnostics": {"first_order_q_hint": {"q_star": 0.092}},
@@ -287,10 +287,11 @@ def test_major_axis_beyond_observed_ridge_is_a_ring_warning() -> None:
             "rmse": 0.0001,
         },
     )
-    assert "major_axis_exceeds_observed_extent" in inflated["quality"]["flags"]
+    assert observed_long_wing["quality"]["metrics"]["observed_q_extent"] > 0.55
+    assert "major_axis_exceeds_observed_extent" not in observed_long_wing["quality"]["flags"]
 
 
-def test_major_axis_beyond_first_order_q_star_is_unpublished() -> None:
+def test_major_axis_beyond_actual_observed_support_is_unpublished() -> None:
     points = [
         {
             "accepted": True,
@@ -320,8 +321,7 @@ def test_major_axis_beyond_first_order_q_star_is_unpublished() -> None:
             "rmse": 0.0001,
         },
     )
-    assert 0.26 < 1.2 * q_extent
-    assert 0.26 > 2.0 * 0.092
+    assert 0.26 > q_extent + 3.0 * 0.001
     assert result["quality"]["status"] == "WARN"
     assert "major_axis_exceeds_observed_extent" in result["quality"]["flags"]
 

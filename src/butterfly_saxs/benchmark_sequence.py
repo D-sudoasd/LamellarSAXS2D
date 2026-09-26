@@ -241,7 +241,7 @@ def generate_sequence(settings: SequenceSettings | None = None) -> tuple[dict[st
         )
         beamstop = _fixed_beamstop(reference["q"], settings)
         noise_control = {
-            "frame_index": settings.n_signal_frames,
+            "frame_index": len(generated),
             "frame_id": "noise_control",
             "sequence_role": "noise_only_control",
             "seed": control_seed,

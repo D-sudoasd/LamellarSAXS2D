@@ -943,6 +943,106 @@ def test_frame_summary_exports_arc_quality_and_radial_period(tmp_path: Path) -> 
     assert float(row["Lz_candidate_from_draw_axis_nm"]) == pytest.approx(52.0)
 
 
+def test_frame_summary_exports_radial_hint_beside_observed_arc_q(
+    tmp_path: Path,
+) -> None:
+    frames = [
+        FrameFitResult(
+            frame=FrameRef(tmp_path / "frame1.tif"),
+            result={
+                "status": "ok",
+                "geometry_parameters": {
+                    "q_star_from_arcs": 0.099,
+                    "q_star_source": "first_order_iq",
+                },
+                "butterfly": {
+                    "candidate_fit": {
+                        "parameters": {},
+                        "observed_arc_q_median": 0.106,
+                        "radial_hint_q": 0.104,
+                        "radial_hint_selection_status": "selected",
+                        "radial_hint_reason": None,
+                        "observed_arc_q_source": "accepted_arc_point_coordinates",
+                        "radial_arc_comparison": {
+                            "status": "compared",
+                            "q_unit": "nm^-1",
+                            "radial_hint_to_observed_arc_ratio": 0.9811320755,
+                            "signed_relative_difference": -0.0188679245,
+                        },
+                    },
+                },
+            },
+        ),
+        FrameFitResult(
+            frame=FrameRef(tmp_path / "frame2.tif"),
+            result={
+                "status": "warning",
+                "geometry_parameters": {
+                    "q_star_from_arcs": 0.102,
+                    "q_star_source": "first_order_iq",
+                },
+                "butterfly": {
+                    "candidate_fit": {
+                        "parameters": {
+                            "observed_arc_q_median": 0.11,
+                            "radial_hint_q": None,
+                        },
+                        "radial_hint_selection_status": "no_radial_hint",
+                        "radial_hint_reason": None,
+                        "observed_arc_q_source": "accepted_arc_point_coordinates",
+                        "radial_arc_comparison": {
+                            "status": "radial_hint_unavailable",
+                            "q_unit": "nm^-1",
+                            "radial_hint_to_observed_arc_ratio": None,
+                            "signed_relative_difference": None,
+                        },
+                    },
+                },
+            },
+        ),
+    ]
+
+    outputs = export_batch(frames, tmp_path / "exports")
+    with outputs["frame_summary"].open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [float(row["q_star_from_arcs"]) for row in rows] == pytest.approx([0.099, 0.102])
+    assert [row["q_star_source"] for row in rows] == ["first_order_iq", "first_order_iq"]
+    assert [float(row["observed_arc_q_median"]) for row in rows] == pytest.approx([0.106, 0.11])
+    assert float(rows[0]["radial_hint_q"]) == pytest.approx(0.104)
+    assert rows[1]["radial_hint_q"] == ""
+    assert [row["radial_arc_comparison_q_unit"] for row in rows] == ["nm^-1", "nm^-1"]
+    assert [row["radial_hint_selection_status"] for row in rows] == ["selected", "no_radial_hint"]
+    assert [row["radial_hint_reason"] for row in rows] == ["", ""]
+    assert all(row["observed_arc_q_source"] == "accepted_arc_point_coordinates" for row in rows)
+    assert [row["radial_arc_comparison_status"] for row in rows] == [
+        "compared",
+        "radial_hint_unavailable",
+    ]
+    assert float(rows[0]["radial_hint_to_observed_arc_ratio"]) == pytest.approx(0.9811320755)
+    assert rows[1]["radial_hint_to_observed_arc_ratio"] == ""
+
+    stream = StreamingBatchExporter(tmp_path / "stream")
+    for frame in frames:
+        stream.write(frame)
+    streamed = stream.finalize(frames)
+    with streamed["frame_summary"].open(newline="", encoding="utf-8") as handle:
+        streamed_rows = list(csv.DictReader(handle))
+    compared_fields = (
+        "observed_arc_q_median",
+        "radial_hint_q",
+        "radial_arc_comparison_q_unit",
+        "radial_hint_selection_status",
+        "radial_hint_reason",
+        "observed_arc_q_source",
+        "radial_arc_comparison_status",
+        "radial_hint_to_observed_arc_ratio",
+        "radial_arc_comparison_signed_relative_difference",
+    )
+    assert [tuple(row[field] for field in compared_fields) for row in streamed_rows] == [
+        tuple(row[field] for field in compared_fields) for row in rows
+    ]
+
+
 def test_frame_summary_does_not_export_capped_solver_shape_on_ring_rows(tmp_path: Path) -> None:
     frame = FrameFitResult(
         frame=FrameRef(tmp_path / "frame1.tif"),
