@@ -258,6 +258,23 @@ def test_manual_mode_is_available_without_source() -> None:
     assert scene.centers.shape == (2, 3)
 
 
+@pytest.mark.parametrize("status", ["estimate", "candidate"])
+def test_ellipse_scene_preserves_parameter_evidence_over_raw_solver_alias(status):
+    source = _radial_source()
+    source["ellipse_fit"] = {
+        "b": 0.1, "center": [0.0, 0.0], "q_unit": "nm^-1", "status": "ok",
+        "parameters": {"b": 0.1},
+        "quantitative_parameters": {
+            "b": {"value": 0.1, "candidate_value": 0.1, "status": status}
+        },
+    }
+    scene = build_lamellar_scene(
+        source, {"period_source": "ellipse", "layer_count": 1, "stack_count": 1}
+    )
+    assert scene.status == "candidate"
+    assert scene.metadata["populations"][0]["period"] == pytest.approx(2.0 * np.pi / 0.1)
+
+
 def test_ellipse_requires_origin_and_keeps_candidate_formal_value_null() -> None:
     base = _radial_source()
     base["ellipse_fit"] = {"b": 0.1, "center": [0.01, 0.0], "q_unit": "nm^-1"}

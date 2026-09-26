@@ -19,7 +19,7 @@ import math
 import sys
 import threading
 import time
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Callable
 
@@ -369,6 +369,8 @@ def _analysis_scalar(value: Any, *, default: Any = None) -> Any:
 _BATCH_STATUS_KEYS = {
     "ready": "status.ready",
     "ok": "status.batch_ok",
+    "warning": "status.batch_warning",
+    "warn": "status.batch_warning",
     "failed": "status.batch_failed",
     "skipped": "status.batch_skipped",
 }
@@ -389,7 +391,12 @@ _BATCH_TABLE_HEADERS = (
 )
 
 
-def _batch_scalar(source: Any, names: tuple[str, ...]) -> float | None:
+def _batch_scalar(
+    source: Any,
+    names: tuple[str, ...],
+    *,
+    include_candidate: bool = False,
+) -> float | None:
     """Read one finite geometry/export scalar from nested batch records."""
 
     if not isinstance(source, Mapping):
@@ -397,7 +404,11 @@ def _batch_scalar(source: Any, names: tuple[str, ...]) -> float | None:
     for name in names:
         value = source.get(name)
         if isinstance(value, Mapping):
-            value = value.get("value", value.get("candidate_value", value.get("val")))
+            value_keys = ("value", "val", "candidate_value") if include_candidate else ("value", "val")
+            value = next(
+                (value.get(key) for key in value_keys if value.get(key) not in (None, "")),
+                None,
+            )
         try:
             number = float(value)
         except (TypeError, ValueError):
@@ -407,17 +418,68 @@ def _batch_scalar(source: Any, names: tuple[str, ...]) -> float | None:
     return None
 
 
+def _batch_parameter_metadata(
+    sources: Sequence[Any],
+    names: tuple[str, ...],
+) -> dict[str, str]:
+    """Read confidence and reporting state attached to a quantitative row."""
+
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        for name in names:
+            value = source.get(name)
+            if isinstance(value, Mapping) and any(
+                value.get(key) not in (None, "")
+                for key in ("status", "confidence", "publication_status")
+            ):
+                return {
+                    key: str(value.get(key) or "").strip()
+                    for key in ("status", "confidence", "publication_status")
+                }
+    return {}
+
+
+def _batch_candidate_scalar(
+    source: Any,
+    candidate_names: tuple[str, ...],
+    parameter_names: tuple[str, ...],
+    *,
+    include_plain_parameter: bool = False,
+) -> float | None:
+    """Read an explicit candidate field or a nested candidate value."""
+
+    value = _batch_scalar(source, candidate_names, include_candidate=True)
+    if value is not None or not isinstance(source, Mapping):
+        return value
+    if include_plain_parameter:
+        value = _batch_scalar(source, parameter_names, include_candidate=True)
+        if value is not None:
+            return value
+    for name in parameter_names:
+        parameter = source.get(name)
+        if isinstance(parameter, Mapping) and any(
+            parameter.get(key) not in (None, "")
+            for key in ("candidate_value", "candidate")
+        ):
+            return _batch_scalar(source, (name,), include_candidate=True)
+    return None
+
+
 def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
     """Collect public ellipse fields for the batch review table."""
 
+    candidate_sources: list[Any] = [record.get("candidate_geometry_parameters")]
     sources: list[Any] = [
         record.get("geometry_parameters"),
         record.get("parameters"),
         record.get("ellipse_fit"),
         record.get("metrics"),
+        record.get("quantitative_parameters"),
     ]
     butterfly = record.get("butterfly")
     if isinstance(butterfly, Mapping):
+        candidate_sources.append(butterfly.get("candidate_geometry_parameters"))
         sources.extend(
             (
                 butterfly.get("candidate_fit"),
@@ -429,6 +491,7 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(observables, Mapping):
         sources.extend((observables.get("ellipse"), observables.get("butterfly"), observables))
     a = b = ratio = theta = ln = lz = l_radial = rmse = None
+    a_candidate = b_candidate = ratio_candidate = theta_candidate = None
     ln_candidate = lz_candidate = l_major_candidate = None
     for source in sources:
         if a is None:
@@ -453,6 +516,84 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
             l_radial = _batch_scalar(source, ("L_from_observed_radius_nm",))
         if rmse is None:
             rmse = _batch_scalar(source, ("rmse", "geometry_rmse", "residual_rms"))
+    for source in sources:
+        if not isinstance(source, Mapping):
+            continue
+        if ln_candidate is None:
+            ln_candidate = _batch_candidate_scalar(
+                source,
+                ("Ln_candidate_from_minor_axis_nm",),
+                ("Ln_from_minor_axis_nm", "L_N", "Ln"),
+            )
+        if lz_candidate is None:
+            lz_candidate = _batch_candidate_scalar(
+                source,
+                ("Lz_candidate_from_draw_axis_nm",),
+                ("Lz_from_draw_axis_nm", "L_z", "Lz"),
+            )
+        if l_major_candidate is None:
+            l_major_candidate = _batch_candidate_scalar(
+                source,
+                ("L_candidate_from_major_axis_nm",),
+                ("L_from_major_axis_nm", "L_major"),
+            )
+    for source in candidate_sources:
+        if not isinstance(source, Mapping):
+            continue
+        if a_candidate is None:
+            a_candidate = _batch_candidate_scalar(
+                source,
+                ("a_candidate", "semi_major_candidate"),
+                ("a", "semi_major"),
+                include_plain_parameter=True,
+            )
+        if b_candidate is None:
+            b_candidate = _batch_candidate_scalar(
+                source,
+                ("b_candidate", "semi_minor_candidate"),
+                ("b", "semi_minor"),
+                include_plain_parameter=True,
+            )
+        if ratio_candidate is None:
+            ratio_candidate = _batch_candidate_scalar(
+                source,
+                ("axis_ratio_candidate", "b_over_a_candidate"),
+                ("axis_ratio", "b_over_a"),
+                include_plain_parameter=True,
+            )
+        if theta_candidate is None:
+            theta_candidate = _batch_candidate_scalar(
+                source,
+                ("theta_deg_candidate", "angle_deg_candidate"),
+                ("theta_deg", "angle_deg"),
+                include_plain_parameter=True,
+            )
+        if ln_candidate is None:
+            ln_candidate = _batch_candidate_scalar(
+                source,
+                ("Ln_candidate_from_minor_axis_nm",),
+                ("Ln_from_minor_axis_nm", "L_N", "Ln"),
+                include_plain_parameter=True,
+            )
+        if lz_candidate is None:
+            lz_candidate = _batch_candidate_scalar(
+                source,
+                ("Lz_candidate_from_draw_axis_nm",),
+                ("Lz_from_draw_axis_nm", "L_z", "Lz"),
+                include_plain_parameter=True,
+            )
+        if l_major_candidate is None:
+            l_major_candidate = _batch_candidate_scalar(
+                source,
+                ("L_candidate_from_major_axis_nm",),
+                ("L_from_major_axis_nm",),
+                include_plain_parameter=True,
+            )
+    if ratio_candidate is None and a_candidate not in (None, 0.0) and b_candidate is not None:
+        try:
+            ratio_candidate = float(b_candidate) / float(a_candidate)
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio_candidate = None
     if ratio is None and a not in (None, 0.0) and b is not None:
         try:
             ratio = float(b) / float(a)
@@ -536,18 +677,119 @@ def _batch_record_geometry(record: Mapping[str, Any]) -> dict[str, Any]:
         axis_ratio=ratio,
         flags=flag_tokens,
     )
+    ln_metadata = _batch_parameter_metadata(
+        sources,
+        ("Ln_from_minor_axis_nm", "Ln", "L_N", "Ln_nm"),
+    )
+    lz_metadata = _batch_parameter_metadata(
+        sources,
+        ("Lz_from_draw_axis_nm", "Lz", "L_z", "Lz_nm"),
+    )
+    shape_metadata = {
+        "a": _batch_parameter_metadata(sources, ("a", "semi_major")),
+        "b": _batch_parameter_metadata(sources, ("b", "semi_minor")),
+        "axis_ratio": _batch_parameter_metadata(sources, ("axis_ratio", "b_over_a")),
+        "theta_deg": _batch_parameter_metadata(sources, ("theta_deg", "angle_deg")),
+    }
+    shape_values = {"a": a, "b": b, "axis_ratio": ratio, "theta_deg": theta}
+    shape_candidates = {
+        "a": a_candidate,
+        "b": b_candidate,
+        "axis_ratio": ratio_candidate,
+        "theta_deg": theta_candidate,
+    }
+    for name, value in shape_values.items():
+        metadata = shape_metadata[name]
+        candidate_only = (
+            metadata.get("status", "").lower() in {"candidate", "unavailable"}
+            or metadata.get("confidence", "").lower() in {"limited", "unavailable"}
+            or metadata.get("publication_status", "").lower() == "not_assessed"
+            or ellipse_kind != "ellipse"
+        )
+        if candidate_only and value is not None:
+            if shape_candidates[name] is None:
+                shape_candidates[name] = value
+            shape_values[name] = None
+    a, b, ratio, theta = (
+        shape_values["a"],
+        shape_values["b"],
+        shape_values["axis_ratio"],
+        shape_values["theta_deg"],
+    )
+    a_candidate, b_candidate, ratio_candidate, theta_candidate = (
+        shape_candidates["a"],
+        shape_candidates["b"],
+        shape_candidates["axis_ratio"],
+        shape_candidates["theta_deg"],
+    )
+    ln_candidate_only = (
+        ln_metadata.get("status", "").lower() in {"candidate", "unavailable"}
+        or ln_metadata.get("confidence", "").lower() in {"limited", "unavailable"}
+        or ln_metadata.get("publication_status", "").lower() == "not_assessed"
+        or ellipse_kind != "ellipse"
+    )
+    if ln_candidate_only and ln is not None:
+        if ln_candidate is None:
+            ln_candidate = ln
+        ln = None
+    lz_candidate_only = (
+        lz_metadata.get("status", "").lower() in {"candidate", "unavailable"}
+        or lz_metadata.get("confidence", "").lower() in {"limited", "unavailable"}
+        or lz_metadata.get("publication_status", "").lower() == "not_assessed"
+        or ellipse_kind != "ellipse"
+    )
+    if lz_candidate_only and lz is not None:
+        if lz_candidate is None:
+            lz_candidate = lz
+        lz = None
+    ln_state = ln_metadata.get("status", "")
+    ln_confidence = ln_metadata.get("confidence", "")
+    lz_state = lz_metadata.get("status", "")
+    lz_confidence = lz_metadata.get("confidence", "")
+    if ln_candidate is not None and not ln_state:
+        ln_state = "candidate"
+    if ln_candidate is not None and not ln_confidence:
+        ln_confidence = "limited"
+    if lz_candidate is not None and not lz_state:
+        lz_state = "candidate"
+    if lz_candidate is not None and not lz_confidence:
+        lz_confidence = "limited"
     return {
         "a": a,
+        "a_candidate": a_candidate,
+        "a_status": shape_metadata["a"].get("status", "candidate" if a_candidate is not None else ""),
+        "a_confidence": shape_metadata["a"].get("confidence", "limited" if a_candidate is not None else ""),
         "b": b,
+        "b_candidate": b_candidate,
+        "b_status": shape_metadata["b"].get("status", "candidate" if b_candidate is not None else ""),
+        "b_confidence": shape_metadata["b"].get("confidence", "limited" if b_candidate is not None else ""),
         "axis_ratio": ratio,
+        "axis_ratio_candidate": ratio_candidate,
+        "axis_ratio_status": shape_metadata["axis_ratio"].get(
+            "status", "candidate" if ratio_candidate is not None else ""
+        ),
+        "axis_ratio_confidence": shape_metadata["axis_ratio"].get(
+            "confidence", "limited" if ratio_candidate is not None else ""
+        ),
         "theta_deg": theta,
+        "theta_deg_candidate": theta_candidate,
+        "theta_deg_status": shape_metadata["theta_deg"].get(
+            "status", "candidate" if theta_candidate is not None else ""
+        ),
+        "theta_deg_confidence": shape_metadata["theta_deg"].get(
+            "confidence", "limited" if theta_candidate is not None else ""
+        ),
         "arcs": arcs,
         "quality": quality_text,
         "ellipse_kind": ellipse_kind,
         "ln": ln,
         "lz": lz,
         "ln_candidate": ln_candidate,
+        "ln_status": ln_state,
+        "ln_confidence": ln_confidence,
         "lz_candidate": lz_candidate,
+        "lz_status": lz_state,
+        "lz_confidence": lz_confidence,
         "l_major_candidate": l_major_candidate,
         "l_radial": l_radial,
         "rmse": rmse,
@@ -692,7 +934,8 @@ def _result_has_failure(result: Any) -> bool:
     )
 
 
-_BATCH_SUCCESS_STATUSES = frozenset({"ok", "success", "completed"})
+_BATCH_SUCCESS_STATUSES = frozenset({"ok", "success", "completed", "warning", "warn"})
+_BATCH_LIMITED_STATUSES = frozenset({"warning", "warn"})
 
 
 def _batch_records_have_failure(records: Any) -> bool:
@@ -703,9 +946,76 @@ def _batch_records_have_failure(records: Any) -> bool:
             status = str(record.get("status", "ok") or "ok").casefold()
             if status not in _BATCH_SUCCESS_STATUSES:
                 return True
+            if status in _BATCH_LIMITED_STATUSES:
+                if _batch_warning_has_explicit_failure(record):
+                    return True
+                # A warning is a completed frame lifecycle. Its quality gate
+                # can fail while finite observed/candidate geometry remains
+                # useful for review and a continuous batch trend.
+                continue
         if _result_has_failure(record):
             return True
     return False
+
+
+def _batch_warning_has_explicit_failure(record: Mapping[str, Any]) -> bool:
+    """Find execution/input failures that a warning lifecycle must not hide."""
+
+    for name in (
+        "error",
+        "traceback",
+        "read_error",
+        "input_error",
+        "optimizer_error",
+        "solver_error",
+        "exception",
+    ):
+        if record.get(name) not in (None, ""):
+            return True
+
+    failure_statuses = {"fail", "failed", "error", "exception", "invalid"}
+    for name in (
+        "read_status",
+        "input_status",
+        "optimizer_status",
+        "solver_status",
+        "fit_status",
+        "io_status",
+    ):
+        if str(record.get(name, "") or "").strip().casefold() in failure_statuses:
+            return True
+    if record.get("success") is False or record.get("optimizer_success") is False:
+        return True
+
+    for stage_name in ("optimizer", "solver", "full2d", "metrics"):
+        stage = record.get(stage_name)
+        if not isinstance(stage, Mapping):
+            continue
+        if stage.get("success") is False:
+            return True
+        if str(stage.get("status", "") or "").strip().casefold() in failure_statuses:
+            return True
+
+    flags = record.get("flags", ())
+    if isinstance(flags, Mapping):
+        flags = flags.get("flags", ())
+    if isinstance(flags, str):
+        flags = (flags,)
+    operational_failure_tokens = (
+        "optimizer_failed",
+        "solver_failed",
+        "intensity_fit_failed",
+        "read_failed",
+        "input_failed",
+        "decode_failed",
+        "no_engine",
+        "exception",
+    )
+    return any(
+        token in str(flag).casefold()
+        for flag in (flags or ())
+        for token in operational_failure_tokens
+    )
 
 
 def _new_fit_session() -> dict[str, Any]:
@@ -1133,16 +1443,12 @@ if QT_AVAILABLE:
             self.setCentralWidget(self.pages)
 
         def _butterfly_page_analysis(self, settings: Any) -> dict[str, Any]:
-            """Keep the butterfly page on the flat-ellipse prior unless the user named another."""
+            """Pass the user's selected ellipse preset through unchanged."""
 
-            payload: dict[str, Any] = {
+            return {
                 "ridge_method": "butterfly_curvature",
                 "butterfly": settings,
             }
-            preset = str(self.ellipse_preset_combo.currentData() or "standard")
-            if preset.strip().lower().replace("-", "_") in {"", "standard"}:
-                payload["ellipse_preset"] = "flat_ellipse"
-            return payload
 
         def _on_butterfly_identify(self, settings: Any) -> None:
             """Commit trace settings, then reuse the existing geometry worker."""
@@ -2549,6 +2855,12 @@ if QT_AVAILABLE:
             self.evolution_parameter_combo.currentTextChanged.connect(self._render_evolution)
             selector_row.addWidget(self.evolution_parameter_combo, 1)
             layout.addLayout(selector_row)
+            self.evolution_quality_hint = QtWidgets.QLabel(
+                self._tr("measurement.evolution_quality_hint"), self.evolution_page
+            )
+            self.evolution_quality_hint.setObjectName("evolutionQualityHint")
+            self.evolution_quality_hint.setWordWrap(True)
+            layout.addWidget(self.evolution_quality_hint)
             self.evolution_plot = None
             if _pg is not None:
                 self.evolution_plot = _pg.PlotWidget(self.evolution_page)
@@ -3300,6 +3612,9 @@ if QT_AVAILABLE:
                 self.evolution_placeholder.setText(
                     self._tr("measurement.evolution_placeholder")
                 )
+            self.evolution_quality_hint.setText(
+                self._tr("measurement.evolution_quality_hint")
+            )
 
             self.lobe_panel_label.setText(self._tr("measurement.lobes"))
             self.ridge_panel_label.setText(self._tr("measurement.ridge"))
@@ -5621,18 +5936,26 @@ if QT_AVAILABLE:
                     self._update_batch_rows(records)
                     if hasattr(self, "butterfly_workbench"):
                         successful = []
+                        limited = []
                         failures = []
                         for record in records:
                             mapping = record if isinstance(record, Mapping) else {"value": record}
                             status = str(mapping.get("status", "ok")).casefold()
-                            if status in {"ok", "success", "completed"}:
-                                successful.append(mapping.get("frame", mapping.get("path", "frame")))
+                            frame = mapping.get("frame", mapping.get("path", "frame"))
+                            if status in _BATCH_SUCCESS_STATUSES:
+                                successful.append(frame)
+                                if status in _BATCH_LIMITED_STATUSES:
+                                    limited.append(frame)
                             else:
                                 failures.append(
                                     f"{mapping.get('frame', mapping.get('path', 'frame'))}: "
                                     f"{mapping.get('reason', mapping.get('error', status))}"
                                 )
-                        self.butterfly_workbench.set_batch_feedback(successful, failures)
+                        self.butterfly_workbench.set_batch_feedback(
+                            successful,
+                            failures,
+                            limited=limited,
+                        )
                 self._batch_cancel_event = None
             else:
                 self._last_result = result
@@ -6107,22 +6430,63 @@ if QT_AVAILABLE:
             else:
                 quality_text = str(quality or "—")
                 quality_tip = ""
+            ln_candidate = geometry.get("ln_candidate")
+            lz_candidate = geometry.get("lz_candidate")
+            show_ln_candidate = geometry.get("ln") is None and ln_candidate is not None
+            show_lz_candidate = geometry.get("lz") is None and lz_candidate is not None
+            show_ln_estimate = str(geometry.get("ln_status", "")).lower() in {"estimate", "candidate"}
+            show_lz_estimate = str(geometry.get("lz_status", "")).lower() in {"estimate", "candidate"}
+            ln_display = geometry.get("ln") if geometry.get("ln") is not None else ln_candidate
+            lz_display = geometry.get("lz") if geometry.get("lz") is not None else lz_candidate
+            if show_ln_candidate or show_ln_estimate:
+                ln_display = f"≈{_format_metric(ln_display)}"
+            else:
+                ln_display = _format_metric(ln_display)
+            if show_lz_candidate or show_lz_estimate:
+                lz_display = f"≈{_format_metric(lz_display)}"
+            else:
+                lz_display = _format_metric(lz_display)
+
+            def shape_display(name: str) -> tuple[str, str]:
+                value = geometry.get(name)
+                candidate = geometry.get(f"{name}_candidate")
+                status = str(geometry.get(f"{name}_status", "")).lower()
+                confidence = str(geometry.get(f"{name}_confidence", "")).lower()
+                is_candidate = value is None and candidate is not None
+                display_value = value if value is not None else candidate
+                marked = is_candidate or status in {"estimate", "candidate"}
+                display = _format_metric(display_value)
+                if marked and display_value is not None:
+                    display = f"≈{display}"
+                tooltip = ""
+                if marked and display_value is not None:
+                    tooltip = self._tr(
+                        "tooltip.batch_shape_candidate",
+                        status=status or "candidate",
+                        confidence=confidence or "limited",
+                    )
+                return display, tooltip
+
+            a_display, a_tip = shape_display("a")
+            b_display, b_tip = shape_display("b")
+            ratio_display, ratio_tip = shape_display("axis_ratio")
+            theta_display, theta_tip = shape_display("theta_deg")
             values = (
                 str(mapping.get("frame", mapping.get("path", frame))),
                 status_item,
                 quality_text,
-                _format_metric(geometry["a"]),
-                _format_metric(geometry["b"]),
-                _format_metric(geometry["axis_ratio"]),
-                _format_metric(geometry["theta_deg"]),
+                a_display,
+                b_display,
+                ratio_display,
+                theta_display,
                 str(geometry["arcs"] or "—"),
-                _format_metric(geometry["ln"]),
-                _format_metric(geometry["lz"]),
+                ln_display,
+                lz_display,
                 _format_metric(geometry["l_radial"]),
                 _format_metric(geometry["rmse"] if geometry["rmse"] is not None else mapping.get("rmse")),
                 geometry["flags"] or "—",
             )
-            if geometry["ln"] is None and geometry.get("ln_candidate") is not None:
+            if geometry.get("ln_candidate") is not None or geometry.get("lz_candidate") is not None:
                 ln_tip = self._tr(
                     "tooltip.batch_ln_candidate",
                     ln=_format_metric(geometry.get("ln_candidate")),
@@ -6135,8 +6499,12 @@ if QT_AVAILABLE:
                 ln_tip = ""
             tips = {
                 2: quality_tip,
-                5: self._tr("tooltip.batch_ratio_empty") if geometry["axis_ratio"] is None else "",
-                6: (
+                3: a_tip,
+                4: b_tip,
+                5: ratio_tip or (
+                    self._tr("tooltip.batch_ratio_empty") if geometry["axis_ratio"] is None else ""
+                ),
+                6: theta_tip or (
                     self._tr("tooltip.batch_theta_empty")
                     if geometry["theta_deg"] is None
                     and "axis_ratio_at_bound" in (geometry.get("flags") or "")
@@ -7481,7 +7849,9 @@ if QT_AVAILABLE:
             numeric_keys = [
                 str(key)
                 for key in keys
-                if key not in ignored and any(_is_finite(_numeric(row.get(key), float("nan"))) for row in rows)
+                if key not in ignored
+                and not str(key).endswith(("_status", "_confidence", "_publication_status", "_reason"))
+                and any(_is_finite(_numeric(row.get(key), float("nan"))) for row in rows)
             ]
             self.evolution_parameter_combo.blockSignals(True)
             self.evolution_parameter_combo.clear()
@@ -7515,15 +7885,81 @@ if QT_AVAILABLE:
                 for index, row in enumerate(rows)
             ]
             y_values = [_numeric(row.get(self.evolution_y_key, float("nan")), float("nan")) for row in rows]
-            finite = [(x, y) for x, y in zip(x_values, y_values) if _is_finite(x) and _is_finite(y)]
-            if finite:
+            categories: list[str] = []
+            for row in rows:
+                status = str(
+                    row.get(f"{self.evolution_y_key}_status", row.get("status", "")) or ""
+                ).strip().lower()
+                confidence = str(
+                    row.get(f"{self.evolution_y_key}_confidence", row.get("confidence", "")) or ""
+                ).strip().lower()
+                publication = str(
+                    row.get(
+                        f"{self.evolution_y_key}_publication_status",
+                        row.get("publication_status", ""),
+                    )
+                    or ""
+                ).strip().lower()
+                quality = str(row.get("quality_status", row.get("quality", "")) or "").strip().lower()
+                frame_status = str(row.get("status", "") or "").strip().lower()
+                if frame_status in _BATCH_LIMITED_STATUSES:
+                    categories.append(
+                        "failed" if _batch_warning_has_explicit_failure(row) else "limited"
+                    )
+                elif frame_status in {"failed", "fail", "error", "invalid", "skipped"} or status in {
+                    "failed",
+                    "fail",
+                    "error",
+                    "invalid",
+                    "skipped",
+                } or quality in {
+                    "failed",
+                    "fail",
+                    "error",
+                    "invalid",
+                }:
+                    categories.append("failed")
+                elif (
+                    status in {"warning", "warn", "candidate", "estimate", "unavailable"}
+                    or confidence in {"limited", "unavailable"}
+                    or publication == "not_assessed"
+                    or quality in {"warning", "warn"}
+                ):
+                    categories.append("limited")
+                else:
+                    categories.append("measured")
+            line_y = [
+                value if category != "failed" else float("nan")
+                for value, category in zip(y_values, categories)
+            ]
+            if any(_is_finite(x) and _is_finite(y) for x, y in zip(x_values, line_y)):
                 self.evolution_plot.plot(
-                    [point[0] for point in finite],
-                    [point[1] for point in finite],
+                    x_values,
+                    line_y,
                     pen=_pg.mkPen(70, 170, 255, width=2),
-                    symbol="o",
-                    symbolSize=6,
+                    connect="finite",
                 )
+            styles = {
+                "measured": ((42, 154, 220), "o"),
+                "limited": ((215, 142, 30), "t"),
+                "failed": ((130, 130, 138), "x"),
+            }
+            for category, (color, symbol) in styles.items():
+                points = [
+                    (x, y)
+                    for x, y, current in zip(x_values, y_values, categories)
+                    if current == category and _is_finite(x) and _is_finite(y)
+                ]
+                if points:
+                    self.evolution_plot.plot(
+                        [point[0] for point in points],
+                        [point[1] for point in points],
+                        pen=None,
+                        symbol=symbol,
+                        symbolSize=8 if category != "measured" else 6,
+                        symbolPen=_pg.mkPen(color, width=1.5),
+                        symbolBrush=None if category == "failed" else _pg.mkBrush(color),
+                    )
 
         # ----- status and lifetime ---------------------------------------------
 
@@ -7757,24 +8193,58 @@ def _flatten_evolution_record(record: Any, index: int) -> dict[str, Any]:
         row: dict[str, Any] = dict(record)
     else:
         row = {"frame": index, "value": record}
-    parameters = row.pop("parameters", None)
-    if isinstance(parameters, Mapping):
-        for name, value in parameters.items():
-            scalar = _read(value, ("value", "val", "initial", "best"), None)
-            if scalar is None and not isinstance(value, Mapping):
-                scalar = value
-            row[str(name)] = scalar
-    geometry = row.get("geometry_parameters")
-    if isinstance(geometry, Mapping):
-        for name, value in geometry.items():
-            scalar = _read(value, ("value", "val", "initial", "best"), None)
-            if scalar is None and not isinstance(value, Mapping):
-                scalar = value
-            row.setdefault(str(name), scalar)
+
+    def scalar_value(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            return next(
+                (
+                    value.get(key)
+                    for key in ("value", "val", "candidate_value", "candidate", "initial", "best")
+                    if value.get(key) not in (None, "")
+                ),
+                None,
+            )
+        return value
+
+    def flatten_parameter_block(
+        block: Any,
+        *,
+        overwrite: bool,
+        candidate_fallback: bool = False,
+    ) -> None:
+        if not isinstance(block, Mapping):
+            return
+        for name, value in block.items():
+            scalar = scalar_value(value)
+            key = str(name)
+            current = row.get(key)
+            empty_or_nonfinite = current in (None, "") or (
+                isinstance(current, (int, float)) and not _is_finite(current)
+            )
+            if overwrite or key not in row or empty_or_nonfinite:
+                row[str(name)] = scalar
+                if candidate_fallback and scalar not in (None, ""):
+                    row.setdefault(f"{name}_status", "candidate")
+                    row.setdefault(f"{name}_confidence", "limited")
+                    row.setdefault(f"{name}_publication_status", "not_assessed")
+            if isinstance(value, Mapping):
+                for metadata in ("status", "confidence", "publication_status", "reason"):
+                    metadata_value = value.get(metadata)
+                    if metadata_value not in (None, ""):
+                        row[f"{name}_{metadata}"] = metadata_value
+
+    flatten_parameter_block(row.pop("parameters", None), overwrite=True)
+    flatten_parameter_block(row.get("quantitative_parameters"), overwrite=False)
+    flatten_parameter_block(row.get("geometry_parameters"), overwrite=False)
+    flatten_parameter_block(
+        row.get("candidate_geometry_parameters"),
+        overwrite=False,
+        candidate_fallback=True,
+    )
     metrics = row.get("metrics")
     if isinstance(metrics, Mapping):
         for name, value in metrics.items():
-            row.setdefault(str(name), _read(value, ("value", "val"), value))
+            row.setdefault(str(name), scalar_value(value))
     return row
 
 

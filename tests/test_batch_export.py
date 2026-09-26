@@ -11,7 +11,12 @@ import pytest
 from butterfly_saxs.batch import (
     FrameFitResult, FrameRef, _quality_warning_reason, build_frame_refs, run_batch,
 )
-from butterfly_saxs.export import _contains_omitted_array, _parameters, export_batch
+from butterfly_saxs.export import (
+    StreamingBatchExporter,
+    _contains_omitted_array,
+    _parameters,
+    export_batch,
+)
 
 
 def _touch_frames(root: Path, names: list[str]) -> list[Path]:
@@ -90,7 +95,80 @@ def test_warm_start_lineage_does_not_propagate_failed_frame(tmp_path: Path) -> N
     assert run[2].warm_start_from == FrameRef(paths[0]).key
 
 
-def test_warm_start_quality_gate_rejects_explicit_and_nested_failures_without_rmse_threshold(
+def test_quality_warning_keeps_candidate_in_series_and_warm_start(tmp_path: Path) -> None:
+    paths = _touch_frames(tmp_path, ["frame1.tif", "frame2.tif"])
+    calls: list[tuple[str, object]] = []
+    ellipse_parameters = {
+        "a": {"status": "candidate", "value": 0.5, "candidate_value": 0.5},
+        "b": {"status": "candidate", "value": 0.3, "candidate_value": 0.3},
+        "axis_ratio": {"status": "candidate", "value": 0.6, "candidate_value": 0.6},
+        "theta_deg": {"status": "candidate", "value": 20.0, "candidate_value": 20.0},
+    }
+    warm_parameters = {
+        "a": 0.5,
+        "b": 0.3,
+        "axis_ratio": 0.6,
+        "theta_deg": 20.0,
+    }
+
+    def analyze(frame: FrameRef, initial=None):
+        calls.append((frame.path.name, initial))
+        if frame.path.name == "frame1.tif":
+            return {
+                "quality_status": "FAIL",
+                "quality": {"status": "FAIL", "confidence": "low"},
+                "parameters": warm_parameters,
+                "ellipse_fit": {"quantitative_parameters": ellipse_parameters},
+                "butterfly": {
+                    "warm_start_eligible": True,
+                    "candidate_fit": {"parameters": warm_parameters},
+                    "quality": {"status": "FAIL", "confidence": "low"},
+                },
+            }
+        return {"parameters": {"a": initial["a"] if initial else 0.4}}
+
+    run = run_batch(paths, analyze, mode="warm_start")
+
+    assert [item.status for item in run] == ["warning", "ok"]
+    assert run[0].success is False
+    assert not run.failures
+    assert calls[1][1] == warm_parameters
+    assert run[0].diagnostic
+
+    outputs = export_batch(run, tmp_path / "exports")
+    with outputs["frame_summary"].open(newline="", encoding="utf-8") as handle:
+        summary = list(csv.DictReader(handle))
+    assert [row["status"] for row in summary] == ["warning", "ok"]
+    assert [row["frame_index"] for row in summary] == ["0", "1"]
+    assert summary[0]["quality_status"] == "FAIL"
+    assert summary[0]["confidence"] == "low"
+    assert summary[0]["diagnostic"]
+
+    with outputs["parameters_long"].open(newline="", encoding="utf-8") as handle:
+        parameters = list(csv.DictReader(handle))
+    candidate = next(row for row in parameters if row["frame_index"] == "0" and row["parameter"] == "a")
+    assert float(candidate["value"]) == pytest.approx(0.5)
+    assert float(candidate["candidate_value"]) == pytest.approx(0.5)
+    assert candidate["publication_status"] == "not_assessed"
+
+    stream = StreamingBatchExporter(tmp_path / "stream")
+    for item in run:
+        stream.write(item)
+    streamed = stream.finalize(run)
+    with streamed["frame_summary"].open(newline="", encoding="utf-8") as handle:
+        streamed_summary = list(csv.DictReader(handle))
+    assert [row["status"] for row in streamed_summary] == ["warning", "ok"]
+    with streamed["parameters_long"].open(newline="", encoding="utf-8") as handle:
+        streamed_parameters = list(csv.DictReader(handle))
+    streamed_candidate = next(
+        row for row in streamed_parameters
+        if row["frame_index"] == "0" and row["parameter"] == "a"
+    )
+    assert float(streamed_candidate["value"]) == pytest.approx(0.5)
+    assert streamed_candidate["publication_status"] == "not_assessed"
+
+
+def test_warm_start_retains_optimizer_diagnostics_without_seeding_failed_fit(
     tmp_path: Path,
 ) -> None:
     paths = _touch_frames(
@@ -122,7 +200,7 @@ def test_warm_start_quality_gate_rejects_explicit_and_nested_failures_without_rm
 
     run = run_batch(paths, analyze, mode="warm_start")
 
-    assert [item.status for item in run] == ["ok", "failed", "failed", "failed", "ok"]
+    assert [item.status for item in run] == ["ok", "warning", "warning", "warning", "ok"]
     assert [initial["value"] if initial else None for _, initial in calls] == [
         None,
         1,
@@ -130,13 +208,14 @@ def test_warm_start_quality_gate_rejects_explicit_and_nested_failures_without_rm
         1,
         1,
     ]
-    assert "success=False" in (run[1].error or "")
-    assert "full2d.success=False" in (run[2].error or "")
-    assert "full2d.status=error" in (run[3].error or "")
+    assert "success=False" in (run[1].diagnostic or "")
+    assert "full2d.success=False" in (run[2].diagnostic or "")
+    assert "full2d.status=error" in (run[3].diagnostic or "")
+    assert all(not item.success for item in run[1:4])
     assert run[4].warm_start_from == FrameRef(paths[0]).key
 
 
-def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flags(
+def test_warm_start_quality_status_is_advisory_but_failed_optimizers_do_not_seed(
     tmp_path: Path,
 ) -> None:
     paths = _touch_frames(
@@ -199,12 +278,12 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
 
     assert [item.status for item in run] == [
         "ok",
-        "failed",
-        "failed",
-        "failed",
-        "failed",
-        "failed",
-        "failed",
+        "warning",
+        "warning",
+        "warning",
+        "warning",
+        "warning",
+        "warning",
         "ok",
     ]
     assert [initial["value"] if initial else None for _, initial in calls] == [
@@ -215,15 +294,15 @@ def test_warm_start_quality_gate_rejects_metrics_ellipse_full2d_and_failure_flag
         1,
         1,
         1,
-        1,
+        7,
     ]
-    assert "metrics.success=False" in (run[1].error or "")
-    assert "ellipse_fit.status=insufficient_data" in (run[2].error or "")
-    assert "full2d.status=insufficient_data" in (run[3].error or "")
-    assert "intensity_fit_failed:RuntimeError" in (run[4].error or "")
-    assert "analysis_validation_failed:q window" in (run[5].error or "")
-    assert "ellipse_fit.quality_status=FAIL" in (run[6].error or "")
-    assert run[7].warm_start_from == FrameRef(paths[0]).key
+    assert "metrics.success=False" in (run[1].diagnostic or "")
+    assert "ellipse_fit.status=insufficient_data" in (run[2].diagnostic or "")
+    assert "full2d.status=insufficient_data" in (run[3].diagnostic or "")
+    assert "intensity_fit_failed:RuntimeError" in (run[4].diagnostic or "")
+    assert "analysis_validation_failed:q window" in (run[5].diagnostic or "")
+    assert "ellipse_fit.quality_status=FAIL" in (run[6].diagnostic or "")
+    assert run[7].warm_start_from == FrameRef(paths[6]).key
 
 
 def test_batch_rejects_top_level_fail_status(tmp_path: Path) -> None:
@@ -386,6 +465,228 @@ def test_checkpoint_resume_and_hash_guard(tmp_path: Path) -> None:
     assert all(item.resumed for item in resumed)
     with pytest.raises(ValueError, match="config hash mismatch"):
         run_batch(paths, should_not_run, config={"loss": "soft_l1"}, checkpoint=checkpoint, resume=True)
+
+
+def test_checkpoint_restores_warning_candidate_without_rerunning(tmp_path: Path) -> None:
+    path = _touch_frames(tmp_path, ["frame1.tif"])[0]
+    checkpoint = tmp_path / "warning-checkpoint.json"
+    result = {
+        "quality_status": "FAIL",
+        "parameters": {"a": 0.42},
+        "ellipse_fit": {"quantitative_parameters": {
+            "a": {
+                "status": "candidate",
+                "value": 0.42,
+                "candidate_value": 0.42,
+            }
+        }},
+    }
+
+    first = run_batch([path], lambda _frame: result, checkpoint=checkpoint)
+    assert first[0].status == "warning"
+    assert first[0].diagnostic == "quality_status=FAIL"
+
+    resumed_calls: list[str] = []
+
+    def should_not_run(frame: FrameRef):
+        resumed_calls.append(frame.path.name)
+        return {}
+
+    resumed = run_batch(
+        [path],
+        should_not_run,
+        checkpoint=checkpoint,
+        resume=True,
+    )
+    assert resumed_calls == []
+    assert resumed[0].status == "warning"
+    assert resumed[0].resumed
+    assert resumed[0].diagnostic == "quality_status=FAIL"
+    assert resumed[0].result["parameters"]["a"] == pytest.approx(0.42)
+
+
+def test_nested_empty_fit_keeps_independent_radial_measurements_and_does_not_seed(
+    tmp_path: Path,
+) -> None:
+    paths = _touch_frames(tmp_path, ["frame1.tif", "frame2.tif"])
+    calls: list[tuple[str, object]] = []
+    partial_result = {
+        "observables": {
+            "q_star": 0.52,
+            "L_from_observed_radius_nm": 12.1,
+        },
+        "ellipse_fit": {
+            "status": "insufficient_data",
+            "observed": None,
+            "parameters": {"a": 0.7},
+        },
+    }
+
+    def analyze(frame: FrameRef, initial=None):
+        calls.append((frame.path.name, initial))
+        if frame.path.name == "frame1.tif":
+            return partial_result
+        return {"parameters": {"a": 0.8}}
+
+    run = run_batch(paths, analyze, mode="warm_start")
+
+    assert [item.status for item in run] == ["warning", "ok"]
+    assert "ellipse_fit.status=insufficient_data" in (run[0].diagnostic or "")
+    assert run[0].result["observables"]["q_star"] == pytest.approx(0.52)
+    assert calls[1][1] is None
+
+    # A nested empty fit with no independent measurement is still a failed
+    # frame, even if the optimizer left behind an initial parameter value.
+    no_measurement = {
+        "ellipse_fit": {
+            "status": "insufficient_data",
+            "observed": None,
+            "parameters": {"a": 0.7},
+        }
+    }
+    failed = run_batch([paths[0]], lambda _frame: no_measurement)
+    assert failed[0].status == "failed"
+
+    # An explicit frame-level no_observed flag remains authoritative.
+    full_frame_empty = dict(partial_result, flags=["no_observed"])
+    empty = run_batch([paths[0]], lambda _frame: full_frame_empty)
+    assert empty[0].status == "failed"
+    explicit_empty_frame = dict(partial_result, observed=None)
+    empty_frame = run_batch([paths[0]], lambda _frame: explicit_empty_frame)
+    assert empty_frame[0].status == "failed"
+
+
+def test_checkpoint_restores_nested_empty_fit_warning_with_radial_data(tmp_path: Path) -> None:
+    paths = _touch_frames(tmp_path, ["frame1.tif", "frame2.tif"])
+    checkpoint = tmp_path / "radial-warning-checkpoint.json"
+    result = {
+        "observables": {
+            "q_star": 0.52,
+            "L_from_observed_radius_nm": 12.1,
+        },
+        "ellipse_fit": {
+            "status": "insufficient_data",
+            "observed": None,
+            "parameters": {"a": 0.7},
+        },
+    }
+    first_calls: list[tuple[str, object]] = []
+
+    def analyze(frame: FrameRef, initial=None):
+        first_calls.append((frame.path.name, initial))
+        if frame.path.name == "frame1.tif":
+            return result
+        return {"parameters": {"a": 0.8}}
+
+    first = run_batch(paths, analyze, mode="warm_start", checkpoint=checkpoint)
+    assert [item.status for item in first] == ["warning", "ok"]
+    assert first_calls[1][1] is None
+
+    def should_not_run(_frame: FrameRef, **_kwargs):
+        raise AssertionError("checkpoint restore should keep the measured partial result")
+
+    resumed = run_batch(
+        paths,
+        should_not_run,
+        mode="warm_start",
+        checkpoint=checkpoint,
+        resume=True,
+    )
+    assert all(item.resumed for item in resumed)
+    assert [item.status for item in resumed] == ["warning", "ok"]
+    assert resumed[0].result["observables"]["q_star"] == pytest.approx(0.52)
+    assert "ellipse_fit.status=insufficient_data" in (resumed[0].diagnostic or "")
+
+
+def test_checkpoint_reclassifies_legacy_failed_candidate_and_retries_exceptions(
+    tmp_path: Path,
+) -> None:
+    paths = _touch_frames(tmp_path, ["frame1.tif", "frame2.tif"])
+    checkpoint = tmp_path / "legacy-failed-quality-checkpoint.json"
+
+    def first_pass(frame: FrameRef):
+        if frame.path.name == "frame1.tif":
+            return {"quality_status": "FAIL", "parameters": {"a": 0.42}}
+        raise OSError("transient detector failure")
+
+    first = run_batch(paths, first_pass, mode="warm_start", checkpoint=checkpoint)
+    assert [item.status for item in first] == ["warning", "failed"]
+
+    # Recreate the old checkpoint contract: pre-warning builds stored the
+    # quality-gated candidate as failed/error and did not store a diagnostic.
+    stored = json.loads(checkpoint.read_text(encoding="utf-8"))
+    stored_first = stored["frames"][0]
+    stored_first["status"] = "failed"
+    stored_first["error"] = "quality_status=FAIL"
+    stored_first.pop("diagnostic", None)
+    checkpoint.write_text(json.dumps(stored), encoding="utf-8")
+
+    resumed_calls: list[tuple[str, object]] = []
+
+    def resume_analyze(frame: FrameRef, initial_parameters=None):
+        resumed_calls.append((frame.path.name, initial_parameters))
+        if frame.path.name == "frame1.tif":
+            raise OSError("must not replace the retained candidate")
+        return {"parameters": {"a": 0.43}}
+
+    resumed = run_batch(
+        paths,
+        resume_analyze,
+        mode="warm_start",
+        checkpoint=checkpoint,
+        resume=True,
+    )
+
+    assert [name for name, _ in resumed_calls] == ["frame2.tif"]
+    assert resumed_calls[0][1] == {"a": 0.42}
+    assert [item.status for item in resumed] == ["warning", "ok"]
+    assert resumed[0].resumed
+    assert resumed[0].result["parameters"]["a"] == pytest.approx(0.42)
+    assert resumed[0].diagnostic == "quality_status=FAIL"
+    assert not resumed[1].resumed
+
+
+def test_cancelled_batch_keeps_all_selected_frame_positions(tmp_path: Path) -> None:
+    from threading import Event
+
+    paths = _touch_frames(tmp_path, ["frame1.tif", "frame2.tif", "frame3.tif"])
+    cancel = Event()
+
+    def progress(payload):
+        if payload.get("status") == "ok":
+            cancel.set()
+
+    run = run_batch(
+        paths,
+        lambda frame: {"parameters": {"value": frame.path.stem}},
+        cancel_event=cancel,
+        progress=progress,
+    )
+
+    assert run.cancelled
+    assert run.processed_count == 1
+    assert [item.frame.path for item in run] == paths
+    assert [item.status for item in run] == ["ok", "skipped", "skipped"]
+
+    outputs = export_batch(run, tmp_path / "cancelled-exports")
+    with outputs["frame_summary"].open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["frame_index"] for row in rows] == ["0", "1", "2"]
+    assert [row["status"] for row in rows] == ["ok", "skipped", "skipped"]
+
+
+def test_diagnostic_numbers_and_text_are_not_misreported_as_candidate_data(tmp_path: Path) -> None:
+    path = _touch_frames(tmp_path, ["frame1.tif"])[0]
+    result = {
+        "quality_status": "FAIL",
+        "parameters": {"ndata": 12, "min": 0.1, "max": 0.8},
+        "observed": ["detector read failed"],
+    }
+
+    run = run_batch([path], lambda _frame: result)
+
+    assert run[0].status == "failed"
+    assert not run.warnings
 
 
 def test_checkpoint_omits_detector_sized_arrays_but_keeps_restart_parameters(tmp_path: Path) -> None:

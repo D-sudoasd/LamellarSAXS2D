@@ -6,6 +6,7 @@ import pytest
 from butterfly_saxs.arc_geometry import (
     _local_coordinates,
     _observed_radius_seed,
+    _parameter_set_for_arcs,
     _project_ellipse_arc,
     _project_point_to_support,
     _rectangle_intervals,
@@ -380,6 +381,25 @@ def test_flat_ellipse_specs_cap_near_circular_and_runaway_major_axis() -> None:
     assert fit is not None
     assert fit.values["axis_ratio"] <= 0.35 + 1e-12
     assert fit.values["a"] < 1.0
+
+
+def test_arc_defaults_keep_data_derived_center_and_physical_ratio_bounds() -> None:
+    raw_points = _arc_points()
+    coordinates = np.asarray([[point["qx"], point["qy"]] for point in raw_points])
+
+    standard = _parameter_set_for_arcs(coordinates, None, reference_axis=0.0)
+    assert standard["cx"].vary is True
+    assert standard["cy"].vary is True
+    assert standard["axis_ratio"].min > 0.0
+    assert standard["axis_ratio"].max == pytest.approx(1.0)
+
+    flat_settings = validate_analysis_settings({"ellipse_preset": "flat_ellipse"})
+    flat_specs = ellipse_parameter_specs(flat_settings)
+    constrained = _parameter_set_for_arcs(coordinates, flat_specs, reference_axis=0.0)
+    assert constrained["cx"].vary is False
+    assert constrained["cy"].vary is False
+    assert constrained["axis_ratio"].min == pytest.approx(0.005)
+    assert constrained["axis_ratio"].max == pytest.approx(0.35)
 
 
 def test_unreachable_support_rectangle_skips_interval_enumeration() -> None:

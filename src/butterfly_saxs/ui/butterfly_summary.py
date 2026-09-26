@@ -256,6 +256,10 @@ _REASON_TEXT: dict[str, tuple[str, str]] = {
         "some fitted projections exceed observed support",
     ),
     "geometry_not_evaluated": ("椭圆参数尚未评估", "ellipse parameters not evaluated"),
+    "parameter_candidates_require_review": (
+        "部分参数仍为估计值或候选值；请在定量参数表查看置信度和发表状态",
+        "some parameters remain estimates or candidates; review confidence and reporting status in the parameter table",
+    ),
     "uncalibrated_pixel_q": ("pixel-q 未标定，不能解释物理周期", "pixel-q is uncalibrated; physical period unavailable"),
     "spacing_unavailable_unknown_q_unit": ("q 单位未确认，L ring 不可用", "q unit is unknown; L ring unavailable"),
     "cancelled": ("任务已取消，旧结果已失效", "job cancelled; previous result invalidated"),
@@ -279,6 +283,8 @@ def _reason_priority(code: str) -> tuple[int, str]:
         return (2, token)
     if "residual" in token or "condition" in token:
         return (3, token)
+    if "parameter_candidates" in token:
+        return (4, token)
     if "sensitivity" in token or "interval" in token:
         return (8, token)
     if "uncalibrated" in token or "unknown_q_unit" in token:
@@ -447,6 +453,15 @@ def build_butterfly_quality_summary(
         _finite(ratio_row.get("value")) if isinstance(ratio_row, Mapping) else None
     )
     ratio = published_ratio if published_ratio is not None else _finite(candidate.get("axis_ratio"))
+    has_unsettled_parameter = any(
+        isinstance(row, Mapping)
+        and (
+            str(row.get("status", "")).lower() in {"estimate", "candidate", "unavailable"}
+            or str(row.get("confidence", "")).lower() in {"limited", "unavailable"}
+            or str(row.get("publication_status", "")).lower() == "not_assessed"
+        )
+        for row in quantitative.values()
+    )
     kind = classify_ellipse_publication(
         quality_status=quality_status,
         axis_ratio=ratio,
@@ -507,6 +522,8 @@ def build_butterfly_quality_summary(
         next_step_key = "ellipse_review"
         reasons.extend(flags)
 
+    if visible_result and active_stage != "trace" and has_unsettled_parameter:
+        reasons.append("parameter_candidates_require_review")
     if visible_result and not calibrated:
         reasons.append("uncalibrated_pixel_q" if unit == "pixel-q" else "spacing_unavailable_unknown_q_unit")
         l_ring = None
@@ -565,7 +582,10 @@ if QT_AVAILABLE:
             "wait": ("等待当前任务完成或取消", "Wait for the current job to finish or cancel it"),
             "evaluate": ("运行 Evaluate，完成椭圆质量评估", "Run Evaluate to assess ellipse quality"),
             "retry": ("检查输入、掩膜和 q 范围后重试", "Check input, mask and q range, then retry"),
-            "ring_review": ("保留一阶环 L；独立支持前不发布 Ln/Lz", "Keep ring L; do not publish Ln/Lz without independent support"),
+            "ring_review": (
+                "复核观测弧迹/峰轨迹、q 窗口和候选置信度；一阶周期看环 L",
+                "Review observed arcs or peak tracks, the q window, and candidate confidence; use L ring for the first-order period",
+            ),
             "ellipse_review": ("复核质量和支持后再导出；科学接受仍需外部证据", "Review quality/support before export; scientific acceptance still needs external evidence"),
         }
 

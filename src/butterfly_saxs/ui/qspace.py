@@ -47,6 +47,14 @@ def _read(source: Any, names: tuple[str, ...], default: Any = None) -> Any:
     return default
 
 
+def _point_is_accepted(point: Any, *, default: bool = True) -> bool:
+    """Apply the same acceptance rule to a point across every q-space view."""
+
+    valid = bool(_read(point, ("valid",), default))
+    accepted = bool(_read(point, ("accepted",), valid))
+    return valid and accepted
+
+
 def _as_array(value: Any, *, dtype: Any = float) -> Any:
     if _np is None or value is None:
         return None
@@ -257,7 +265,7 @@ if QT_AVAILABLE:
                 (1, "lower"): True,
                 (-1, "unknown"): True,
             }
-            self._show_excluded = False
+            self._show_excluded = True
             self._branch_colors = ((42, 154, 220), (239, 143, 44))
             self._custom_branch_colors = False
             self.setAccessibleName("Butterfly reciprocal-space image")
@@ -957,7 +965,7 @@ if QT_AVAILABLE:
                 painter.drawImage(0, 0, self._mesh_cache_image)
 
         def _point_visible(self, point: Mapping[str, Any]) -> bool:
-            if not bool(_read(point, ("valid",), True)) or not bool(_read(point, ("accepted",), True)):
+            if not _point_is_accepted(point):
                 return self._show_excluded
             branch = _read(point, ("branch_id",), -1)
             side = str(_read(point, ("side",), "unknown") or "unknown").lower()
@@ -1099,7 +1107,7 @@ if QT_AVAILABLE:
                     pending_break_reason = "missing_point"
                     flush()
                     continue
-                if not bool(_read(point, ("valid",), True)) or not bool(_read(point, ("accepted",), True)):
+                if not _point_is_accepted(point):
                     pending_break_reason = "invalid_or_rejected"
                     flush()
                     continue
@@ -1169,15 +1177,14 @@ if QT_AVAILABLE:
                 screen = self._q_to_screen(*q)
                 if screen is None:
                     continue
-                valid = bool(_read(point, ("valid", "accepted"), True))
-                accepted = bool(_read(point, ("accepted", "valid"), valid))
+                accepted = _point_is_accepted(point)
                 branch = _read(point, ("branch_id",), -1)
                 side = str(_read(point, ("side",), "unknown") or "unknown").lower()
                 try:
                     branch = int(branch)
                 except (TypeError, ValueError):
                     branch = -1
-                if not valid or not accepted:
+                if not accepted:
                     pen = QtGui.QPen(QtGui.QColor(150, 150, 155, 135), 1.0)
                     painter.setPen(pen)
                     painter.drawLine(screen.x() - 3, screen.y() - 3, screen.x() + 3, screen.y() + 3)
@@ -1244,8 +1251,7 @@ if QT_AVAILABLE:
                 previous_point: Mapping[str, Any] | None = None
                 for item in raw_points:
                     if isinstance(item, Mapping) and (
-                        not bool(_read(item, ("valid",), True))
-                        or not bool(_read(item, ("accepted",), True))
+                        not _point_is_accepted(item)
                     ):
                         screen_points.append(None)
                         previous_q = None

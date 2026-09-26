@@ -1350,15 +1350,271 @@ def _quality_warning_reason(result: Any) -> str | None:
     return None
 
 
+def _finite_value(value: Any) -> bool:
+    """Return whether one scalar is a finite, non-boolean estimate."""
+
+    if value is None or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _has_parameter_estimate(value: Any) -> bool:
+    """Inspect parameter containers for an estimate, excluding uncertainty-only fields."""
+
+    if isinstance(value, Mapping):
+        for name, spec in value.items():
+            if str(name).casefold() in {
+                "stderr", "uncertainty", "sigma", "error", "std", "fixed", "unit",
+                "flags", "bound_flags", "vary", "expr", "status", "success",
+                "ndata", "n_data", "nfev", "sampled_n", "min", "max", "mean",
+                "median", "rmse", "weighted_rmse", "sample_rmse", "condition",
+                "condition_number", "confidence", "confidence_level", "reason",
+            }:
+                continue
+            if _finite_value(spec):
+                return True
+            if isinstance(spec, Mapping):
+                for candidate_name in ("candidate_value", "value", "estimate", "val"):
+                    if candidate_name in spec and _finite_value(spec[candidate_name]):
+                        return True
+                if _has_parameter_estimate(spec):
+                    return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_has_parameter_estimate(item) for item in value)
+    candidate = _named_value(value, "candidate_value")
+    if _finite_value(candidate):
+        return True
+    estimate = _named_value(value, "value")
+    return _finite_value(estimate)
+
+
+def _has_finite_observation(value: Any) -> bool:
+    """Check an explicitly supplied observation array without inferring data."""
+
+    if value is _MISSING or value is None:
+        return False
+    if isinstance(value, Mapping) and value.get("array_omitted") is True:
+        shape = value.get("shape")
+        if not isinstance(shape, (list, tuple)):
+            return False
+        try:
+            if any(int(dimension) <= 0 for dimension in shape):
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        return _finite_value(value.get("min")) and _finite_value(value.get("max"))
+    try:
+        import numpy as np
+
+        array = np.asarray(value)
+        if array.size == 0 or array.dtype.kind not in "biufc":
+            return False
+        return bool(np.isfinite(array).any())
+    except (ImportError, TypeError, ValueError):
+        return False
+
+
+def _has_measurement_records(value: Any) -> bool:
+    """Recognize observed peak/ridge records without counting summary statistics."""
+
+    if isinstance(value, Mapping):
+        for key in ("qx", "qy", "q", "q_star", "intensity", "pixel_x", "pixel_y"):
+            if _finite_value(value.get(key)):
+                return True
+        return any(
+            _has_measurement_records(item)
+            for key, item in value.items()
+            if str(key).casefold()
+            not in {
+                "status", "success", "ndata", "n_data", "nfev", "min", "max",
+                "mean", "median", "rmse", "weighted_rmse", "condition_number",
+                "confidence", "reason", "flags",
+            }
+        )
+    if isinstance(value, (list, tuple)):
+        if _has_finite_observation(value):
+            return True
+        return any(_has_measurement_records(item) for item in value)
+    return False
+
+
+def _has_candidate_or_observation(result: Any) -> bool:
+    """Keep an analyzable partial result when it contains actual estimates/data."""
+
+    for name in (
+        "parameters", "params", "geometry_parameters", "values",
+    ):
+        if _has_parameter_estimate(_named_value(result, name)):
+            return True
+    if _has_measurement_records(_named_value(result, "observables")):
+        return True
+
+    for name in ("ellipse_fit", "ellipse", "full2d", "metrics"):
+        stage = _named_value(result, name)
+        if stage is _MISSING or stage is None:
+            continue
+        for parameter_name in ("parameters", "params", "quantitative_parameters", "values"):
+            if _has_parameter_estimate(_named_value(stage, parameter_name)):
+                return True
+        if _has_finite_observation(_named_value(stage, "observed")):
+            return True
+
+    butterfly = _butterfly_payload(result)
+    if butterfly is not None:
+        candidate = _named_value(butterfly, "candidate_fit")
+        if candidate is _MISSING:
+            candidate = butterfly
+        for parameter_name in ("parameters", "parameter_values", "values"):
+            if _has_parameter_estimate(_named_value(candidate, parameter_name)):
+                return True
+        if _has_finite_observation(_named_value(candidate, "observed")):
+            return True
+        points = _named_value(butterfly, "points")
+        if isinstance(points, (list, tuple)) and any(
+            _named_value(point, "accepted") is True
+            or _finite_value(_named_value(point, "q"))
+            for point in points
+        ):
+            return True
+
+    for name in ("observed",):
+        if _has_finite_observation(_named_value(result, name)):
+            return True
+    for name in ("ridge_points", "ridges", "lobe_radial_peaks", "lobe_radial_profiles"):
+        if _has_measurement_records(_named_value(result, name)):
+            return True
+
+    # Common directly exposed observables are legitimate partial outputs even
+    # when the ellipse optimizer did not converge.
+    for name in (
+        "q_star", "q_star_from_arcs", "L_from_observed_radius_nm", "a", "b",
+        "axis_ratio", "theta_deg", "ellipticity", "eccentricity",
+    ):
+        if _finite_value(_named_value(result, name)):
+            return True
+    return False
+
+
+def _has_independent_observations(result: Any) -> bool:
+    """Find measured data that remains useful when one fit stage has no support."""
+
+    if _has_measurement_records(_named_value(result, "observables")):
+        return True
+    if _has_finite_observation(_named_value(result, "observed")):
+        return True
+
+    for name in ("ridge_points", "ridges", "lobe_radial_peaks", "lobe_radial_profiles"):
+        if _has_measurement_records(_named_value(result, name)):
+            return True
+
+    for name in ("q_star", "q_star_from_arcs", "L_from_observed_radius_nm"):
+        if _finite_value(_named_value(result, name)):
+            return True
+    geometry = _named_value(result, "geometry_parameters")
+    for name in ("q_star", "q_star_from_arcs", "L_from_observed_radius_nm"):
+        if _finite_value(_named_value(geometry, name)):
+            return True
+
+    # Detector observations exposed by a different analysis stage are also
+    # independent of a sibling stage's empty input. Do not count parameters
+    # from the failed optimizer here; those alone cannot prove observed data.
+    for name in ("metrics", "ellipse_fit", "ellipse", "full2d", "butterfly"):
+        stage = _named_value(result, name)
+        if stage is _MISSING or stage is None:
+            continue
+        if _has_finite_observation(_named_value(stage, "observed")):
+            return True
+        if _has_measurement_records(_named_value(stage, "observables")):
+            return True
+        points = _named_value(stage, "points")
+        if isinstance(points, (list, tuple)) and any(
+            _named_value(point, "accepted") is True
+            or _finite_value(_named_value(point, "q"))
+            for point in points
+        ):
+            return True
+    return False
+
+
+def _has_empty_observation(result: Any) -> bool:
+    """Reject a frame with no observations, without discarding sibling-stage data."""
+
+    # A frame-level empty signal is authoritative even if a malformed result
+    # also carries stale values from a previous stage.
+    if _empty_observation_failure("result", result) is not None:
+        return True
+    if _quality_failure_flag(_named_value(result, "flags")) in _EMPTY_OBSERVATION_FLAGS:
+        return True
+
+    # A fit stage can legitimately have no support while other measurements
+    # from the same frame remain usable (for example q* alongside an
+    # underdetermined ellipse). Only treat stage-level emptiness as a frame
+    # failure when there is no independent measured evidence.
+    has_empty_stage = False
+    for stage_name in ("metrics", "ellipse_fit", "ellipse", "full2d", "butterfly"):
+        stage = _named_value(result, stage_name)
+        if stage is _MISSING or stage is None:
+            continue
+        if _empty_observation_failure(stage_name, stage) is not None:
+            has_empty_stage = True
+        if _quality_failure_flag(_named_value(stage, "flags")) in _EMPTY_OBSERVATION_FLAGS:
+            has_empty_stage = True
+    return has_empty_stage and not _has_independent_observations(result)
+
+
+def _batch_result_status(result: Any) -> tuple[Literal["ok", "warning", "failed"], str | None]:
+    """Separate completed candidate results from failures and quality diagnostics."""
+
+    reason = _quality_failure_reason(result)
+    if reason is None:
+        reason = _quality_warning_reason(result)
+    if reason is None:
+        return "ok", None
+    if not _has_empty_observation(result) and _has_candidate_or_observation(result):
+        return "warning", reason
+    return "failed", reason
+
+
+def _warm_start_optimizer_failed(result: Any) -> bool:
+    """Reject explicit optimizer failures while leaving quality assessments advisory."""
+
+    if _quality_failure_flag(_named_value(result, "flags")) is not None:
+        return True
+    if _is_explicit_false(_named_value(result, "success")):
+        return True
+    if _is_failure_status(_named_value(result, "status")):
+        return True
+    for name in ("metrics", "ellipse_fit", "ellipse", "full2d"):
+        stage = _named_value(result, name)
+        if stage is _MISSING or stage is None:
+            continue
+        if _quality_failure_flag(_named_value(stage, "flags")) is not None:
+            return True
+        if _is_explicit_false(_named_value(stage, "success")):
+            return True
+        if _is_failure_status(_named_value(stage, "status")):
+            return True
+    return False
+
+
 def _warm_start_seed(result: Any) -> Any:
     """Extract the parameter state expected by an analyzer when available."""
 
+    if result is None or _has_empty_observation(result):
+        return None
     butterfly = _butterfly_payload(result)
     if butterfly is not None:
         # New butterfly results are correction/evidence envelopes.  They may
         # seed a later frame only when the payload explicitly certifies the
         # candidate and all required geometry values are finite numbers.
         return _numeric_butterfly_seed(butterfly)
+
+    if _warm_start_optimizer_failed(result):
+        return None
 
     ellipse = _named_value(result, "ellipse_fit")
     if _named_value(ellipse, "warm_start_eligible") is False:
@@ -1383,8 +1639,9 @@ class FrameFitResult:
 
     frame: FrameRef
     result: Any = None
-    status: Literal["ok", "failed", "skipped"] = "ok"
+    status: Literal["ok", "warning", "failed", "skipped"] = "ok"
     error: str | None = None
+    diagnostic: str | None = None
     traceback: str | None = None
     warm_start_from: str | None = None
     elapsed_s: float | None = None
@@ -1394,8 +1651,9 @@ class FrameFitResult:
         self,
         frame: FrameRef | str | os.PathLike[str] | None = None,
         result: Any = None,
-        status: Literal["ok", "failed", "skipped"] = "ok",
+        status: Literal["ok", "warning", "failed", "skipped"] = "ok",
         error: str | None = None,
+        diagnostic: str | None = None,
         traceback: str | None = None,
         warm_start_from: str | None = None,
         elapsed_s: float | None = None,
@@ -1426,6 +1684,7 @@ class FrameFitResult:
         self.result = result
         self.status = status
         self.error = error
+        self.diagnostic = diagnostic
         self.traceback = traceback
         self.warm_start_from = warm_start_from
         self.elapsed_s = elapsed_s
@@ -1479,6 +1738,7 @@ class FrameFitResult:
             "frame": self.frame.to_dict(),
             "status": self.status,
             "error": self.error,
+            "diagnostic": self.diagnostic,
             "traceback": self.traceback,
             "warm_start_from": self.warm_start_from,
             "elapsed_s": self.elapsed_s,
@@ -1494,6 +1754,7 @@ class FrameFitResult:
             result=record.get("result"),
             status=record.get("status", "ok"),
             error=record.get("error"),
+            diagnostic=record.get("diagnostic"),
             traceback=record.get("traceback"),
             warm_start_from=record.get("warm_start_from", record.get("lineage")),
             elapsed_s=record.get("elapsed_s"),
@@ -1533,7 +1794,13 @@ class BatchRunResult:
 
     @property
     def successful(self) -> list[FrameFitResult]:
-        return [item for item in self.frame_results if item.ok]
+        # A warning frame is a completed analysis with a candidate/evidence
+        # record; retain it for the series while its status remains explicit.
+        return [item for item in self.frame_results if item.status in {"ok", "warning"}]
+
+    @property
+    def warnings(self) -> list[FrameFitResult]:
+        return [item for item in self.frame_results if item.status == "warning"]
 
     @property
     def failures(self) -> list[FrameFitResult]:
@@ -1843,8 +2110,16 @@ def run_batch(
             raise AnalysisCancelled("batch cancelled while hashing config")
         emit_phase("analyze")
     except AnalysisCancelled:
+        cancelled_items = [
+            FrameFitResult(
+                frame=frame,
+                status="skipped",
+                error="analysis cancelled before frame processing",
+            )
+            for frame in refs
+        ]
         run = BatchRunResult(
-            frame_results=[],
+            frame_results=cancelled_items,
             mode=mode,
             input_hash="",
             config_hash="",
@@ -1856,6 +2131,9 @@ def run_batch(
         )
         run.cancelled = True
         run.elapsed_s = __import__("time").perf_counter() - started_batch
+        if result_sink is not None:
+            for item in cancelled_items:
+                result_sink(item)
         emit_phase("cancelled")
         return run
 
@@ -1898,6 +2176,18 @@ def run_batch(
         if not retain_results:
             item.result = _checkpoint_safe(item.result)
 
+    def mark_cancelled_tail(start_index: int) -> None:
+        """Represent every selected but unprocessed frame in its original position."""
+
+        for frame in refs[start_index:]:
+            item = FrameFitResult(
+                frame=frame,
+                status="skipped",
+                error="analysis cancelled before frame processing",
+            )
+            run.frame_results.append(item)
+            publish(item)
+
     prior_records: dict[str, Mapping[str, Any]] = {}
     if resume:
         if checkpoint_file is None or not checkpoint_file.exists():
@@ -1931,24 +2221,55 @@ def run_batch(
         if cancelled():
             run.cancelled = True
             emit_progress(len(run.frame_results), None)
+            mark_cancelled_tail(len(run.frame_results))
             break
         emit_progress(len(run.frame_results), None)
+        if cancelled():
+            run.cancelled = True
+            emit_progress(len(run.frame_results), None)
+            mark_cancelled_tail(len(run.frame_results))
+            break
         restored = prior_records.get(frame.key)
-        # Successful frames are safe to restore.  Failed frames are retried so
-        # a transient detector/read error does not become permanent.
-        if restored is not None and restored.get("status") == "ok":
-            # Do not trust a legacy checkpoint that called an explicitly
-            # unsuccessful result "ok".  Falling through retries the frame;
-            # importantly, the invalid payload never becomes a warm seed.
-            restored_quality_error = _quality_failure_reason(restored.get("result"))
-            if restored_quality_error is None:
+        # Completed frames with usable estimates restore regardless of their
+        # quality assessment. Legacy ``failed`` rows may have been written by
+        # older quality gates; reclassify result-bearing rows before retrying.
+        # Exception rows retain a traceback and are always retried.
+        restore_candidate = restored is not None and restored.get("status") in {
+            "ok", "warning"
+        }
+        if restored is not None and restored.get("status") == "failed":
+            legacy_error = restored.get("error")
+            looks_like_exception = (
+                isinstance(legacy_error, str)
+                and ": " in legacy_error
+                and legacy_error.split(": ", 1)[0].replace(".", "").isidentifier()
+            )
+            if (
+                restored.get("traceback") is None
+                and not looks_like_exception
+                and restored.get("result") is not None
+            ):
+                restore_candidate = True
+        if restore_candidate:
+            restored_status, restored_reason = _batch_result_status(
+                restored.get("result")
+            )
+            if restored_status in {"ok", "warning"}:
                 item = FrameFitResult.from_record(restored)
                 item.frame = frame
+                item.status = restored_status
+                if restored_status == "warning" and item.diagnostic is None:
+                    item.diagnostic = restored_reason
+                if item.error is not None and restored_status != "failed":
+                    item.diagnostic = item.diagnostic or item.error
+                    item.error = None
                 item.resumed = True
                 run.frame_results.append(item)
                 if mode == "warm_start":
-                    previous_result = _warm_start_seed(item.result)
-                    previous_frame_key = frame.key if previous_result is not None else None
+                    seed = _warm_start_seed(item.result)
+                    if seed is not None:
+                        previous_result = seed
+                        previous_frame_key = frame.key
                 publish(item)
                 emit_progress(len(run.frame_results) - 1, item)
                 continue
@@ -1967,6 +2288,7 @@ def run_batch(
         except AnalysisCancelled:
             run.cancelled = True
             emit_progress(len(run.frame_results), None)
+            mark_cancelled_tail(len(run.frame_results))
             break
         except Exception as exc:
             item = FrameFitResult(
@@ -1980,18 +2302,21 @@ def run_batch(
             # Crucially, previous_result is unchanged.  A failed frame must
             # never seed the next warm-start fit.
         else:
-            quality_error = _quality_failure_reason(result)
+            result_status, quality_reason = _batch_result_status(result)
             item = FrameFitResult(
                 frame=frame,
                 result=result,
-                status="failed" if quality_error is not None else "ok",
-                error=quality_error,
+                status=result_status,
+                error=quality_reason if result_status == "failed" else None,
+                diagnostic=quality_reason if result_status == "warning" else None,
                 warm_start_from=lineage,
                 elapsed_s=__import__("time").perf_counter() - started,
             )
-            if mode == "warm_start" and quality_error is None:
-                previous_result = _warm_start_seed(result)
-                previous_frame_key = frame.key if previous_result is not None else None
+            if mode == "warm_start":
+                seed = _warm_start_seed(result)
+                if seed is not None:
+                    previous_result = seed
+                    previous_frame_key = frame.key
         run.frame_results.append(item)
         publish(item)
         run.processed_count = len(run.frame_results)
@@ -2002,7 +2327,7 @@ def run_batch(
                 _checkpoint_payload(run, refs, config=config),
             )
 
-    run.processed_count = len(run.frame_results)
+    run.processed_count = sum(item.status != "skipped" for item in run.frame_results)
     run.elapsed_s = __import__("time").perf_counter() - started_batch
     if checkpoint_file is not None:
         write_checkpoint(checkpoint_file, _checkpoint_payload(run, refs, config=config))

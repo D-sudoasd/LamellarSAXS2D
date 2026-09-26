@@ -552,7 +552,29 @@ P0–P2/R0 运行必须记录实际命令、环境、PONI/mask/manifest/config/c
 }
 ```
 
-## 14. 实现验收检查
+## 14. 蝴蝶拟合估计与可靠性
+
+从 WingSAXS 0.4.3 起，`butterfly.quantitative_parameters` 与
+`ellipse_fit.quantitative_parameters` 的各参数行将数值可用性与不确定度评估分开：
+
+| 字段 | 含义 |
+| --- | --- |
+| `value` | 有效观测支持下收敛的有限几何估计；数值无效或无支持时为 null |
+| `candidate_value` | 原始候选值，保留与旧结果的兼容性 |
+| `status` | estimate、candidate、available、unavailable；识别阶段为 not_evaluated |
+| `confidence` | empirical、limited 或 unavailable，属于定性诊断而非概率 |
+| `publication_status` | available 或 not_assessed；不会因保存了数值自动升级 |
+| `reasons` / `interval` | 具体局限和已执行重采样得到的区间；未执行时区间为 null |
+
+读取数值时应同时读取状态；`status=estimate/candidate` 不再要求
+`value=null`。条件性椭圆周期继续使用候选字段。`warm_start_eligible`
+描述当前拟合能否用作后续优化的初值，不代表结构解释已被确认。
+
+批次保持输入顺序，含有限观测或候选的受限结果可使用 `warning` 状态；
+读取异常或无可用结果使用 `failed`。`n_completed` 包括 ok 和 warning，
+`n_success` 仅包括 ok，`n_warning` 单列。JSON 中非有限数值仍为 null。
+
+## 15. 实现验收检查
 
 实现者应至少用 T0 正例、预期失败例和 R0 只读 preflight 验证：
 

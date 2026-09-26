@@ -114,6 +114,8 @@ def normalize_ellipse_settings(settings: Mapping[str, Any] | None) -> dict[str, 
         "residual": "ellipse_residual",
         "multistart": "ellipse_multistart",
     }
+    supplied_nested_keys = set(nested)
+    supplied_root_keys = set(source)
     explicit = bool(nested)
     # ``{"preset": "standard"}`` is a no-op marker commonly emitted by UI
     # persistence.  Treat it like an omitted preset so standard fitting keeps
@@ -287,19 +289,193 @@ def normalize_ellipse_settings(settings: Mapping[str, Any] | None) -> dict[str, 
             raise ValueError(
                 "ellipse b and axis_ratio are inconsistent; provide b/a-consistent values"
             )
+    if preset == "standard":
+        # A standard preset carries no prior by itself.  Only a supplied
+        # geometry value, bound or fixed state makes it explicit; residual
+        # and multistart controls affect the solver but should not replace
+        # this frame's data-derived initial geometry.
+        canonical_default_mapping = (
+            set(ELLIPSE_PRESET_DEFAULTS["standard"]).issubset(supplied_nested_keys)
+            and all(
+                nested.get(name) == default
+                for name, default in ELLIPSE_PRESET_DEFAULTS["standard"].items()
+            )
+        )
+        explicit_geometry_keys = {
+            "axis_ratio_min", "axis_ratio_max", "a_min", "a_max", "b_min", "b_max",
+            "theta_min_deg", "theta_max_deg", "fixed_center", "center_qx", "center_qy",
+            "fixed_angle", "angle_deg", "theta_deg", "theta", "angle", "fixed_a",
+            "fixed_axis_ratio", "center", "a", "b", "axis_ratio",
+        }
+        explicit_root_geometry_keys = {
+            root_name for name, root_name in aliases.items() if name in explicit_geometry_keys
+        }
+        has_explicit_geometry_value = any(
+            result.get(name) is not None
+            for name in (
+                "axis_ratio_min", "axis_ratio_max", "a_min", "a_max",
+                "b_min", "b_max", "theta_min_deg", "theta_max_deg",
+                "a", "b", "axis_ratio",
+            )
+        ) or any(
+            bool(result.get(name))
+            for name in ("fixed_center", "fixed_angle", "fixed_a", "fixed_axis_ratio")
+        ) or any(
+            not np.isclose(float(result[name]), float(ELLIPSE_PRESET_DEFAULTS["standard"][name]))
+            for name in ("center_qx", "center_qy", "angle_deg")
+        )
+        explicitly_supplied_start = bool(
+            (supplied_nested_keys & explicit_geometry_keys)
+            or (supplied_root_keys & explicit_root_geometry_keys)
+        ) and not canonical_default_mapping
+        explicit = has_explicit_geometry_value or explicitly_supplied_start
+    else:
+        explicit = True
     return result if explicit else None
+
+
+def _ellipse_seed_source(value: Any, *, depth: int = 0) -> Mapping[str, Any] | None:
+    """Find measured ellipse values in a fit result or parameter mapping."""
+
+    if depth > 5:
+        return None
+    resolver = getattr(value, "resolve", None)
+    if callable(resolver):
+        try:
+            resolved = resolver()
+        except (TypeError, ValueError):
+            resolved = None
+        if isinstance(resolved, Mapping):
+            value = resolved
+    if isinstance(value, Mapping):
+        geometry_names = {
+            "a", "major_axis", "b", "minor_axis", "axis_ratio", "ratio",
+            "b_over_a", "theta", "theta_rad", "theta_deg", "angle",
+            "angle_rad", "angle_deg", "tilt_deg", "cx", "cy",
+            "center_qx", "center_qy", "center_x", "center_y", "x0", "y0",
+            "center", "centre",
+        }
+        if geometry_names.intersection(value):
+            return value
+        for name in (
+            "geometry_parameters", "ellipse_fit", "ellipse", "candidate_fit",
+            "full2d", "parameters", "parameter_values", "butterfly",
+        ):
+            nested = value.get(name)
+            if nested is not None:
+                source = _ellipse_seed_source(nested, depth=depth + 1)
+                if source is not None:
+                    return source
+        return None
+    for name in (
+        "geometry_parameters", "ellipse_fit", "ellipse", "candidate_fit",
+        "full2d", "parameters", "parameter_values", "butterfly",
+    ):
+        nested = getattr(value, name, None)
+        if nested is not None and nested is not value:
+            source = _ellipse_seed_source(nested, depth=depth + 1)
+            if source is not None:
+                return source
+    return None
+
+
+def _finite_parameter_value(value: Any) -> float | None:
+    """Read a finite scalar from a result value or ParameterSpec-like row."""
+
+    if isinstance(value, Mapping):
+        value = value.get(
+            "value", value.get("estimate", value.get("candidate_value", value.get("initial")))
+        )
+    elif hasattr(value, "value"):
+        value = value.value
+    if isinstance(value, (bool, np.bool_)) or value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if np.isfinite(result) else None
+
+
+def _ellipse_seed_values(value: Any) -> dict[str, float]:
+    """Return finite, physical ellipse starts without importing result types."""
+
+    source = _ellipse_seed_source(value)
+    if source is None:
+        return {}
+
+    def read(*names: str) -> float | None:
+        for name in names:
+            if name in source:
+                candidate = _finite_parameter_value(source[name])
+                if candidate is not None:
+                    return candidate
+        return None
+
+    result: dict[str, float] = {}
+    a = read("a", "major_axis")
+    ratio = read("axis_ratio", "ratio", "b_over_a")
+    b = read("b", "minor_axis")
+    if ratio is None and a is not None and b is not None and a > 0.0:
+        ratio = b / a
+    if a is None and b is not None and ratio is not None and ratio > 0.0:
+        a = b / ratio
+    if a is not None and a > 0.0:
+        result["a"] = a
+    if ratio is not None and 0.0 < ratio <= 1.0:
+        result["axis_ratio"] = ratio
+
+    center = source.get("center", source.get("centre"))
+    if isinstance(center, Mapping):
+        center_x = _finite_parameter_value(center.get("qx", center.get("x")))
+        center_y = _finite_parameter_value(center.get("qy", center.get("y")))
+    else:
+        try:
+            center_x = _finite_parameter_value(center[0]) if center is not None else None
+            center_y = _finite_parameter_value(center[1]) if center is not None else None
+        except (TypeError, IndexError):
+            center_x = center_y = None
+    if center_x is None:
+        center_x = read("cx", "center_qx", "center_x", "x0")
+    if center_y is None:
+        center_y = read("cy", "center_qy", "center_y", "y0")
+    if center_x is not None:
+        result["cx"] = center_x
+    if center_y is not None:
+        result["cy"] = center_y
+
+    theta_deg = read("theta_deg", "angle_deg", "tilt_deg")
+    if theta_deg is None:
+        theta_rad = read("theta", "theta_rad", "angle", "angle_rad")
+        if theta_rad is not None:
+            theta_deg = float(np.degrees(theta_rad))
+    if theta_deg is not None and np.isfinite(theta_deg):
+        result["theta_deg"] = theta_deg
+    return result
 
 
 def ellipse_parameter_specs(
     settings: Mapping[str, Any] | None,
     *,
     q_window: tuple[float, float] | None = None,
+    initial_parameters: Any = None,
 ) -> dict[str, dict[str, Any]] | None:
-    """Build canonical ellipse specs consumed by the measured-ridge fit."""
+    """Build canonical ellipse specs consumed by the measured-ridge fit.
+
+    Finite previous-frame geometry can replace the starting values while the
+    current settings retain their bounds, fixed state, and tied expressions.
+    These values only initialize the current frame's measured-ridge fit.
+    """
 
     normalized = normalize_ellipse_settings(settings)
-    if normalized is None:
+    seed_values = _ellipse_seed_values(initial_parameters)
+    if normalized is None and not seed_values:
         return None
+    if normalized is None:
+        # Let the ellipse engine derive unspecified starts from this frame's
+        # measured ridge.  The previous frame contributes only the finite
+        # values it actually supplied.
+        return {name: {"value": value} for name, value in seed_values.items()}
     q_mid = (
         0.5 * (float(q_window[0]) + float(q_window[1]))
         if q_window is not None
@@ -364,10 +540,51 @@ def ellipse_parameter_specs(
     }
     # ``None`` bounds are omitted for cleaner ParameterSet error messages and
     # stable project/checkpoint JSON.
-    return {
+    specs = {
         name: {key: value for key, value in spec.items() if value is not None}
         for name, spec in specs.items()
     }
+    for name, value in seed_values.items():
+        spec = specs.get(name)
+        if spec is None or spec.get("expr") is not None or spec.get("vary", True) is False:
+            continue
+        lower, upper = spec.get("min"), spec.get("max")
+        if lower is not None:
+            value = max(float(lower), value)
+        if upper is not None:
+            value = min(float(upper), value)
+        spec["value"] = float(value)
+    derived_b = specs["a"]["value"] * specs["axis_ratio"]["value"]
+    b_spec = specs["b"]
+    b_min, b_max = b_spec.get("min"), b_spec.get("max")
+    if b_min is not None and derived_b < float(b_min):
+        for name in ("axis_ratio", "a"):
+            spec = specs[name]
+            if spec.get("expr") is not None or spec.get("vary", True) is False:
+                continue
+            other = specs["a"]["value"] if name == "axis_ratio" else specs["axis_ratio"]["value"]
+            target = float(b_min) / float(other)
+            lower = float(spec.get("min", np.finfo(float).eps))
+            upper = float(spec.get("max", 1.0 if name == "axis_ratio" else float("inf")))
+            spec["value"] = min(max(target, lower), upper)
+            derived_b = specs["a"]["value"] * specs["axis_ratio"]["value"]
+            if derived_b >= float(b_min):
+                break
+    if b_max is not None and derived_b > float(b_max):
+        for name in ("axis_ratio", "a"):
+            spec = specs[name]
+            if spec.get("expr") is not None or spec.get("vary", True) is False:
+                continue
+            other = specs["a"]["value"] if name == "axis_ratio" else specs["axis_ratio"]["value"]
+            target = float(b_max) / float(other)
+            lower = float(spec.get("min", np.finfo(float).eps))
+            upper = float(spec.get("max", 1.0 if name == "axis_ratio" else float("inf")))
+            spec["value"] = min(max(target, lower), upper)
+            derived_b = specs["a"]["value"] * specs["axis_ratio"]["value"]
+            if derived_b <= float(b_max):
+                break
+    b_spec["value"] = float(derived_b)
+    return specs
 
 
 def normalize_ridge_method(value: Any) -> str:
@@ -430,30 +647,6 @@ def validate_analysis_settings(
 
     method = normalize_ridge_method(merged.get("ridge_method", "radial_peak"))
     merged["ridge_method"] = method
-    raw_input = settings if isinstance(settings, Mapping) else {}
-    raw_ellipse = raw_input.get("ellipse") if isinstance(raw_input.get("ellipse"), Mapping) else {}
-    raw_preset = str(
-        raw_ellipse.get("preset", raw_input.get("ellipse_preset", ""))
-        if isinstance(raw_ellipse, Mapping)
-        else raw_input.get("ellipse_preset", "")
-    ).strip().lower().replace("-", "_")
-    root_named_preset = "ellipse_preset" in raw_input
-    nested_named_preset = isinstance(raw_ellipse, Mapping) and "preset" in raw_ellipse
-    nested_standard_marker = (
-        nested_named_preset
-        and set(raw_ellipse).issubset({"preset"})
-        and raw_preset == "standard"
-    )
-    if method == "butterfly_curvature" and not root_named_preset and (
-        not nested_named_preset or nested_standard_marker
-    ):
-        # Butterfly wings are short and flat.  The unconstrained standard
-        # prior lets b/a collapse to a line; apply the documented very-flat
-        # interval unless the caller named a preset.
-        merged["ellipse_preset"] = "flat_ellipse"
-        ellipse = dict(merged.get("ellipse") or {}) if isinstance(merged.get("ellipse"), Mapping) else {}
-        ellipse["preset"] = "flat_ellipse"
-        merged["ellipse"] = ellipse
     if merged.get("butterfly") is not None or method == "butterfly_curvature":
         from .butterfly_settings import normalize_butterfly_settings
 
@@ -546,6 +739,13 @@ def validate_analysis_settings(
         raise ValueError("scales must be a sequence of positive finite numbers")
     merged["scales"] = scales
     ellipse_settings = normalize_ellipse_settings(merged)
+    if ellipse_settings is None:
+        # Keep a complete, editable standard row in validated project settings.
+        # Pipeline fitting separately checks the caller's raw geometry controls
+        # so this display/persistence default does not become an ellipse prior.
+        ellipse_settings = ellipse_preset_defaults("standard")
+        ellipse_settings["residual"] = merged["ellipse_residual"]
+        ellipse_settings["multistart"] = merged["ellipse_multistart"]
     merged["ellipse"] = ellipse_settings
     if ellipse_settings is not None:
         merged["ellipse_preset"] = ellipse_settings["preset"]

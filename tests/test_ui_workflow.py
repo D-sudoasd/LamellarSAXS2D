@@ -58,6 +58,51 @@ class _CancelledBatchEngine:
         return {"records": [{"frame": "first.tif", "status": "ok"}], "cancelled": True}
 
 
+class _WarningBatchEngine:
+    def batch(self, *, parameters, payload):
+        del parameters, payload
+        return {
+            "records": [
+                {
+                    "frame": "limited-frame.tif",
+                    "status": "warning",
+                    "quality_status": "WARN",
+                    "candidate_geometry_parameters": {
+                        "a": 0.21,
+                        "b": 0.0525,
+                        "axis_ratio": 0.25,
+                        "Ln_from_minor_axis_nm": 176.4,
+                    },
+                }
+            ]
+        }
+
+
+class _WarningQualityFailBatchEngine:
+    def batch(self, *, parameters, payload):
+        del parameters, payload
+        return {
+            "records": [
+                {
+                    "frame": "limited-frame.tif",
+                    "status": "warning",
+                    "quality_status": "FAIL",
+                    "diagnostic": "ellipse support is underdetermined",
+                    "geometry_parameters": {"L_from_observed_radius_nm": 68.8},
+                    "candidate_geometry_parameters": {
+                        "a": 0.24,
+                        "b": 0.05,
+                        "axis_ratio": 0.208,
+                        "theta_deg": 34.0,
+                        "Ln_from_minor_axis_nm": 171.2,
+                        "Lz_from_draw_axis_nm": 55.0,
+                    },
+                    "arc_sides": "2/4",
+                }
+            ]
+        }
+
+
 class _StateEngine:
     def __init__(self) -> None:
         self.parameters = {
@@ -181,6 +226,58 @@ def test_batch_failed_record_sets_failed_completion_status(qtbot) -> None:
     assert engine.payloads
     assert "batch failed" in window.status_message.text().lower()
     assert "bad-frame.tif" in window.butterfly_workbench.batch_feedback_label.text()
+    window.close()
+
+
+def test_warning_batch_record_completes_and_remains_available_for_review(qtbot) -> None:
+    window = MainWindow(engine=_WarningBatchEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_batch_frames(["limited-frame.tif"])
+
+    window.run_batch()
+    qtbot.waitUntil(lambda: window._status_key == "status.batch_complete", timeout=2_000)
+
+    assert window.batch_table.item(0, 1).text() == "Warning"
+    assert window.batch_table.item(0, 3).text() == "≈0.21"
+    assert window.batch_table.item(0, 8).text() == "≈176.4"
+    feedback = window.butterfly_workbench.batch_feedback_label.text()
+    assert "1 need review" in feedback
+    assert "failures:" not in feedback
+    window.close()
+
+
+def test_warning_quality_fail_keeps_candidate_batch_record_and_evolution(qtbot) -> None:
+    from butterfly_saxs.ui.main_window import _batch_records_have_failure
+
+    record = {
+        "frame": "limited-frame.tif",
+        "status": "warning",
+        "quality_status": "FAIL",
+        "candidate_geometry_parameters": {"Ln_from_minor_axis_nm": 171.2},
+    }
+    assert not _batch_records_have_failure([record])
+    assert _batch_records_have_failure([{**record, "error": "optimizer failed to run"}])
+    assert _batch_records_have_failure([{**record, "flags": ["input_failed:missing frame"]}])
+
+    window = MainWindow(engine=_WarningQualityFailBatchEngine(), auto_preview=False)
+    qtbot.addWidget(window)
+    window.set_batch_frames(["limited-frame.tif"])
+
+    window.run_batch()
+    qtbot.waitUntil(lambda: window._status_key == "status.batch_complete", timeout=2_000)
+
+    assert window.batch_table.item(0, 1).text() == "Warning"
+    assert window.batch_table.item(0, 2).text() == "FAIL"
+    assert window.batch_table.item(0, 8).text() == "≈171.2"
+    assert "1 need review" in window.butterfly_workbench.batch_feedback_label.text()
+    assert "failures:" not in window.butterfly_workbench.batch_feedback_label.text()
+
+    window.evolution_parameter_combo.setCurrentText("Ln_from_minor_axis_nm")
+    assert window._evolution_rows[0]["Ln_from_minor_axis_nm"] == pytest.approx(171.2)
+    if window.evolution_plot is not None:
+        line = window.evolution_plot.listDataItems()[0]
+        _, line_y = line.getData()
+        assert line_y[0] == pytest.approx(171.2)
     window.close()
 
 
@@ -424,15 +521,41 @@ def test_evolution_flattens_parameter_specs_and_selects_series(qtbot) -> None:
         [
             {"time": 0.0, "parameters": {"theta_deg": {"value": 4.0}, "a": {"value": 10.0}}},
             {"time": 1.0, "parameters": {"theta_deg": {"value": 6.0}, "a": {"value": 12.0}}},
+            {
+                "time": 2.0,
+                "status": "warning",
+                "candidate_geometry_parameters": {"a": 13.0},
+                "quantitative_parameters": {
+                    "theta_deg": {
+                        "value": None,
+                        "candidate_value": 8.0,
+                        "status": "candidate",
+                        "confidence": "limited",
+                    }
+                },
+            },
+            {
+                "time": 3.0,
+                "status": "failed",
+                "parameters": {"theta_deg": {"value": 10.0}},
+            },
         ]
     )
     labels = [window.evolution_parameter_combo.itemText(i) for i in range(window.evolution_parameter_combo.count())]
     assert {"theta_deg", "a"} <= set(labels)
     window.evolution_parameter_combo.setCurrentText("theta_deg")
     assert window.evolution_y_key == "theta_deg"
-    assert [row["theta_deg"] for row in window._evolution_rows] == [4.0, 6.0]
+    assert [row["theta_deg"] for row in window._evolution_rows] == [4.0, 6.0, 8.0, 10.0]
+    assert window._evolution_rows[2]["theta_deg_status"] == "candidate"
+    assert window._evolution_rows[2]["a"] == pytest.approx(13.0)
+    assert window._evolution_rows[2]["a_status"] == "candidate"
     if window.evolution_plot is not None:
-        assert window.evolution_plot.listDataItems()
+        data_items = window.evolution_plot.listDataItems()
+        assert data_items
+        line_x, line_y = data_items[0].getData()
+        assert list(line_x) == [0.0, 1.0, 2.0, 3.0]
+        assert line_y[2] == pytest.approx(8.0)
+        assert np.isnan(line_y[3])
     window.close()
 
 

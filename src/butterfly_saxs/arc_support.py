@@ -627,6 +627,21 @@ def _arc_lookup(arcs: Any) -> tuple[list[Mapping[str, Any]], dict[Any, Mapping[s
     return values, lookup
 
 
+def _is_unassigned_arc_id(value: Any) -> bool:
+    """Return whether an arc identifier is the tracer's unassigned sentinel."""
+
+    if isinstance(value, (bool, np.bool_)):
+        return False
+    if isinstance(value, Integral):
+        return int(value) < 0
+    if isinstance(value, str):
+        try:
+            return int(value.strip()) < 0
+        except ValueError:
+            return False
+    return False
+
+
 def freeze_observed_support(
     points: list[dict[str, Any]],
     arcs: Any,
@@ -649,11 +664,19 @@ def freeze_observed_support(
         raise_if_cancelled(cancel_event, "observed-support-freeze")
 
     arc_values, _ = _arc_lookup(arcs)
+    arc_values = [
+        arc for arc in arc_values
+        if not _is_unassigned_arc_id(arc.get("arc_id", arc.get("id", -1)))
+    ]
     points_by_arc: dict[Any, list[tuple[int, Mapping[str, Any]]]] = {}
+    unassigned_point_count = 0
     for index, point in enumerate(points):
         if not isinstance(point, Mapping):
             continue
         arc_id = point.get("arc_id", -1)
+        if _is_unassigned_arc_id(arc_id):
+            unassigned_point_count += 1
+            continue
         points_by_arc.setdefault(arc_id, []).append((index, point))
         points_by_arc.setdefault(str(arc_id), points_by_arc[arc_id])
     records: list[dict[str, Any]] = []
@@ -762,6 +785,7 @@ def freeze_observed_support(
             "n_arcs": len(records),
             "n_frozen_arcs": sum(status == "frozen" for status in statuses),
             "n_unavailable_arcs": sum(status != "frozen" for status in statuses),
+            "n_unassigned_points": int(unassigned_point_count),
             "n_support_components": sum(len(record.get("support_components", [])) for record in records),
             "n_support_gaps": sum(len(record.get("support_gaps", [])) for record in records),
         },

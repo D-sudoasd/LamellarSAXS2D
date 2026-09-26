@@ -228,6 +228,8 @@ def test_evaluated_undetermined_keeps_reason_and_exposes_unvalidated_candidate(q
                     "value": None,
                     "candidate_value": 0.42,
                     "status": "undetermined",
+                    "confidence": "limited",
+                    "publication_status": "not_assessed",
                     "reason": "candidate geometry is ill-conditioned after evaluation",
                     "interval": None,
                 }
@@ -252,8 +254,10 @@ def test_evaluated_undetermined_keeps_reason_and_exposes_unvalidated_candidate(q
             },
         }
     )
-    assert window.butterfly_workbench.quantity_table.item(0, 2).text() == "未确定"
+    assert window.butterfly_workbench.quantity_table.item(0, 2).text().startswith("未确定")
     assert window.butterfly_workbench.quantity_table.item(0, 3).text() == "0.42"
+    assert "有限支持" in window.butterfly_workbench.quantity_table.item(0, 2).text()
+    assert "未评估发表状态" in window.butterfly_workbench.quantity_table.item(0, 5).text()
     assert "ill-conditioned" in window.butterfly_workbench.quantity_table.item(0, 5).text()
     assert "追踪阶段" not in window.butterfly_workbench.quantity_table.item(0, 5).text()
     labels = [
@@ -310,7 +314,11 @@ def test_workbench_reads_runaway_major_axis_as_ring_only(qtbot, tmp_path):
     ]
     reading_row = labels.index("判读")
     assert window.butterfly_workbench.quantity_table.item(reading_row, 1).text() == "仅一阶环"
-    assert "Ln 候选（nm）" not in labels
+    assert "Ln 候选（nm）" in labels
+    assert "长轴 L 候选（nm）" in labels
+    ln_row = labels.index("Ln 候选（nm）")
+    assert window.butterfly_workbench.quantity_table.item(ln_row, 2).text() == "candidate · limited"
+    assert window.butterfly_workbench.quantity_table.item(ln_row, 3).text() == "125"
     assert "环 L（nm）" in labels
     window.resize(980, 680)
     window.show()
@@ -318,6 +326,50 @@ def test_workbench_reads_runaway_major_axis_as_ring_only(qtbot, tmp_path):
     shot = tmp_path / "workbench-ring-only.png"
     window.butterfly_workbench.save_screenshot(shot)
     assert shot.stat().st_size > 0
+    window.close()
+
+
+def test_rejected_and_invalid_candidates_are_visible_in_the_butterfly_views(qtbot):
+    window = MainWindow(engine=_ButterflyEngine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+    page = window.butterfly_workbench
+    assert page.show_excluded_check.isChecked()
+    rejected = {
+        "point_id": "candidate-1",
+        "qx": 0.1,
+        "qy": 0.2,
+        "branch_id": 0,
+        "side": "upper",
+        "accepted": True,
+        "valid": False,
+        "reason": "low_local_support",
+        "confidence": "limited",
+    }
+    rejected_accepted = {
+        **rejected,
+        "point_id": "candidate-2",
+        "accepted": False,
+        "valid": True,
+    }
+    page.set_result(
+        {"points": [rejected, rejected_accepted], "profiles": {}, "quantitative_parameters": {}}
+    )
+    assert page.qspace._point_visible(rejected)
+    assert page.qspace._point_visible(rejected_accepted)
+    assert "×" in page.point_list.item(0).text()
+    assert "×" in page.point_list.item(1).text()
+    assert "limited" in page.point_list.item(0).toolTip()
+
+    page.ellipse_diagnostic.set_uv_series(
+        [
+            {"u": 0.1, "v": 0.02, "side": "upper", "accepted": True, "valid": True},
+            {"u": 0.2, "v": 0.03, "side": "upper", "accepted": True, "valid": False},
+        ],
+        {},
+    )
+    names = [item.opts.get("name", "") for item in page.ellipse_diagnostic.plot.listDataItems()]
+    assert "upper points" in names
+    assert "upper excluded candidates" in names
     window.close()
 
 
@@ -366,6 +418,15 @@ def test_programmatic_butterfly_export_is_authoritative_non_overwriting_and_stal
     service = ButterflyAnalysisService(analysis_settings=settings)
     state = service.set_observed(case["image"], qmap=case["qmap"])
     result = service.measure_geometry(payload=state)
+    result["butterfly"]["quantitative_parameters"]["a"] = {
+        "value": 0.2,
+        "candidate_value": 0.2,
+        "status": "candidate",
+        "confidence": "limited",
+        "publication_status": "not_assessed",
+        "reason": "limited observed support",
+        "unit": "nm^-1",
+    }
 
     window = MainWindow(engine=service, auto_preview=False, language="en")
     qtbot.addWidget(window)
@@ -395,6 +456,12 @@ def test_programmatic_butterfly_export_is_authoritative_non_overwriting_and_stal
     for row in csv_rows:
         source = authoritative[row["parameter"]]
         assert row["candidate_value"] == ("" if source.get("candidate_value") is None else str(source.get("candidate_value")))
+        assert row["confidence"] == ("" if source.get("confidence") is None else str(source.get("confidence")))
+        assert row["publication_status"] == (
+            "" if source.get("publication_status") is None else str(source.get("publication_status"))
+        )
+    assert csv_rows[0]["confidence"] == "limited"
+    assert csv_rows[0]["publication_status"] == "not_assessed"
     with pytest.raises(FileExistsError):
         window.butterfly_workbench.export_analysis(target)
     window.butterfly_workbench._on_edit_requested({"type": "seed", "qx": 0.1, "qy": 0.2})

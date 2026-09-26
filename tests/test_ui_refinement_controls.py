@@ -89,6 +89,24 @@ def _flat_settings() -> dict:
     }
 
 
+def test_butterfly_actions_keep_standard_preset_without_implicit_flat_prior(qtbot) -> None:
+    window = MainWindow(engine=_Engine(), auto_preview=False, language="en")
+    qtbot.addWidget(window)
+
+    payload = window._butterfly_page_analysis({"stage": "evaluate"})
+    assert payload == {
+        "ridge_method": "butterfly_curvature",
+        "butterfly": {"stage": "evaluate"},
+    }
+    assert "ellipse_preset" not in payload
+    assert window.ellipse_preset_combo.currentData() == "standard"
+
+    flat_index = window.ellipse_preset_combo.findData("flat_ellipse")
+    window.ellipse_preset_combo.setCurrentIndex(flat_index)
+    assert window.analysis_settings["ellipse"]["preset"] == "flat_ellipse"
+    window.close()
+
+
 def test_flat_controls_round_trip_and_fit_tabs_are_compact(qtbot) -> None:
     engine = _Engine()
     window = MainWindow(
@@ -459,9 +477,33 @@ def test_batch_table_shows_ellipse_parameters_and_folder_controls(qtbot) -> None
             }
         ]
     )
-    assert window.batch_table.item(0, 8).text() == "—"
+    assert window.batch_table.item(0, 8).text() == "≈174.5"
     assert "174.5" in window.batch_table.item(0, 8).toolTip()
-    assert "Unpublished" in window.batch_table.item(0, 8).toolTip()
+    assert "Ellipse-derived candidates" in window.batch_table.item(0, 8).toolTip()
+    assert "first-order period" in window.batch_table.item(0, 8).toolTip()
+    window._update_batch_rows(
+        [
+            {
+                "frame": "candidate-frame.tif",
+                "status": "warning",
+                "quality_status": "WARN",
+                "geometry_parameters": {"L_from_observed_radius_nm": 68.3},
+                "candidate_geometry_parameters": {
+                    "a": 0.21,
+                    "b": 0.0525,
+                    "axis_ratio": 0.25,
+                    "theta_deg": 31.0,
+                    "Ln_from_minor_axis_nm": 176.4,
+                },
+            }
+        ]
+    )
+    assert window.batch_table.item(0, 1).text() == "Warning"
+    assert window.batch_table.item(0, 3).text() == "≈0.21"
+    assert window.batch_table.item(0, 5).text() == "≈0.25"
+    assert "candidate" in window.batch_table.item(0, 3).toolTip()
+    assert window.batch_table.item(0, 8).text() == "≈176.4"
+    assert window.batch_table.item(0, 10).text() == "68.3"
     window._update_batch_rows(
         [
             {

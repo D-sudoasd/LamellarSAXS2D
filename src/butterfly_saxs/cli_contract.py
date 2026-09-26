@@ -31,7 +31,7 @@ INVARIANTS = (
     "success=True and solver_status=success are not scientific acceptance.",
     "pixel-q never becomes a physical period; load a PONI before reporting L in nm.",
     "Do not fabricate missing butterfly quadrants or opposite-side arcs.",
-    "A flat_ellipse bound hit or a runaway major axis is ring-only; do not copy ring L into Ln.",
+    "Keep bound-limited or extrapolated ellipse values as labelled candidates; do not copy ring L into Ln.",
     "Do not overwrite outputs without an explicit --force; --force never applies to raw inputs.",
     "Identify (trace) then Evaluate; --full2d is a separate empirical intensity model.",
     "geometry-only analysis must not silently start full2d.",
@@ -180,14 +180,14 @@ def agent_guidance(
             next_steps.append("Provide --poni before interpreting q*, L ring, or any spacing as physical.")
         next_steps.append(
             "bsaxs analyze INPUT --ridge-method butterfly_curvature "
-            "--ellipse-preset flat_ellipse --butterfly-stage evaluate"
+            "--ellipse-preset standard --butterfly-stage evaluate"
         )
         next_steps.append("Do not pass --full2d unless an empirical whole-pixel intensity model is explicitly requested.")
     elif command == "analyze":
         if quality_gate_reason:
-            next_steps.append(f"Quality gate reported ({quality_gate_reason}); keep the JSON evidence, do not publish ellipse shape.")
+            next_steps.append(f"Quality diagnostics: {quality_gate_reason}. Inspect retained estimates, confidence and reasons; refine the mask, q window or constraints where indicated.")
         if publication == "ring":
-            next_steps.append("Publish first-order ring L only; leave Ln/Lz/major-axis unpublished.")
+            next_steps.append("Use the independently measured ring period and inspect the constrained ellipse candidates separately.")
         if pixel_q:
             next_steps.append("Result is pixel-q; do not convert to nm without a PONI.")
         next_steps.append("Treat solver success as an engineering status, not scientific acceptance.")
@@ -195,6 +195,8 @@ def agent_guidance(
         failed = report.get("n_failed")
         if isinstance(failed, int) and failed > 0:
             next_steps.append("Inspect failed frames in stdout JSON and the output directory; remaining frames were isolated.")
+        if report.get("n_warning"):
+            next_steps.append("Warning frames retain estimates and diagnostics; compare their candidate values and confidence across the sequence.")
         if report.get("blocked_stage") == "preflight":
             next_steps.append("Read preflight/preflight.json; fitting did not start.")
         elif report.get("unattended"):
@@ -268,7 +270,7 @@ def agent_manifest() -> dict[str, Any]:
         "defaults": {
             "ridge_method": "radial_peak",
             "recommended_ridge_method": "butterfly_curvature",
-            "recommended_ellipse_preset": "flat_ellipse",
+            "recommended_ellipse_preset": "standard",
             "recommended_butterfly_stage": "evaluate",
             "overwrite": False,
         },
@@ -278,7 +280,7 @@ def agent_manifest() -> dict[str, Any]:
             "bsaxs synthetic --shape 128x128 -o synthetic.npz",
             "bsaxs inspect synthetic.npz",
             "bsaxs analyze synthetic.npz --ridge-method butterfly_curvature "
-            "--ellipse-preset flat_ellipse --butterfly-stage evaluate --butterfly-resamples 0",
+            "--ellipse-preset standard --butterfly-stage evaluate --butterfly-resamples 0",
             "bsaxs preflight PACKAGE --manifest MANIFEST --poni PONI --mask MASK -o results/preflight",
             "bsaxs batch 'PACKAGE/images/*.edf' --unattended PACKAGE --manifest PACKAGE/manifest.csv --poni PACKAGE/geometry.poni --mask PACKAGE/mask.npy -o results/unattended_001",
         ],

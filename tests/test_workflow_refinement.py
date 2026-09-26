@@ -400,7 +400,7 @@ def test_service_batch_butterfly_stage_uses_geometry_path_and_forced_recipe(monk
     assert result["records"][0]["parameters"]["theta_deg"] == pytest.approx(28.0)
 
 
-def test_service_batch_butterfly_stage_applies_flat_ellipse_and_keeps_periods(monkeypatch, tmp_path: Path) -> None:
+def test_service_batch_butterfly_stage_uses_standard_fit_and_keeps_warning_candidates(monkeypatch, tmp_path: Path) -> None:
     service = ButterflyAnalysisService()
     source = tmp_path / "frame.npy"
     source.write_bytes(b"frame")
@@ -423,8 +423,8 @@ def test_service_batch_butterfly_stage_applies_flat_ellipse_and_keeps_periods(mo
                 "b": 0.0144,
                 "axis_ratio": 0.02,
                 "theta_deg": 17.0,
-                "Ln_from_minor_axis_nm": 436.0,
-                "Lz_from_draw_axis_nm": 8.7,
+                "Ln_candidate_from_minor_axis_nm": 436.0,
+                "Lz_candidate_from_draw_axis_nm": 8.7,
             },
             "ellipse_fit": {
                 "rmse": 0.01,
@@ -434,9 +434,16 @@ def test_service_batch_butterfly_stage_applies_flat_ellipse_and_keeps_periods(mo
                 "Lz_from_draw_axis_nm": 8.7,
             },
             "butterfly": {
-                "quality": {"metrics": {"side_counts": {
-                    "0_upper": 12, "0_lower": 11, "1_upper": 10, "1_lower": 9,
-                }}},
+                "candidate_fit": {
+                    "success": True,
+                    "parameters": {"a": 0.72, "b": 0.0144, "axis_ratio": 0.02, "theta_deg": 17.0},
+                },
+                "quality": {
+                    "status": "WARN",
+                    "metrics": {"side_counts": {
+                        "0_upper": 12, "0_lower": 11, "1_upper": 10, "1_lower": 9,
+                    }},
+                },
             },
             "metrics": {"rmse": 0.01, "success": True},
             "flags": [],
@@ -454,16 +461,20 @@ def test_service_batch_butterfly_stage_applies_flat_ellipse_and_keeps_periods(mo
     )
     analysis = seen[0]
     assert analysis["ridge_method"] == "butterfly_curvature"
-    assert analysis["ellipse_preset"] == "flat_ellipse"
-    assert analysis["ellipse"]["preset"] == "flat_ellipse"
+    assert analysis.get("ellipse_preset", "standard") == "standard"
+    assert "ellipse" not in analysis
     assert analysis["butterfly"]["sensitivity"] is False
     assert analysis["butterfly"]["resamples"] == 0
     assert analysis["butterfly"]["run_wang_check"] is False
     assert analysis["butterfly"]["companion_observables"] is False
     record = result["records"][0]
+    assert record["status"] == "warning"
+    assert "WARN" in record["diagnostic"]
     assert record["arc_sides"] == "4/4"
-    assert record["geometry_parameters"]["Ln_from_minor_axis_nm"] == pytest.approx(436.0)
-    assert record["geometry_parameters"]["Lz_from_draw_axis_nm"] == pytest.approx(8.7)
+    assert record["geometry_parameters"]["Ln_candidate_from_minor_axis_nm"] == pytest.approx(436.0)
+    assert record["geometry_parameters"]["Lz_candidate_from_draw_axis_nm"] == pytest.approx(8.7)
+    assert "Ln_from_minor_axis_nm" not in record["geometry_parameters"]
+    assert "Lz_from_draw_axis_nm" not in record["geometry_parameters"]
 
 
 def test_service_batch_butterfly_warm_start_seeds_next_ellipse(monkeypatch, tmp_path: Path) -> None:

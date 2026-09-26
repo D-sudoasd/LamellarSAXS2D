@@ -34,9 +34,8 @@ def test_old_method_is_preserved_and_new_recipe_is_independent():
     settings = validate_analysis_settings({"ridge_method": "butterfly_curvature", "butterfly": recipe})
     settings["butterfly"]["edits"][0]["qx"] = 10.
     assert recipe["edits"][0]["qx"] == .2
-    assert settings["ellipse"]["preset"] == "flat_ellipse"
-    assert settings["ellipse"]["axis_ratio_min"] == pytest.approx(0.005)
-    assert settings["ellipse"]["axis_ratio_max"] == pytest.approx(0.35)
+    assert settings["ellipse"]["preset"] == "standard"
+    assert settings["ellipse"]["axis_ratio_max"] is None
     named = validate_analysis_settings(
         {"ridge_method": "butterfly_curvature", "ellipse_preset": "very_flat_ellipse"}
     )
@@ -45,6 +44,10 @@ def test_old_method_is_preserved_and_new_recipe_is_independent():
         {"ridge_method": "butterfly_curvature", "ellipse_preset": "standard"}
     )
     assert standard["ellipse"]["preset"] == "standard"
+    nested = validate_analysis_settings(
+        {"ridge_method": "butterfly_curvature", "ellipse": {"preset": "standard"}}
+    )
+    assert nested["ellipse"]["preset"] == "standard"
 
 
 @pytest.mark.parametrize("recipe", [
@@ -149,6 +152,8 @@ def test_service_preview_withholds_new_ring_only_shapes(monkeypatch, flag) -> No
     assert all(name not in result["geometry_parameters"] for name in
                ("semi_major", "semi_minor", "axes_ratio", "ellipse_axis_tilt_deg"))
     assert result["butterfly"]["candidate_fit"]["a"] == 1.0
+    assert result["candidate_geometry_parameters"]["a"] == 1.0
+    assert result["candidate_geometry_parameters"]["axis_ratio"] == 0.3
 
 
 def test_two_occupied_sides_are_an_engineering_fail() -> None:
@@ -157,6 +162,8 @@ def test_two_occupied_sides_are_an_engineering_fail() -> None:
             "accepted": True,
             "branch_id": 0,
             "side": side,
+            "qx": 0.2,
+            "qy": 0.02 if side == "upper" else -0.02,
             "localization_sigma_q": 0.001,
         }
         for side in ("upper", "lower")
@@ -183,6 +190,8 @@ def test_axis_ratio_floor_is_a_ring_warning() -> None:
             "accepted": True,
             "branch_id": branch,
             "side": side,
+            "qx": 0.1 if branch == 0 else -0.1,
+            "qy": 0.001 if side == "upper" else -0.001,
             "localization_sigma_q": 0.001,
         }
         for branch in (0, 1)
@@ -371,6 +380,7 @@ def test_unidentified_frame_cannot_seed_the_next_frame(tmp_path):
 def test_flat_butterfly_evaluate_recovers_axes_and_origin_centered_periods() -> None:
     from butterfly_saxs.benchmark_arcs import generate_arc_case
     from butterfly_saxs.butterfly import analyze_butterfly
+    from butterfly_saxs.analysis_config import ellipse_parameter_specs
 
     case = generate_arc_case("ellipse_ratio_020", seed=502, shape=(96, 96))
     result = analyze_butterfly(
@@ -379,6 +389,7 @@ def test_flat_butterfly_evaluate_recovers_axes_and_origin_centered_periods() -> 
         (0.05, 1.1),
         mask=case.get("mask"),
         options={"stage": "evaluate", "resamples": 0, "sensitivity": False, "run_wang_check": False},
+        parameters=ellipse_parameter_specs({"ellipse_preset": "flat_ellipse"}),
         reference_axis_deg=0.0,
         multistart=5,
     )
@@ -406,6 +417,7 @@ def test_flat_butterfly_evaluate_recovers_axes_and_origin_centered_periods() -> 
 def test_very_flat_butterfly_evaluate_keeps_ratio_above_line_collapse() -> None:
     from butterfly_saxs.benchmark_arcs import generate_arc_case
     from butterfly_saxs.butterfly import analyze_butterfly
+    from butterfly_saxs.analysis_config import ellipse_parameter_specs
 
     case = generate_arc_case("ellipse_ratio_005", seed=501, shape=(80, 80))
     result = analyze_butterfly(
@@ -414,6 +426,7 @@ def test_very_flat_butterfly_evaluate_keeps_ratio_above_line_collapse() -> None:
         (0.05, 1.1),
         mask=case.get("mask"),
         options={"stage": "evaluate", "resamples": 0, "sensitivity": False, "run_wang_check": False},
+        parameters=ellipse_parameter_specs({"ellipse_preset": "flat_ellipse"}),
         reference_axis_deg=0.0,
         multistart=5,
     )
@@ -447,6 +460,9 @@ def test_service_and_pipeline_share_actual_butterfly_measurement(tmp_path):
     cli_result = analyze_frame(case["image"], qmap=case["qmap"],
                                config={"analysis": settings}, full2d=False)
     assert gui_result["butterfly"] is not None
+    assert cli_result.ellipse_fit["axis_ratio"] == pytest.approx(case["truth"]["axis_ratio"], abs=0.02)
+    assert cli_result.butterfly["warm_start_eligible"] is True
+    assert cli_result.butterfly["quantitative_parameters"]["axis_ratio"]["status"] == "estimate"
     for key in ("a", "b", "axis_ratio", "theta_deg", "rmse"):
         assert gui_result["ellipse_fit"][key] == pytest.approx(cli_result.ellipse_fit[key], nan_ok=True)
     ui_points = gui_result["butterfly"]["points"]
@@ -462,9 +478,9 @@ def test_service_and_pipeline_share_actual_butterfly_measurement(tmp_path):
     export_result(cli_result, target)
     with target.open(encoding="utf-8") as handle:
         rows = {row["parameter"]: row for row in csv.DictReader(handle)}
-    assert rows["a"]["value"] == ""
+    assert float(rows["a"]["value"]) == pytest.approx(cli_result.ellipse_fit["a"])
     assert float(rows["a"]["candidate_value"]) == pytest.approx(cli_result.ellipse_fit["a"])
-    assert rows["a"]["identifiability_status"] == "undetermined"
+    assert rows["a"]["identifiability_status"] in {"estimate", "candidate"}
     assert set(cli_result.butterfly["ellipse_local"]) == {"0", "1"}
     assert any(profile.get("residual") for profile in cli_result.butterfly["profiles"].values())
     symmetry = cli_result.ellipse_fit["symmetry"]

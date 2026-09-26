@@ -106,13 +106,87 @@ def _trace_reference_center(trace: Mapping[str, Any]) -> tuple[float, float] | N
     return None
 
 
+def _used_trace_points(trace_points: Any, point_diagnostics: Any) -> list[Mapping[str, Any]]:
+    """Return finite traced points the arc solver actually used.
+
+    Public point IDs are the stable link between a trace and its fit
+    diagnostics.  The trace remains intact for review; summary measurements
+    must use the solver's ``used`` records so rejected or unassigned points do
+    not affect counts, symmetry diagnostics, or the observed-radius period.
+    """
+
+    if not isinstance(trace_points, (list, tuple)):
+        return []
+    if not isinstance(point_diagnostics, (list, tuple)):
+        return []
+    used_ids = {
+        str(diagnostic.get("point_id", index))
+        for index, diagnostic in enumerate(point_diagnostics)
+        if isinstance(diagnostic, Mapping) and diagnostic.get("used") is True
+    }
+    used_points: list[Mapping[str, Any]] = []
+    for index, point in enumerate(trace_points):
+        if not isinstance(point, Mapping):
+            continue
+        if str(point.get("point_id", index)) not in used_ids:
+            continue
+        qx = _finite_bound(point.get("qx"))
+        qy = _finite_bound(point.get("qy"))
+        if qx is None or qy is None:
+            continue
+        arc_id = point.get("arc_id")
+        if arc_id is not None:
+            try:
+                if float(arc_id) < 0.0:
+                    continue
+            except (TypeError, ValueError, OverflowError):
+                pass
+        used_points.append(point)
+    return used_points
+
+
 def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, max_nfev=800):
     from .arc_geometry import fit_arc_ellipses
 
-    supported = [p for p in trace.get("points", [])
-                 if p.get("accepted", p.get("valid", False))
-                 and p.get("branch_id") in (0, 1) and p.get("side") in ("upper", "lower")]
-    if len(supported) < 5 or len({p["branch_id"] for p in supported}) < 2:
+    trace_points = trace.get("points", [])
+    if not isinstance(trace_points, (list, tuple)):
+        trace_points = []
+    if not trace_points:
+        return _empty_candidate(
+            unit,
+            reference,
+            "No observed arc points",
+            diagnostics=trace,
+        )
+    supported = []
+    has_coordinate_fields = False
+    for point in trace_points:
+        if not isinstance(point, Mapping):
+            continue
+        has_coordinate_fields |= "qx" in point or "qy" in point
+        if (
+            not point.get("accepted", point.get("valid", False))
+            or not point.get("valid", True)
+            or point.get("branch_id") not in (0, 1)
+            or point.get("side") not in ("upper", "lower")
+        ):
+            continue
+        qx = _finite_bound(point.get("qx"))
+        qy = _finite_bound(point.get("qy"))
+        if qx is None or qy is None:
+            continue
+        arc_id = point.get("arc_id")
+        if arc_id is not None:
+            try:
+                if float(arc_id) < 0.0:
+                    continue
+            except (TypeError, ValueError, OverflowError):
+                pass
+        supported.append(point)
+    # Legacy diagnostic adapters may omit q coordinates entirely. Let the
+    # canonical fitter return their detailed exclusion reasons, but never use
+    # those records in any fit summary below.
+    if (len(supported) < 5 or len({p["branch_id"] for p in supported}) < 2) and has_coordinate_fields:
         return _empty_candidate(
             unit,
             reference,
@@ -144,13 +218,14 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
     point_diagnostics = result.get("point_diagnostics", [])
     if isinstance(point_diagnostics, Mapping):
         point_diagnostics = list(point_diagnostics.values())
+    fitted_points = _used_trace_points(trace_points, point_diagnostics)
     distances = [p["distance_q"] for p in point_diagnostics
                  if p.get("distance_q") is not None and np.isfinite(p["distance_q"])]
     rmse = float(np.sqrt(np.mean(np.square(distances)))) if distances else None
     swap = bool(result.get("branch_swap_applied", False))
     payload = canonical_ellipse_payload(
         fit,
-        n_points=len(supported),
+        n_points=len(fitted_points),
         qmap={"q_unit": unit},
         config={"analysis": {"draw_axis_deg": float(reference) + 90.0}},
     )
@@ -165,7 +240,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
         symmetry_center = reference_center if reference_center is not None else (0.0, 0.0)
         center_source = "trace_option" if reference_center is not None else "q_origin_default"
     symmetry_points, symmetry_labels = [], []
-    for point in supported:
+    for point in fitted_points:
         try:
             qx, qy = float(point["qx"]), float(point["qy"])
         except (KeyError, TypeError, ValueError):
@@ -178,7 +253,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
         np.asarray(symmetry_labels, dtype=float),
         center=symmetry_center,
         reference_axis_deg=reference,
-        unassigned_count=len(supported) - len(symmetry_points),
+        unassigned_count=len(fitted_points) - len(symmetry_points),
         center_verified=False,
         azimuthal=trace.get("method_version", "").startswith("butterfly-annular-"),
     )
@@ -220,7 +295,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
     first_order = diagnostics.get("first_order_q_hint") if isinstance(diagnostics, Mapping) else {}
     hint = first_order.get("q_star") if isinstance(first_order, Mapping) else None
     q_star, radius_period, radius_flags = observed_arc_radius_period(
-        supported, unit, first_order_q=hint
+        fitted_points, unit, first_order_q=hint
     )
     annular = trace.get("method_version", "").startswith("butterfly-annular-")
     if annular:
@@ -257,7 +332,7 @@ def _fit_trace(trace, *, parameters, reference, multistart, unit, cancel_event, 
             "parameter_values": dict(values),
             "ellipses": members,
             "q_unit": unit,
-            "n_points": len(supported),
+            "n_points": len(fitted_points),
             "rmse": rmse,
             "residual_rms": rmse,
             "rss": float(np.sum(np.square(distances))) if distances else None,
@@ -325,7 +400,7 @@ _BOUND_SHIFT_FRACTION = 0.5
 def _finite_bound(value):
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if np.isfinite(number) else None
 

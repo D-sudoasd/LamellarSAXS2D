@@ -266,9 +266,11 @@ PowerShell 中若使用通配符，建议加引号让 CLI 自己展开；CLI 也
 
 `--stream` 逐帧把 CSV、JSONL 和 NPZ 数组写入临时证据包，并释放已处理帧的 detector 数组；适合 1679×1475 或更大探测器的长序列。流式 checkpoint 仍只保存数组摘要。resume 会先验证上一轮 manifest、NPZ 元数据和声明的数组成员，再保留已恢复帧的原始数组，只替换实际重跑的帧；如果上一轮 bundle 没有可验证的 manifest/数组，会拒绝恢复。参数、ridge、lobe、椭圆和 flags 仍逐帧保留。取消请求会在当前帧结束后停止，并把 `cancelled`、`processed_count`、`elapsed_s` 与最后 checkpoint 写出。
 
-当椭圆的 `quantitative_parameters` 未给出全部可用的轴长与倾角时，批次参数表中由该椭圆推得的 `L_N`、`L_z` 和长轴周期的 `value` 留空；原始拟合数值仅写入带 `identifiability_status=undetermined` 的 `candidate_value`。径向反射环的独立周期字段不受这条椭圆门槛影响。
+轴长、轴比和倾角的有限估计保留在批次参数表的 `value` 中，同时导出 `identifiability_status`、可靠性及原因。`estimate` 表示观测支持的估计，`candidate` 表示受局部支持、边界等条件限制的候选；未执行重采样不会清空这些值。由受限椭圆推得的 `L_N`、`L_z` 和长轴周期继续放在明确标识的 `candidate_value` 中，界面可查看，不能与独立径向反射环周期混用。缺失帧保留原序号，趋势线在缺口处断开。
 
-恢复只接受 checkpoint 中 `status=ok` 且质量检查通过的帧；失败、质量 FAIL 或不完整帧会在恢复时重新读取和拟合，这是预期的 failed-frame retry 行为。若所有选中帧都能从已验证 checkpoint 恢复，stream exporter 会走 no-op fast path，保留原 NPZ 成员而不重新压缩；这只优化 I/O，不把质量 WARN/FAIL 改写成 PASS。
+批次帧状态 `ok` 表示完成且未记录质量警告，`warning` 表示完成并保留候选或观测值，但存在质量或拟合问题，`failed` 表示异常或没有可用结果。JSON 的 `n_completed` 包括 `ok` 与 `warning`；`n_success` 仅统计 `ok`，`n_warning` 单独计数。警告会使命令返回 1，但结果文件仍可用于复核与后续分析。
+
+恢复会重新检查 checkpoint 中 `ok` 与 `warning` 帧保存的结果；含可用观测或估计的警告帧可直接恢复，异常或无可用结果的帧重新读取和拟合。是否可作为下一帧初值另按数值及观测支持判断。若所有选中帧都能从已验证 checkpoint 恢复，stream exporter 会走 no-op fast path，保留原 NPZ 成员而不重新压缩；恢复保留原有质量诊断。
 
 Qt/service 批处理还支持 `stage = "geometry"`（或 `full2d = false`）只提取 observed ridge/lobe/椭圆；省略这两个字段时保持旧的 full2d 优化行为。geometry 阶段的 `parameters` 是实际测得的椭圆参数，full2d 强度参数保存在独立的 `intensity_parameters` 字段，不会覆盖用户的强度初值。流式导出额外写出 `lobe_measurements.csv`，其中每个观测 lobe 的角度、radial `q_star`、FWHM、SNR、面积、coverage、valid/reason 和 q 单位都是标量列；这张表不把 azimuthal annulus q 冒充 radial 峰。
 
@@ -277,7 +279,7 @@ Qt/service 批处理还支持 `stage = "geometry"`（或 `full2d = false`）只�
 ### 两种已实现模式
 
 - `independent`：每帧独立调用分析器，不使用上一帧结果作为初值。
-- `warm_start`：上一帧明确通过质量检查的结果作为下一帧初始状态；失败帧不会成为后续初值。checkpoint 恢复的成功帧也可以成为 warm start 链的一部分。
+- `warm_start`：上一帧具有有效数值和观测支持的几何结果可作为下一帧初值，不要求先完成重采样或置信区间校准。每帧仍使用自己的强度数据拟合，并保留当前参数边界；无效、退化或不可用的初值不传递。checkpoint 恢复的可用结果也可延续初值链，来源帧写入 `warm_start_from`。
 
 当前批处理**没有**跨全序列的 global/shared 联合优化：没有一个自由参数向量同时用所有帧求解。`fixed`/`Expr` 只定义每一帧精修的参数状态；如果希望参数在序列中保持同一固定值，请在配置中明确固定并把该配置随 provenance 保存，但不要把它称为 joint/shared refinement。真正的跨帧 shared free 参数拟合属于后续扩展。
 

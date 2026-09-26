@@ -962,6 +962,7 @@ def _analysis_options(image: np.ndarray, qmap: Any, config: Any = None) -> dict[
     # historical pipeline aliases into it once, then only resolve q bounds
     # from the actual q map below.
     from .settings import resolve_analysis_settings
+    from .analysis_config import normalize_ellipse_settings
 
     raw: dict[str, Any] = {}
     if isinstance(config, Mapping):
@@ -996,6 +997,7 @@ def _analysis_options(image: np.ndarray, qmap: Any, config: Any = None) -> dict[
     canonical = resolve_analysis_settings(raw)
     method = canonical["ridge_method"]
     ellipse = canonical.get("ellipse")
+    ellipse_parameter_settings = normalize_ellipse_settings(raw)
     return {
         "q_window": _q_window(image, qmap, canonical),
         "mask": raw.get("mask"),
@@ -1018,6 +1020,11 @@ def _analysis_options(image: np.ndarray, qmap: Any, config: Any = None) -> dict[
         "curvature_percentile": canonical["curvature_percentile"],
         "curvature_normal_step": canonical["normal_step"],
         "ellipse": ellipse,
+        # Validated settings keep the standard preset visible to project/UI
+        # consumers.  Only explicitly supplied geometry controls initialize
+        # the solver; a standard preset by itself leaves this frame's ridge to
+        # provide its own data-driven start.
+        "_ellipse_parameter_settings": ellipse_parameter_settings,
         "ellipse_residual": canonical["ellipse_residual"],
         "ellipse_multistart": canonical["ellipse_multistart"],
         "full2d_multistart": canonical["full2d_multistart"],
@@ -1178,6 +1185,7 @@ def measure_observables(
     *,
     config: Any = None,
     frame: Any = None,
+    initial_parameters: Any = None,
     fit_ellipse: bool = True,
     analysis_domain: AnalysisDomain | None = None,
     cancel_event: Any = None,
@@ -1189,11 +1197,14 @@ def measure_observables(
     options = _analysis_options(image, qmap, config)
     domain = analysis_domain or _analysis_domain(image, qmap, config=config)
     observed_frame = frame if frame is not None else _loaded_frame(image)
-    from .settings import ellipse_parameter_specs
+    from .analysis_config import ellipse_parameter_specs
 
     ellipse_parameters = ellipse_parameter_specs(
-        {"ellipse": options["ellipse"]} if options["ellipse"] is not None else None,
+        {"ellipse": options["_ellipse_parameter_settings"]}
+        if options["_ellipse_parameter_settings"] is not None
+        else None,
         q_window=domain.q_window,
+        initial_parameters=initial_parameters,
     )
     result = _call_supported(
         observable_module.measure_observables,
@@ -2083,6 +2094,7 @@ def analyze_frame(
         qmap_obj,
         config=config,
         frame=bundle.frame,
+        initial_parameters=initial_parameters,
         fit_ellipse=True,
         analysis_domain=domain,
         cancel_event=cancel_event,
@@ -2125,8 +2137,10 @@ def analyze_frame(
         "parameters": {},
         "flags": ("ellipse_unavailable",),
     }
-    if options["ellipse"] is not None:
-        ellipse_fit["constraint_config"] = _jsonable(options["ellipse"], array_summary=False)
+    if options["_ellipse_parameter_settings"] is not None:
+        ellipse_fit["constraint_config"] = _jsonable(
+            options["_ellipse_parameter_settings"], array_summary=False
+        )
         ellipse_fit["flags"] = tuple(
             dict.fromkeys(tuple(ellipse_fit.get("flags", ())) + ("ellipse_constraints_active",))
         )
@@ -2156,7 +2170,8 @@ def analyze_frame(
     if isinstance(full2d_result, Mapping) and full2d_result.get("sampled_indices") is not None:
         domain = domain.with_sampled_indices(full2d_result["sampled_indices"])
     public_analysis = {
-        key: value for key, value in options.items() if key != "butterfly_options"
+        key: value for key, value in options.items()
+        if key not in {"butterfly_options", "_ellipse_parameter_settings"}
     }
     result = PipelineResult(
         image=image,
@@ -2171,7 +2186,7 @@ def analyze_frame(
             "mechanism_under_determined": True,
             "forward_simulation_only": False,
             "nonunique_inverse_problem": True,
-            "ellipse_constraints_active": options["ellipse"] is not None,
+            "ellipse_constraints_active": options["_ellipse_parameter_settings"] is not None,
         },
         valid_mask=domain.fit_valid_mask,
         analysis_domain=domain,

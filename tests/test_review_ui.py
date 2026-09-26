@@ -132,13 +132,19 @@ def test_qspace_splits_physical_gaps_and_reuses_mesh_cache(qtbot):
         {"point_id": "p1", "qx": 0.01, "qy": 0.00, "q_normal_step": 0.01, "branch_id": 0, "side": "upper"},
         {"point_id": "p2", "qx": 0.10, "qy": 0.00, "q_normal_step": 0.01, "branch_id": 0, "side": "upper"},
         {"point_id": "p3", "qx": 0.11, "qy": 0.00, "q_normal_step": 0.01, "branch_id": 0, "side": "upper"},
+        {"point_id": "p4", "qx": 0.12, "qy": 0.00, "branch_id": 0, "side": "upper", "valid": False},
     ]
     arc = {"arc_id": 3, "ordered_point_ids": [item["point_id"] for item in points], "valid": True}
     view.set_butterfly({"points": points, "arcs": [arc]})
     segments = view._resolve_arc_segments(arc)
     assert [len(segment["points"]) for segment in segments] == [2, 2]
     invalid = dict(arc, arc_id=4, valid=False)
+    assert view._arc_visible(invalid)
+    candidate = points[-1]
+    assert view._point_visible(candidate)
+    view.set_show_excluded(False)
     assert not view._arc_visible(invalid)
+    assert not view._point_visible(candidate)
 
     view.resize(500, 360)
     view.show()

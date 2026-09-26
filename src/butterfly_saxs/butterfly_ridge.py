@@ -57,6 +57,8 @@ FIRST_ORDER_PEAK_PROMINENCE_NOISE_MULTIPLE = 3.0
 FIRST_ORDER_PEAK_AMBIGUITY_NOISE_MULTIPLE = 1.0
 FIRST_ORDER_PEAK_AMBIGUITY_MIN_WIDTH_BINS = 2.0
 FIRST_ORDER_PEAK_FAMILY_SPAN = 1.45
+RADIAL_HINT_SMOOTHING_FWHM_Q_PIXEL_FRACTION = 0.9
+RADIAL_HINT_MAX_SMOOTHING_SIGMA_BINS = 4.0
 RADIAL_HINT_CACHE_MAX_BYTES = 64 * 1024 * 1024
 CANDIDATE_NOISE_METHOD = "mask_normalized_raw_minus_smoothed_mad"
 CANDIDATE_NOISE_MIN_SAFE_SAMPLES = 32
@@ -1046,6 +1048,49 @@ def _radial_profile_noise_mad(
     return float(1.4826 * np.median(np.abs(high_pass - centre)))
 
 
+def _radial_q_pixel_step(
+    q: np.ndarray,
+    valid: np.ndarray,
+    q_min: float,
+    q_max: float,
+) -> float | None:
+    """Estimate one reciprocal-space pixel from adjacent radial-q samples.
+
+    A radial q map on a detector grid has smaller changes along directions
+    tangent to a ring and larger changes across it.  Taking the median of both
+    detector-axis differences, then multiplying by ``sqrt(2)``, estimates the
+    magnitude of one pixel step for a locally isotropic q grid.  One-dimensional
+    profiles do not carry enough geometry for this estimate and return None.
+    """
+
+    q_array = np.asarray(q, dtype=float)
+    if q_array.ndim != 2 or min(q_array.shape) < 2:
+        return None
+    selected = (
+        np.asarray(valid, dtype=bool)
+        & np.isfinite(q_array)
+        & (q_array >= float(q_min))
+        & (q_array <= float(q_max))
+    )
+    axis_steps: list[float] = []
+    for axis in (0, 1):
+        left_slice = [slice(None), slice(None)]
+        right_slice = [slice(None), slice(None)]
+        left_slice[axis] = slice(None, -1)
+        right_slice[axis] = slice(1, None)
+        left = tuple(left_slice)
+        right = tuple(right_slice)
+        paired = selected[left] & selected[right]
+        differences = np.abs(q_array[right] - q_array[left])
+        positive = differences[paired & np.isfinite(differences) & (differences > 0.0)]
+        if positive.size:
+            axis_steps.append(float(np.median(positive)))
+    if len(axis_steps) != 2:
+        return None
+    step = float(np.sqrt(2.0) * np.median(axis_steps))
+    return step if np.isfinite(step) and step > 0.0 else None
+
+
 def _effective_radial_bin_samples(
     bin_indices: np.ndarray,
     weights: np.ndarray,
@@ -1159,6 +1204,9 @@ def _first_order_q_hint(
         "q_star": None,
         "band": None,
         "n_bins": int(n_bins),
+        "radial_q_pixel_step": None,
+        "profile_smoothing_sigma_bins": 0.0,
+        "profile_support_method": "annular_bin_pixel_count",
         "reason": None,
         "selection_status": "not_selected",
         "selection_method": "lowest_significant_supported_radial_peak_family",
@@ -1203,14 +1251,79 @@ def _first_order_q_hint(
         bin_indices, counts = geometry_cache.get(radii, selected, edges)
     summed = np.bincount(bin_indices, weights=weights, minlength=int(n_bins))
     effective_samples = _effective_radial_bin_samples(bin_indices, weights, int(n_bins))
-    profile = np.divide(
+    raw_profile = np.divide(
         summed,
         counts,
         out=np.zeros_like(summed, dtype=float),
         where=counts > 0,
     )
     centres = 0.5 * (edges[:-1] + edges[1:])
-    usable = np.isfinite(profile) & (counts >= FIRST_ORDER_PEAK_MIN_BIN_COUNT)
+    raw_usable = (
+        np.isfinite(raw_profile)
+        & (counts >= FIRST_ORDER_PEAK_MIN_BIN_COUNT)
+    )
+    raw_supported_runs = _contiguous_profile_runs(raw_usable)
+    summary["n_raw_supported_bins"] = int(np.count_nonzero(raw_usable))
+    summary["n_raw_supported_runs"] = len(raw_supported_runs)
+    summary["n_supported_bins"] = int(np.count_nonzero(raw_usable))
+    summary["n_supported_runs"] = len(raw_supported_runs)
+    if summary["n_raw_supported_bins"] < FIRST_ORDER_PEAK_MIN_TOTAL_SUPPORTED_BINS:
+        summary["reason"] = "sparse_radial_profile"
+        summary["selection_status"] = "no_hint"
+        return summary
+    if not raw_supported_runs:
+        summary["reason"] = "insufficient_contiguous_support"
+        summary["selection_status"] = "no_hint"
+        return summary
+
+    # A detector grid samples q on a Cartesian lattice.  Narrow radial bins
+    # can then alternate between populated and empty even where the measured
+    # annular intensity is continuous; using only those runs can discard a
+    # real first-order peak (especially at low detector resolution).  Smooth
+    # the binned weighted sums and counts together over approximately one
+    # detector-pixel FWHM in q.  This averages observed samples only and keeps
+    # the original pixel-level effective-sample check for outlier rejection.
+    radial_q_pixel_step = _radial_q_pixel_step(q, valid, q_min, q_max)
+    smoothing_sigma_bins = 0.0
+    profile = raw_profile
+    support_counts = np.asarray(counts, dtype=float)
+    if radial_q_pixel_step is not None and gaussian_filter1d is not None:
+        bin_width = float(edges[1] - edges[0])
+        if np.isfinite(bin_width) and bin_width > 0.0:
+            smoothing_sigma_bins = min(
+                RADIAL_HINT_MAX_SMOOTHING_SIGMA_BINS,
+                RADIAL_HINT_SMOOTHING_FWHM_Q_PIXEL_FRACTION
+                * radial_q_pixel_step
+                / (2.354820045 * bin_width),
+            )
+            if smoothing_sigma_bins > 0.0:
+                smooth_summed = gaussian_filter1d(
+                    summed, smoothing_sigma_bins, mode="constant", cval=0.0
+                )
+                support_counts = gaussian_filter1d(
+                    np.asarray(counts, dtype=float),
+                    smoothing_sigma_bins,
+                    mode="constant",
+                    cval=0.0,
+                )
+                profile = np.divide(
+                    smooth_summed,
+                    support_counts,
+                    out=np.zeros_like(smooth_summed, dtype=float),
+                    where=support_counts > 0.0,
+                )
+                summary["profile_support_method"] = (
+                    "q_pixel_resolution_smoothed_annular_bin_counts"
+                )
+    summary["radial_q_pixel_step"] = (
+        float(radial_q_pixel_step)
+        if radial_q_pixel_step is not None
+        else None
+    )
+    summary["profile_smoothing_sigma_bins"] = float(smoothing_sigma_bins)
+    usable = np.isfinite(profile) & (
+        support_counts >= FIRST_ORDER_PEAK_MIN_BIN_COUNT
+    )
     summary["n_supported_bins"] = int(np.count_nonzero(usable))
     if summary["n_supported_bins"] < FIRST_ORDER_PEAK_MIN_TOTAL_SUPPORTED_BINS:
         summary["reason"] = "sparse_radial_profile"
@@ -1226,7 +1339,7 @@ def _first_order_q_hint(
         summary["reason"] = "peak_detection_unavailable"
         summary["selection_status"] = "no_hint"
         return summary
-    noise_mad = _radial_profile_noise_mad(profile, supported_runs)
+    noise_mad = _radial_profile_noise_mad(raw_profile, raw_supported_runs)
     if noise_mad is None:
         summary["reason"] = "noise_estimator_unavailable"
         summary["selection_status"] = "no_hint"
@@ -2736,6 +2849,34 @@ def _public_point(point: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _finite_scale_stability_summary(
+    points: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize finite scale support without emitting all-NaN warnings."""
+
+    values: list[float] = []
+    for point in points:
+        try:
+            value = float(point.get("scale_stability", float("nan")))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            values.append(value)
+    if not values:
+        return {
+            "mean": None,
+            "min": None,
+            "n_finite": 0,
+            "n_candidates": int(len(points)),
+        }
+    return {
+        "mean": float(np.mean(values)),
+        "min": float(np.min(values)),
+        "n_finite": int(len(values)),
+        "n_candidates": int(len(points)),
+    }
+
+
 def _deferred_rejected_profile(point: Mapping[str, Any]) -> dict[str, Any]:
     """Keep a review stub without sampling a detector-sized profile."""
 
@@ -3041,6 +3182,7 @@ def trace_butterfly_ridges(
     else:
         wang = {"applicable": False, "diagnostic_only": True, "used_for_acceptance": False, "reason": "disabled_by_options"}
     public_points = [_public_point(point) for point in candidates]
+    scale_stability_summary = _finite_scale_stability_summary(public_points)
     diagnostics: dict[str, Any] = {
         "topology_before_ellipse_fit": True,
         "ellipse_fit": None,
@@ -3061,7 +3203,7 @@ def trace_butterfly_ridges(
         "elapsed_s": float(time.perf_counter() - started),
         "n_arcs": int(len(arcs)),
         "n_valid_arcs": int(sum(bool(arc["valid"]) for arc in arcs)),
-        "scale_stability": {"mean": float(np.nanmean([point["scale_stability"] for point in public_points])) if public_points else float("nan"), "min": float(np.nanmin([point["scale_stability"] for point in public_points])) if public_points else float("nan")},
+        "scale_stability": scale_stability_summary,
         "candidate_noise": {
             "method": CANDIDATE_NOISE_METHOD,
             "threshold_basis": "mask-normalized raw-minus-smoothed high-pass MAD",

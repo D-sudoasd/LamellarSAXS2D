@@ -1066,7 +1066,9 @@ def _handle_batch(args: argparse.Namespace) -> int:
         "config_hash": run.config_hash,
         "frames": compact_records,
         "n_frames": len(run.frame_results),
-        "n_success": len(run.successful),
+        "n_success": sum(frame.status == "ok" for frame in run.frame_results),
+        "n_warning": sum(frame.status == "warning" for frame in run.frame_results),
+        "n_completed": len(run.successful),
         "n_failed": len(run.failures),
         "checkpoint": str(run.checkpoint) if run.checkpoint is not None else None,
         "selection": run.selection,
@@ -1085,7 +1087,7 @@ def _handle_batch(args: argparse.Namespace) -> int:
     warning_reason = next((reason for frame in run.frame_results
                            if frame.result is not None
                            if (reason := _quality_warning_reason(frame.result)) is not None), None)
-    exit_code = 1 if (run.failures or run.cancelled or warning_reason or
+    exit_code = 1 if (run.failures or run.cancelled or warning_reason or report["n_warning"] or
                       (preflight_summary is not None and preflight_summary["status_color"] != "green")) else 0
     report = annotate_report(report, command="batch", exit_code=exit_code,
                              quality_gate_reason=warning_reason)
@@ -1315,10 +1317,11 @@ def _handle_project(args: argparse.Namespace) -> int:
         if hasattr(item.result, "to_mapping"):
             record["result"] = item.result.to_mapping()
         compact_records.append(record)
+    has_warnings = any(item.status == "warning" for item in run.frame_results)
     if args.legacy_json:
         _print_json(compact_records)
-        return 1 if run.failures or run.cancelled else 0
-    exit_code = 1 if run.failures or run.cancelled else 0
+        return 1 if run.failures or run.cancelled or has_warnings else 0
+    exit_code = 1 if run.failures or run.cancelled or has_warnings else 0
     report = annotate_report(
         {
             "schema_version": "lamellarsaxs2d.project_run.v2",
@@ -1327,7 +1330,9 @@ def _handle_project(args: argparse.Namespace) -> int:
             "config_hash": run.config_hash,
             "frames": compact_records,
             "n_frames": len(run.frame_results),
-            "n_success": len(run.successful),
+            "n_success": sum(frame.status == "ok" for frame in run.frame_results),
+            "n_warning": sum(frame.status == "warning" for frame in run.frame_results),
+            "n_completed": len(run.successful),
             "n_failed": len(run.failures),
             "cancelled": run.cancelled,
             "selection": run.selection,

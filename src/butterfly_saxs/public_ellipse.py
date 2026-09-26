@@ -274,7 +274,7 @@ def canonical_ellipse_payload(
         ln, lz, l_major, spacing_flags = _origin_centered_periods(
             a=a,
             b=b,
-            theta_deg=theta_deg,
+            theta_deg=reference_axis + theta_deg,
             cx=cx,
             cy=cy,
             q_unit=q_unit,
@@ -303,8 +303,8 @@ def canonical_ellipse_payload(
         members.append({**common, **row, "theta_deg": member_theta, "angle_deg": member_theta})
     if not members:
         members = [
-            {**common, "theta_deg": theta_deg, "angle_deg": theta_deg},
-            {**common, "theta_deg": -theta_deg, "angle_deg": -theta_deg},
+            {**common, "theta_deg": reference_axis + theta_deg, "angle_deg": reference_axis + theta_deg},
+            {**common, "theta_deg": reference_axis - theta_deg, "angle_deg": reference_axis - theta_deg},
         ]
     payload = {
         "status": solver_status,

@@ -231,6 +231,7 @@ def _frame_results(batch: Any) -> list[FrameFitResult]:
                     result=item.get("result", item.get("fit_result")),
                     status=item.get("status", "ok"),
                     error=item.get("error"),
+                    diagnostic=item.get("diagnostic"),
                     warm_start_from=item.get("warm_start_from", item.get("lineage")),
                 )
             )
@@ -260,6 +261,7 @@ def _frame_base(item: FrameFitResult, index: int) -> dict[str, Any]:
         "time": _scalar(frame.time),
         "status": item.status,
         "error": _scalar(item.error) if item.error else "",
+        "diagnostic": _scalar(item.diagnostic) if item.diagnostic else "",
         "warm_start_from": _scalar(item.warm_start_from) if item.warm_start_from else "",
         "elapsed_s": _scalar(item.elapsed_s),
         "resumed": bool(item.resumed),
@@ -366,6 +368,24 @@ def _result_flags(value: Any) -> Any:
     return None if flags is _MISSING else flags
 
 
+def _quality_confidence(value: Any) -> tuple[Any, Any]:
+    """Return confidence and its explanation from result or butterfly quality."""
+
+    butterfly = _value(value, "butterfly", default=None)
+    if butterfly is None:
+        butterfly = _value(_value(value, "observables", default={}), "butterfly", default=None)
+    quality = _value(butterfly, "quality", default=None)
+    if quality is None:
+        quality = _value(value, "quality", default=None)
+    confidence = _value(value, "confidence", default=_MISSING)
+    if confidence is _MISSING:
+        confidence = _value(quality, "confidence", "confidence_level", default="")
+    reason = _value(value, "confidence_reason", default=_MISSING)
+    if reason is _MISSING:
+        reason = _value(quality, "confidence_reason", "confidence_basis", default="")
+    return confidence, reason
+
+
 def _parameters(value: Any) -> list[dict[str, Any]]:
     """Normalise parameter sources while retaining fit diagnostics.
 
@@ -402,6 +422,17 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
     geometry_units = _value(value, "geometry_parameter_units", default={})
     if not isinstance(geometry_units, Mapping):
         geometry_units = {}
+    confidence, confidence_reason = _quality_confidence(value)
+    confidence_cell = (
+        _json_text(confidence)
+        if isinstance(confidence, (Mapping, list, tuple, set, frozenset))
+        else (_scalar(confidence) if confidence is not _MISSING else "")
+    )
+    confidence_reason_cell = (
+        _json_text(confidence_reason)
+        if isinstance(confidence_reason, (Mapping, list, tuple, set, frozenset))
+        else (_scalar(confidence_reason) if confidence_reason is not _MISSING else "")
+    )
     for name, spec in iterable:
         parameter_name = str(name)
         if np.isscalar(spec) or isinstance(spec, str):
@@ -468,6 +499,13 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
             {
                 "parameter": parameter_name,
                 "value": _scalar(value_field),
+                "candidate_value": _scalar(value_field),
+                "publication_status": "not_assessed",
+                "identifiability_status": "not_assessed",
+                "identifiability_reason": "",
+                "parameter_source": "candidate_only",
+                "confidence": confidence_cell,
+                "confidence_reason": confidence_reason_cell,
                 "stderr": _scalar(stderr) if stderr is not _MISSING else "",
                 "uncertainty": _scalar(uncertainty) if uncertainty is not _MISSING else "",
                 "fixed": _scalar(fixed) if fixed is not _MISSING else "",
@@ -497,19 +535,48 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
             if not isinstance(check, Mapping):
                 continue
             candidate_value = check.get("candidate_value")
+            if candidate_value is None:
+                candidate_value = row["value"]
             if name in ("eccentricity", "ellipticity") and candidate_value is not None:
                 candidate_value = math.sqrt(max(0., 1. - float(candidate_value) ** 2))
             row["candidate_value"] = _scalar(candidate_value)
             row["identifiability_status"] = check.get("status", "undetermined")
             row["identifiability_reason"] = check.get("reason", "")
-            row["parameter_source"] = "quantitative_if_available_else_candidate_only"
-            if check.get("status") != "available":
-                row["value"] = ""
-            else:
-                quantitative_value = check.get("value")
-                if name in ("eccentricity", "ellipticity") and quantitative_value is not None:
-                    quantitative_value = math.sqrt(max(0., 1. - float(quantitative_value) ** 2))
+            quantitative_value = check.get("value")
+            if name in ("eccentricity", "ellipticity") and quantitative_value is not None:
+                quantitative_value = math.sqrt(max(0., 1. - float(quantitative_value) ** 2))
+            check_status = str(check.get("status", "undetermined")).strip().casefold()
+            value_is_finite = (
+                not isinstance(quantitative_value, bool)
+                and isinstance(quantitative_value, (int, float, np.number))
+                and math.isfinite(float(quantitative_value))
+            )
+            if check_status in {"available", "estimate", "candidate"} and value_is_finite:
                 row["value"] = _scalar(quantitative_value)
+                row["publication_status"] = (
+                    "available" if check_status == "available" else "not_assessed"
+                )
+                row["parameter_source"] = (
+                    "quantitative" if check_status == "available" else "candidate"
+                )
+            else:
+                row["value"] = ""
+                row["publication_status"] = "not_assessed"
+                row["parameter_source"] = "candidate_only"
+            parameter_confidence = check.get("confidence", check.get("confidence_level", _MISSING))
+            if parameter_confidence is not _MISSING:
+                row["confidence"] = (
+                    _json_text(parameter_confidence)
+                    if isinstance(parameter_confidence, (Mapping, list, tuple, set, frozenset))
+                    else _scalar(parameter_confidence)
+                )
+            parameter_confidence_reason = check.get("confidence_reason", _MISSING)
+            if parameter_confidence_reason is not _MISSING:
+                row["confidence_reason"] = (
+                    _json_text(parameter_confidence_reason)
+                    if isinstance(parameter_confidence_reason, (Mapping, list, tuple, set, frozenset))
+                    else _scalar(parameter_confidence_reason)
+                )
             interval = check.get("interval")
             if isinstance(interval, (tuple, list)) and len(interval) == 2 and name not in ("eccentricity", "ellipticity"):
                 row["interval_low"], row["interval_high"] = interval
@@ -531,12 +598,52 @@ def _parameters(value: Any) -> list[dict[str, Any]]:
                 "L_from_major_axis_nm",
             }:
                 continue
-            row["candidate_value"] = row["value"]
+            if row.get("candidate_value") in (None, ""):
+                row["candidate_value"] = row["value"]
             row["value"] = ""
+            row["publication_status"] = "not_assessed"
             row["identifiability_status"] = "undetermined"
             row["identifiability_reason"] = "ellipse_shape_not_quantitatively_available"
             row["parameter_source"] = "candidate_only"
     return rows
+
+
+def _quality_summary(value: Any) -> dict[str, Any]:
+    """Flatten status and confidence labels while preserving detailed source JSON."""
+
+    butterfly = _value(value, "butterfly", default=None)
+    if butterfly is None:
+        butterfly = _value(_value(value, "observables", default={}), "butterfly", default=None)
+    quality = _value(butterfly, "quality", default=None)
+    if quality is None:
+        quality = _value(value, "quality", default=None)
+    confidence, confidence_reason = _quality_confidence(value)
+    diagnostic = _value(
+        quality,
+        "diagnostic",
+        "reason",
+        default=_value(value, "quality_diagnostic", "diagnostic", default=""),
+    )
+    return {
+        "quality_status": _scalar(
+            _value(quality, "status", default=_value(value, "quality_status", default=""))
+        ),
+        "confidence": (
+            _json_text(confidence)
+            if isinstance(confidence, (Mapping, list, tuple, set, frozenset))
+            else (_scalar(confidence) if confidence is not _MISSING else "")
+        ),
+        "confidence_reason": (
+            _json_text(confidence_reason)
+            if isinstance(confidence_reason, (Mapping, list, tuple, set, frozenset))
+            else (_scalar(confidence_reason) if confidence_reason is not _MISSING else "")
+        ),
+        "quality_diagnostic": (
+            _json_text(diagnostic)
+            if isinstance(diagnostic, (Mapping, list, tuple, set, frozenset))
+            else (_scalar(diagnostic) if diagnostic is not _MISSING else "")
+        ),
+    }
 
 
 def _frame_summary_rows(results: Sequence[FrameFitResult]) -> list[dict[str, Any]]:
@@ -607,17 +714,8 @@ def _frame_summary_rows(results: Sequence[FrameFitResult]) -> list[dict[str, Any
             ):
                 if name in geometry:
                     row[name] = _scalar(geometry[name])
-        butterfly = _as_mapping(_value(result, "butterfly", default=None))
-        quality = _as_mapping(_value(butterfly, "quality", default=None)) or _as_mapping(
-            _value(result, "quality", default=None)
-        )
-        row.setdefault(
-            "quality_status",
-            _scalar(
-                _value(quality, "status", default=None)
-                or _value(result, "quality_status", default=None)
-            ),
-        )
+        for name, value in _quality_summary(result).items():
+            row.setdefault(name, value)
         row.setdefault("arc_sides", _scalar(_value(result, "arc_sides", default=None)))
         row.setdefault(
             "q_star_from_arcs",
@@ -1014,7 +1112,7 @@ def _write_npz(path: Path, results: Sequence[FrameFitResult]) -> Path:
         _walk_arrays(item.result, f"frame_{index:04d}", arrays)
         if (
             item.result is None
-            or item.status != "ok"
+            or item.status in {"failed", "skipped"}
             or _contains_omitted_array(item.result)
         ):
             missing_frames.append(index)
@@ -1040,7 +1138,7 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
-    series: dict[tuple[str, str | None], list[tuple[float, float]]] = {}
+    series: dict[tuple[str, str | None], list[dict[str, Any]]] = {}
     for index, item in enumerate(results):
         x_value = item.frame.time
         try:
@@ -1051,6 +1149,8 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
             x = float(index)
         for parameter in _parameters(item.result):
             value = parameter.get("value")
+            if value in (None, ""):
+                value = parameter.get("candidate_value")
             try:
                 y = float(value)
             except (TypeError, ValueError):
@@ -1058,7 +1158,14 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
             if math.isfinite(y):
                 unit = parameter.get("unit")
                 unit_key = str(unit).strip() if unit not in (None, "") else None
-                series.setdefault((parameter["parameter"], unit_key), []).append((x, y))
+                series.setdefault((parameter["parameter"], unit_key), []).append(
+                    {
+                        "frame_index": index,
+                        "x": x,
+                        "y": y,
+                        "publication_status": parameter.get("publication_status", "not_assessed"),
+                    }
+                )
     path.parent.mkdir(parents=True, exist_ok=True)
     groups: dict[str, list[tuple[str, str | None]]] = {}
     for key in series:
@@ -1081,13 +1188,26 @@ def _write_evolution(path: Path, results: Sequence[FrameFitResult]) -> Path:
         for axis, (group, keys) in zip(axes_flat, groups.items()):
             for name, unit in keys:
                 points = series[(name, unit)]
-                points.sort(key=lambda point: point[0])
-                axis.plot(
-                    [point[0] for point in points],
-                    [point[1] for point in points],
-                    "o-",
-                    label=name,
-                )
+                points.sort(key=lambda point: point["frame_index"])
+                color = axis._get_lines.get_next_color()
+                axis.plot([], [], color=color, linestyle="None", marker="o", label=name)
+                assessed = [point for point in points if point["publication_status"] == "available"]
+                candidates = [point for point in points if point["publication_status"] != "available"]
+                if assessed:
+                    axis.scatter(
+                        [point["x"] for point in assessed],
+                        [point["y"] for point in assessed],
+                        marker="o",
+                        color=color,
+                    )
+                if candidates:
+                    axis.scatter(
+                        [point["x"] for point in candidates],
+                        [point["y"] for point in candidates],
+                        marker="x",
+                        color=color,
+                        label=f"{name} candidate only",
+                    )
             unit_label = group if not group.startswith("__unknown__:") else "unit unspecified"
             axis.set_ylabel(f"parameter value ({unit_label})")
             axis.legend(loc="best", fontsize="small")
@@ -1112,7 +1232,8 @@ class StreamingBatchExporter:
     """
 
     _FRAME_COLUMNS = [
-        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error",
+        "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "error", "diagnostic",
+        "quality_status", "confidence", "confidence_reason", "quality_diagnostic",
         "warm_start_from", "elapsed_s", "resumed", "flags", "scientific_flags",
         "parameters_json",
     ]
@@ -1120,7 +1241,8 @@ class StreamingBatchExporter:
         "frame_index", "frame_id", "path", "frame_selector", "dataset", "time", "status", "parameter",
         "value", "stderr", "uncertainty", "fixed", "unit", "flags",
         "bound_flags", "scientific_flags",
-        "candidate_value", "identifiability_status", "identifiability_reason", "parameter_source",
+        "candidate_value", "publication_status", "identifiability_status", "identifiability_reason", "parameter_source",
+        "confidence", "confidence_reason",
         "interval_low", "interval_high", "interval_kind",
     ]
     _RIDGE_COLUMNS = [
@@ -1189,6 +1311,7 @@ class StreamingBatchExporter:
         self._missing_ids: list[Any] = []
         self._missing_paths: list[str] = []
         self._quality_failed_frames: list[int] = []
+        self._quality_warning_frames: list[int] = []
         self._array_names: list[str] = []
         self._touched_frames: set[int] = set()
         self._old_npz: zipfile.ZipFile | None = None
@@ -1313,8 +1436,10 @@ class StreamingBatchExporter:
                 self._missing_frames.append(index)
                 self._missing_ids.append(_scalar(item.frame.frame_id))
                 self._missing_paths.append(str(item.frame.path))
-        if item.status != "ok":
+        if item.status == "failed":
             self._quality_failed_frames.append(index)
+        elif item.status == "warning":
+            self._quality_warning_frames.append(index)
         if not item.resumed:
             self._touched_frames.add(index)
         compact = FrameFitResult(
@@ -1322,6 +1447,7 @@ class StreamingBatchExporter:
             result=_checkpoint_safe(item.result),
             status=item.status,
             error=item.error,
+            diagnostic=item.diagnostic,
             traceback=item.traceback,
             warm_start_from=item.warm_start_from,
             elapsed_s=item.elapsed_s,
@@ -1358,6 +1484,7 @@ class StreamingBatchExporter:
                 "frame_count": len(self._compact_results),
                 "complete": not self._missing_frames
                 and not self._quality_failed_frames
+                and not self._quality_warning_frames
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled),
                 "artifact_complete": not self._missing_frames
                 and not (isinstance(batch, BatchRunResult) and batch.cancelled),
@@ -1366,8 +1493,9 @@ class StreamingBatchExporter:
                     and not batch.cancelled
                     and len(self._compact_results) == batch.total_count
                 ),
-                "quality_complete": not self._quality_failed_frames,
+                "quality_complete": not self._quality_failed_frames and not self._quality_warning_frames,
                 "quality_failed_frames": list(self._quality_failed_frames),
+                "quality_warning_frames": list(self._quality_warning_frames),
                 "missing_frames": sorted(
                     set(self._missing_frames)
                     | (
@@ -1699,11 +1827,15 @@ def export_batch(
             "time",
             "status",
             "quality_status",
+            "confidence",
+            "confidence_reason",
+            "quality_diagnostic",
             "arc_sides",
             "q_star_from_arcs",
             "L_from_observed_radius_nm",
             "q_star_source",
             "error",
+            "diagnostic",
             "warm_start_from",
             "elapsed_s",
             "resumed",
@@ -1744,6 +1876,13 @@ def export_batch(
             "flags",
             "bound_flags",
             "scientific_flags",
+            "candidate_value",
+            "publication_status",
+            "identifiability_status",
+            "identifiability_reason",
+            "parameter_source",
+            "confidence",
+            "confidence_reason",
         ],
     )
 

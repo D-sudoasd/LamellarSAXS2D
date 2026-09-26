@@ -286,12 +286,8 @@ def test_inclusive_boundary_values_still_receive_valid_bound_variants() -> None:
         "prior_theta_expand",
     }
     assert not any(item.get("reason") in {"value_at_lower_bound", "value_at_upper_bound"} for item in skipped)
-def test_standard_application_specs_do_not_report_an_explicit_prior():
+def test_standard_application_settings_do_not_create_an_explicit_prior():
     from butterfly_saxs.analysis_config import ellipse_parameter_specs
-    from butterfly_saxs.butterfly import _explicit_prior_bound_variants
 
     specs = ellipse_parameter_specs({"ellipse_multistart": 3}, q_window=(0.1, 0.5))
-    assert specs["b"]["expr"] == "a*axis_ratio"
-    variants, skipped = _explicit_prior_bound_variants(specs)
-    assert variants == []
-    assert skipped == [{"reason": "no_finite_explicit_bounds"}]
+    assert specs is None
